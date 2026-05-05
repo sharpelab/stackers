@@ -41,6 +41,38 @@ def state_label(code: str) -> str:
     return STATE_LABELS.get(code.upper(), f"UNKNOWN ({code})")
 
 
+# 16-bit positioner error register from the TS response, decoded per the
+# CONEX-CC Controller Documentation (docs/newport-conex-cc-controller.pdf §TS).
+# Bits A-F are documented as "Not used"; if any are set we surface as reserved.
+ERROR_BITS: list[tuple[int, str]] = [
+    (0x0001, "negative end of run"),
+    (0x0002, "positive end of run"),
+    (0x0004, "peak current limit"),
+    (0x0008, "RMS current limit"),
+    (0x0010, "short circuit"),
+    (0x0020, "following error"),
+    (0x0040, "homing timeout"),
+    (0x0080, "wrong ESP stage"),
+    (0x0100, "DC voltage too low"),
+    (0x0200, "80W output power exceeded"),
+]
+
+
+def error_label(code: str) -> str:
+    """Decode the 4-hex-char positioner error register from a TS response."""
+    try:
+        bits = int(code, 16)
+    except ValueError:
+        return f"invalid ({code})"
+    if bits == 0:
+        return "no error"
+    names = [name for mask, name in ERROR_BITS if bits & mask]
+    reserved = bits & 0xFC00
+    if reserved:
+        names.append(f"reserved=0x{reserved:04x}")
+    return ", ".join(names) if names else f"reserved=0x{bits:04x}"
+
+
 class ConexError(RuntimeError):
     pass
 
@@ -131,11 +163,15 @@ class ConexAxis:
         return float(self.query("TP?"))
 
     def state(self) -> tuple[str, str]:
-        """Returns (state_code_hex, error_code_hex)."""
+        """Returns (controller_state_2hex, error_register_4hex).
+
+        TS response is `1TSabcdef`: abcd is the 16-bit positioner error
+        register, ef is the controller state. See CONEX-CC controller doc §TS.
+        """
         raw = self.query("TS?")
         if len(raw) < 6:
             raise ConexError(f"unexpected TS response: {raw!r}")
-        return raw[:4][-2:], raw[4:6]
+        return raw[4:6], raw[:4]
 
     def negative_limit(self) -> float:
         return float(self.query("SL?"))

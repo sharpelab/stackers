@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from conex import ConexAxis, state_label
+from conex import ConexAxis, error_label, state_label
 from heater import OmegaPlatinum, diagnose
 
 try:
@@ -230,7 +230,10 @@ class ConexAxisPanel(QGroupBox):
         try:
             state_code, error_code = self.axis.state()
             label = state_label(state_code)
-            err_suffix = "" if error_code == "00" else f"  [err {error_code}]"
+            err_suffix = (
+                "" if error_code == "0000"
+                else f"  [err {error_code}: {error_label(error_code)}]"
+            )
             self.status_label.setText(f"{label}{err_suffix}")
         except Exception as e:
             self.status_label.setText(f"state err: {e}")
