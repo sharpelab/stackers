@@ -10,19 +10,21 @@ import threading
 
 import minimalmodbus
 
-# Holding-register addresses (decimal). Each FLOAT occupies <addr> and <addr+1>.
-REG_PV = 528          # 0x0210 — process value (current temperature)
-REG_SP1 = 544         # 0x0220 — setpoint 1
-REG_STATUS = 540      # 0x021C — system status bitfield (16-bit int)
-REG_RUN_MODE = 542    # 0x021E — run mode (16-bit int; 0 = STOP, 1 = RUN, …)
-REG_OUTPUT1 = 608     # 0x0260 — output 1 PID percentage (float)
+# Holding-register addresses (decimal). Floats occupy <addr> and <addr+1>.
+# References from Omega Platinum Modbus Interface manual (M5458).
+REG_PV = 528              # 0x0210 — CURRENT_INPUT_VALUE (process value, float)
+REG_SP1_CURRENT = 544     # 0x0220 — CURRENT_SETPOINT_1 (active working copy, float)
+REG_SP1_ABSOLUTE = 738    # 0x02E2 — ABSOLUTE_SETPOINT_1 (configured SP1 in NV, float)
+REG_PID_OUTPUT = 554      # 0x022A — PID_OUTPUT (0..100%, float)
+REG_RUN_MODE = 576        # 0x0240 — RUN_MODE (16-bit enum)
 
+# Manual §3.2.1 "Control" enumeration.
 RUN_MODE_LABELS = {
     0: "STOP",
     1: "RUN",
-    2: "PAUSE",
-    3: "WAIT",
-    4: "TUNE",
+    2: "CANCEL",
+    3: "AUTO",
+    4: "CONT",
 }
 
 
@@ -84,20 +86,20 @@ class OmegaPlatinum:
         return self._read_float(REG_PV)
 
     def setpoint(self) -> float:
-        return self._read_float(REG_SP1)
-
-    def status(self) -> int:
-        return self._read_int(REG_STATUS)
+        return self._read_float(REG_SP1_CURRENT)
 
     def run_mode(self) -> int:
         return self._read_int(REG_RUN_MODE)
 
     def output(self) -> float:
-        return self._read_float(REG_OUTPUT1)
+        return self._read_float(REG_PID_OUTPUT)
 
     # --- writes (use with intent) ---
     def set_setpoint(self, value: float) -> None:
-        self._write_float(REG_SP1, value)
+        # ABSOLUTE_SETPOINT_1 lives in NV memory; the controller refreshes the
+        # active working copy (CURRENT_SETPOINT_1) from it each loop, so writes
+        # to the working copy alone get stomped.
+        self._write_float(REG_SP1_ABSOLUTE, value)
 
     def set_run_mode(self, code: int) -> None:
         with self._lock:
