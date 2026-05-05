@@ -258,6 +258,7 @@ class HeaterPanel(QGroupBox):
         self.pv_label.setFont(font)
         self.run_label = QLabel("")
         self.run_label.setStyleSheet("color: #888;")
+        self.output_label = QLabel("output: —")
 
         self.setpoint_spin = QDoubleSpinBox()
         self.setpoint_spin.setRange(-1000.0, 1000.0)
@@ -270,6 +271,7 @@ class HeaterPanel(QGroupBox):
         outer.addWidget(QLabel("Process:"))
         outer.addWidget(self.pv_label)
         outer.addWidget(self.run_label)
+        outer.addWidget(self.output_label)
         sp_row = QHBoxLayout()
         sp_row.addWidget(QLabel("Setpoint:"))
         sp_row.addWidget(self.setpoint_spin, stretch=1)
@@ -315,6 +317,11 @@ class HeaterPanel(QGroupBox):
             self.run_label.setText(f"run: {run_mode_label(mode)}")
         except Exception:
             self.run_label.setText("")
+        try:
+            out = self.heater.output()
+            self.output_label.setText(f"output: {out:.1f} %")
+        except Exception as e:
+            self.output_label.setText(f"output err: {e}")
 
     def shutdown(self) -> None:
         self.timer.stop()

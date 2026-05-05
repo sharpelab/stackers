@@ -15,6 +15,7 @@ REG_PV = 528          # 0x0210 — process value (current temperature)
 REG_SP1 = 544         # 0x0220 — setpoint 1
 REG_STATUS = 540      # 0x021C — system status bitfield (16-bit int)
 REG_RUN_MODE = 542    # 0x021E — run mode (16-bit int; 0 = STOP, 1 = RUN, …)
+REG_OUTPUT1 = 608     # 0x0260 — output 1 PID percentage (float)
 
 RUN_MODE_LABELS = {
     0: "STOP",
@@ -90,6 +91,9 @@ class OmegaPlatinum:
 
     def run_mode(self) -> int:
         return self._read_int(REG_RUN_MODE)
+
+    def output(self) -> float:
+        return self._read_float(REG_OUTPUT1)
 
     # --- writes (use with intent) ---
     def set_setpoint(self, value: float) -> None:
