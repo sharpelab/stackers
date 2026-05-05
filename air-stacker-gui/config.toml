@@ -24,3 +24,11 @@ port = "COM4"
 baud = 921600
 units = "mm"
 step = 0.01
+
+# Omega Platinum heater controller (Modbus RTU over USB CDC).
+[heater]
+port = "COM7"
+baud = 19200
+slave_id = 1
+units = "°C"
+poll_interval_ms = 1000

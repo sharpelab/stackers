@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from conex import ConexAxis, state_label
+from heater import OmegaPlatinum, run_mode_label
 
 try:
     import tomllib
@@ -238,6 +239,88 @@ class ConexAxisPanel(QGroupBox):
         self.axis.close()
 
 
+class HeaterPanel(QGroupBox):
+    """Live temperature + setpoint control for an Omega Platinum controller."""
+
+    def __init__(self, cfg: dict) -> None:
+        super().__init__("Heater")
+        self.units = cfg.get("units", "°C")
+        self.heater = OmegaPlatinum(
+            port=cfg["port"],
+            baud=int(cfg.get("baud", 19200)),
+            slave_id=int(cfg.get("slave_id", 1)),
+        )
+
+        self.status_label = QLabel("disconnected")
+        self.pv_label = QLabel("—")
+        font = self.pv_label.font()
+        font.setPointSize(font.pointSize() + 4)
+        self.pv_label.setFont(font)
+        self.run_label = QLabel("")
+        self.run_label.setStyleSheet("color: #888;")
+
+        self.setpoint_spin = QDoubleSpinBox()
+        self.setpoint_spin.setRange(-1000.0, 1000.0)
+        self.setpoint_spin.setDecimals(2)
+        self.setpoint_spin.setSingleStep(1.0)
+        self.set_btn = QPushButton("Set")
+
+        outer = QVBoxLayout(self)
+        outer.addWidget(self.status_label)
+        outer.addWidget(QLabel("Process:"))
+        outer.addWidget(self.pv_label)
+        outer.addWidget(self.run_label)
+        sp_row = QHBoxLayout()
+        sp_row.addWidget(QLabel("Setpoint:"))
+        sp_row.addWidget(self.setpoint_spin, stretch=1)
+        sp_row.addWidget(self.set_btn)
+        outer.addLayout(sp_row)
+        outer.addStretch(1)
+
+        self.set_btn.clicked.connect(self._on_set)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+
+        try:
+            self.heater.open()
+        except Exception as e:
+            self.status_label.setText(f"open failed: {e}")
+            self.set_btn.setEnabled(False)
+            return
+
+        self.status_label.setText(f"connected on {self.heater.port}")
+        self.timer.start(int(cfg.get("poll_interval_ms", 1000)))
+
+    def _on_set(self) -> None:
+        try:
+            self.heater.set_setpoint(self.setpoint_spin.value())
+        except Exception as e:
+            self.status_label.setText(f"set err: {e}")
+
+    def poll(self) -> None:
+        try:
+            pv = self.heater.process_value()
+            self.pv_label.setText(f"{pv:.2f} {self.units}")
+        except Exception as e:
+            self.pv_label.setText(f"pv err: {e}")
+        try:
+            sp = self.heater.setpoint()
+            if not self.setpoint_spin.hasFocus():
+                self.setpoint_spin.setValue(sp)
+        except Exception:
+            pass
+        try:
+            mode = self.heater.run_mode()
+            self.run_label.setText(f"run: {run_mode_label(mode)}")
+        except Exception:
+            self.run_label.setText("")
+
+    def shutdown(self) -> None:
+        self.timer.stop()
+        self.heater.close()
+
+
 class CameraWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -247,9 +330,10 @@ class CameraWindow(QMainWindow):
         self.label.setMinimumSize(640, 480)
 
         self.axis_panels: list[ConexAxisPanel] = []
+        self.heater_panel: HeaterPanel | None = None
 
         config = load_config()
-        settings_panel = self._build_settings_panel()
+        settings_panel = self._build_settings_panel(config.get("heater"))
         axes_panel = self._build_axes_panel(config.get("axis", []))
 
         central = QWidget()
@@ -275,7 +359,7 @@ class CameraWindow(QMainWindow):
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
 
-    def _build_settings_panel(self) -> QWidget:
+    def _build_settings_panel(self, heater_cfg: dict | None) -> QWidget:
         panel = QWidget()
         panel.setFixedWidth(240)
         layout = QVBoxLayout(panel)
@@ -298,14 +382,15 @@ class CameraWindow(QMainWindow):
         camera_options_layout = QVBoxLayout(camera_options)
         camera_options_layout.addWidget(QLabel("TODO"))
 
-        heater = QGroupBox("Heater")
-        heater_layout = QVBoxLayout(heater)
-        heater_layout.addWidget(QLabel("TODO"))
-
         layout.addWidget(recording)
         layout.addWidget(presets)
         layout.addWidget(camera_options)
-        layout.addWidget(heater, stretch=1)
+
+        if heater_cfg:
+            self.heater_panel = HeaterPanel(heater_cfg)
+            layout.addWidget(self.heater_panel, stretch=1)
+        else:
+            layout.addStretch(1)
         return panel
 
     def _build_axes_panel(self, axes_cfg: list[dict]) -> QWidget:
@@ -340,6 +425,8 @@ class CameraWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         for ap in self.axis_panels:
             ap.shutdown()
+        if self.heater_panel is not None:
+            self.heater_panel.shutdown()
         self.acquirer.stop()
         self.acquirer.destroy()
         self.harvester.reset()

@@ -30,15 +30,16 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 
 ## Heater
 
-- **Hardware**: Thermo Scientific **Platinum** series (model TBD on physical inspection).
-- **Software**: `~/Desktop/Platinum_Firmware_Software_1.4.0.6/` containing `EIP_1.1.5`, `Firmware_1.4.0.6`, `Platinum_Configurator_1.5.2.0`, `USBDriver`.
-- **Launcher**: `Temp Controller.appref-ms` (ClickOnce) on Desktop.
-- **Status**: deferred — recording integration may come later.
+- **Hardware**: **Omega Engineering Platinum** series controller. Device ID `062BE937`, firmware `1.4.0.6`, run mode RUNNING (per the Configurator's Device Information panel).
+- **Connection**: USB-CDC virtual COM via Omega's `OmegaVCP.inf` driver — currently enumerated as **COM7**.
+- **Protocol**: Modbus RTU at 19200 8N1, slave ID 1 by default. 32-bit IEEE floats span two consecutive holding registers; Omega's manual (M5451) documents the register map.
+- **Software**: `~/Desktop/Platinum_Firmware_Software_1.4.0.6/` containing `EIP_1.1.5`, `Firmware_1.4.0.6`, `Platinum_Configurator_1.5.2.0`, `USBDriver`. Launcher on Desktop is `Temp Controller.appref-ms` (ClickOnce).
+- The earlier "Thermo Scientific Platinum" label in this doc was wrong — it's Omega.
 
-## Other USB instruments & scripts found
+## Defunct / disabled
 
-- `~/something.py` — long-running pyvisa loop polling a USB-VISA sensor for `SENS1:TEMP:DATA?` and `SENS2:HUM:DATA?`, posting every 5 min to `https://spxtr.net/demgraphs/` as `stacker.temp` / `stacker.hum`. Pre-existing env logger.
-- `~/something.bat` — companion batch (uninspected).
+- The USBTMC SCPI temp/humidity instrument that `~/something.py` used to poll (`SENS1:TEMP:DATA?` / `SENS2:HUM:DATA?` → `spxtr.net/demgraphs/` as `stacker.temp`/`stacker.hum`) is **no longer connected** — pyvisa enumerates no USB instruments. The script and its `something.bat` companion are still on disk but inert.
+- Scheduled task **`Wowza`** that re-launched `something.py` at login has been disabled (not deleted) on 2026-05-05.
 
 ## Serial port map (current snapshot)
 
@@ -47,7 +48,7 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 | COM1 | Communications Port (legacy) | Unused |
 | COM3 | USB Serial Port | CONEX-CC axis A (Z or spin) |
 | COM4 | USB Serial Port | CONEX-CC axis B (Z or spin) |
-| COM7 | USB Serial Device | Unknown — possibly heater or env sensor |
+| COM7 | USB Serial Device (Omega VCP) | Heater (Omega Platinum, Modbus RTU) |
 
 ## Tooling on the box
 
@@ -61,6 +62,4 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 ## Open questions / TBD
 
 - Confirm which of COM3/COM4 is Z vs spin (from CONEX controller IDs or the LabVIEW VI's bindings).
-- Identify what's on COM7.
-- Decide: drive CONEX directly via pyserial vs. via NI-VISA vs. shell out to vendor utility.
 - Add Air Stacker entry to the lab wiki (machine page, beyond the rustdesk listing).
