@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QDoubleSpinBox,
     QFrame,
     QGroupBox,
@@ -239,6 +240,95 @@ class ConexAxisPanel(QGroupBox):
         self.axis.close()
 
 
+class CameraOptionsPanel(QGroupBox):
+    """Live gain / exposure controls (GenICam node map). Auto checkboxes
+    map to GainAuto / ExposureAuto Off ↔ Continuous."""
+
+    def __init__(self, node_map, defaults: dict) -> None:
+        super().__init__("Camera Options")
+        self.node_map = node_map
+
+        self.gain_spin = QDoubleSpinBox()
+        self.gain_spin.setKeyboardTracking(False)
+        self.gain_spin.setDecimals(2)
+        self.gain_spin.setSingleStep(0.5)
+        self.gain_auto = QCheckBox("auto")
+
+        self.exp_spin = QDoubleSpinBox()
+        self.exp_spin.setKeyboardTracking(False)
+        self.exp_spin.setDecimals(0)
+        self.exp_spin.setSingleStep(100)
+        self.exp_spin.setSuffix(" μs")
+        self.exp_auto = QCheckBox("auto")
+
+        outer = QVBoxLayout(self)
+        gain_row = QHBoxLayout()
+        gain_row.addWidget(QLabel("Gain:"))
+        gain_row.addWidget(self.gain_spin, stretch=1)
+        gain_row.addWidget(self.gain_auto)
+        outer.addLayout(gain_row)
+        exp_row = QHBoxLayout()
+        exp_row.addWidget(QLabel("Exposure:"))
+        exp_row.addWidget(self.exp_spin, stretch=1)
+        exp_row.addWidget(self.exp_auto)
+        outer.addLayout(exp_row)
+
+        self._init_float("Gain", self.gain_spin, defaults.get("gain"))
+        self._init_float("ExposureTime", self.exp_spin, defaults.get("exposure_us"))
+        self._init_auto("GainAuto", self.gain_auto, self.gain_spin, default_on=False)
+        self._init_auto("ExposureAuto", self.exp_auto, self.exp_spin, default_on=False)
+
+        self.gain_spin.editingFinished.connect(
+            lambda: self._set_float("Gain", self.gain_spin.value())
+        )
+        self.exp_spin.editingFinished.connect(
+            lambda: self._set_float("ExposureTime", self.exp_spin.value())
+        )
+        self.gain_auto.toggled.connect(
+            lambda on: self._set_auto("GainAuto", on, self.gain_spin)
+        )
+        self.exp_auto.toggled.connect(
+            lambda on: self._set_auto("ExposureAuto", on, self.exp_spin)
+        )
+
+    def _init_float(self, name: str, spin: QDoubleSpinBox, default) -> None:
+        try:
+            node = getattr(self.node_map, name)
+            spin.setRange(float(node.min), float(node.max))
+            current = float(default) if default is not None else float(node.value)
+            current = max(node.min, min(node.max, current))
+            node.value = current
+            spin.setValue(current)
+        except Exception as e:
+            spin.setEnabled(False)
+            print(f"camera {name}: {e}", file=sys.stderr)
+
+    def _init_auto(self, name: str, cb: QCheckBox, manual_spin: QDoubleSpinBox, default_on: bool) -> None:
+        try:
+            node = getattr(self.node_map, name)
+            node.value = "Continuous" if default_on else "Off"
+            cb.setChecked(default_on)
+            manual_spin.setEnabled(not default_on)
+        except Exception as e:
+            cb.setEnabled(False)
+            print(f"camera {name}: {e}", file=sys.stderr)
+
+    def _set_float(self, name: str, value: float) -> None:
+        try:
+            node = getattr(self.node_map, name)
+            node.value = max(node.min, min(node.max, float(value)))
+        except Exception as e:
+            print(f"camera {name}: {e}", file=sys.stderr)
+
+    def _set_auto(self, name: str, on: bool, manual_spin: QDoubleSpinBox) -> None:
+        try:
+            node = getattr(self.node_map, name)
+            node.value = "Continuous" if on else "Off"
+            manual_spin.setEnabled(not on)
+        except Exception as e:
+            print(f"camera {name}: {e}", file=sys.stderr)
+
+
 class HeaterPanel(QGroupBox):
     """Live temperature + setpoint control for an Omega Platinum controller."""
 
@@ -369,20 +459,13 @@ class CameraWindow(QMainWindow):
 
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
+        self.camera_options_panel: CameraOptionsPanel | None = None
 
         config = load_config()
-        settings_panel = self._build_settings_panel(config.get("heater"))
-        axes_panel = self._build_axes_panel(config.get("axis", []))
-
-        central = QWidget()
-        layout = QHBoxLayout(central)
-        layout.addWidget(settings_panel)
-        layout.addWidget(self.label, stretch=1)
-        layout.addWidget(axes_panel)
-        self.setCentralWidget(central)
+        camera_cfg = config.get("camera", {})
 
         cti = resolve_cti(config["gentl"]["producer"])
-        device_index = int(config.get("camera", {}).get("device_index", 0))
+        device_index = int(camera_cfg.get("device_index", 0))
 
         with silenced_stderr():
             self.harvester = Harvester()
@@ -391,13 +474,37 @@ class CameraWindow(QMainWindow):
             if not self.harvester.device_info_list:
                 raise RuntimeError("no cameras enumerated by GenTL producer")
             self.acquirer = self.harvester.create(device_index)
+            self._apply_camera_startup()
             self.acquirer.start()
+
+        settings_panel = self._build_settings_panel(camera_cfg)
+        right_panel = self._build_right_panel(config.get("axis", []), config.get("heater"))
+
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.addWidget(settings_panel)
+        layout.addWidget(self.label, stretch=1)
+        layout.addWidget(right_panel)
+        self.setCentralWidget(central)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
 
-    def _build_settings_panel(self, heater_cfg: dict | None) -> QWidget:
+    def _apply_camera_startup(self) -> None:
+        """Set acquisition mode + balance-white-auto before .start().
+
+        Gain / exposure / their auto modes are applied by CameraOptionsPanel
+        from the camera section of config.toml.
+        """
+        nm = self.acquirer.remote_device.node_map
+        for name, value in (("AcquisitionMode", "Continuous"), ("BalanceWhiteAuto", "Continuous")):
+            try:
+                getattr(nm, name).value = value
+            except Exception as e:
+                print(f"camera {name}: {e}", file=sys.stderr)
+
+    def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
         panel = QWidget()
         panel.setFixedWidth(240)
         layout = QVBoxLayout(panel)
@@ -416,30 +523,28 @@ class CameraWindow(QMainWindow):
         presets_layout = QVBoxLayout(presets)
         presets_layout.addWidget(QLabel("TODO"))
 
-        camera_options = QGroupBox("Camera Options")
-        camera_options_layout = QVBoxLayout(camera_options)
-        camera_options_layout.addWidget(QLabel("TODO"))
+        self.camera_options_panel = CameraOptionsPanel(
+            self.acquirer.remote_device.node_map, camera_cfg
+        )
 
         layout.addWidget(recording)
         layout.addWidget(presets)
-        layout.addWidget(camera_options)
-
-        if heater_cfg:
-            self.heater_panel = HeaterPanel(heater_cfg)
-            layout.addWidget(self.heater_panel, stretch=1)
-        else:
-            layout.addStretch(1)
+        layout.addWidget(self.camera_options_panel)
+        layout.addStretch(1)
         return panel
 
-    def _build_axes_panel(self, axes_cfg: list[dict]) -> QWidget:
+    def _build_right_panel(self, axes_cfg: list[dict], heater_cfg: dict | None) -> QWidget:
         panel = QWidget()
-        panel.setFixedWidth(280)
+        panel.setFixedWidth(300)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         for cfg in axes_cfg:
             ap = ConexAxisPanel(cfg)
             self.axis_panels.append(ap)
             layout.addWidget(ap)
+        if heater_cfg:
+            self.heater_panel = HeaterPanel(heater_cfg)
+            layout.addWidget(self.heater_panel)
         layout.addStretch(1)
         return panel
 
