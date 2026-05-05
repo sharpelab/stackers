@@ -264,7 +264,8 @@ class HeaterPanel(QGroupBox):
         self.setpoint_spin.setRange(-1000.0, 1000.0)
         self.setpoint_spin.setDecimals(2)
         self.setpoint_spin.setSingleStep(1.0)
-        self.set_btn = QPushButton("Set")
+        self.setpoint_spin.setKeyboardTracking(False)
+        self.run_btn = QPushButton("Run")
         self.stop_btn = QPushButton("Stop")
 
         outer = QVBoxLayout(self)
@@ -276,14 +277,15 @@ class HeaterPanel(QGroupBox):
         sp_row = QHBoxLayout()
         sp_row.addWidget(QLabel("Setpoint:"))
         sp_row.addWidget(self.setpoint_spin, stretch=1)
-        sp_row.addWidget(self.set_btn)
         outer.addLayout(sp_row)
         btn_row = QHBoxLayout()
+        btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.stop_btn)
         outer.addLayout(btn_row)
         outer.addStretch(1)
 
-        self.set_btn.clicked.connect(self._on_set)
+        self.setpoint_spin.editingFinished.connect(self._on_set)
+        self.run_btn.clicked.connect(self._on_run)
         self.stop_btn.clicked.connect(self._on_stop)
 
         self.timer = QTimer(self)
@@ -293,7 +295,8 @@ class HeaterPanel(QGroupBox):
             self.heater.open()
         except Exception as e:
             self.status_label.setText(f"open failed: {e}")
-            self.set_btn.setEnabled(False)
+            self.setpoint_spin.setEnabled(False)
+            self.run_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             return
 
@@ -303,9 +306,14 @@ class HeaterPanel(QGroupBox):
     def _on_set(self) -> None:
         try:
             self.heater.set_setpoint(self.setpoint_spin.value())
-            self.heater.set_run_mode(1)
         except Exception as e:
             self.status_label.setText(f"set err: {e}")
+
+    def _on_run(self) -> None:
+        try:
+            self.heater.set_run_mode(1)
+        except Exception as e:
+            self.status_label.setText(f"run err: {e}")
 
     def _on_stop(self) -> None:
         try:

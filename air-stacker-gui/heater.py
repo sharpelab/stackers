@@ -16,15 +16,44 @@ REG_PV = 528              # 0x0210 — CURRENT_INPUT_VALUE (process value, float
 REG_SP1_CURRENT = 544     # 0x0220 — CURRENT_SETPOINT_1 (active working copy, float)
 REG_SP1_ABSOLUTE = 738    # 0x02E2 — ABSOLUTE_SETPOINT_1 (configured SP1 in NV, float)
 REG_PID_OUTPUT = 554      # 0x022A — PID_OUTPUT (0..100%, float)
-REG_RUN_MODE = 576        # 0x0240 — RUN_MODE (16-bit enum)
+REG_RUN_MODE = 576        # 0x0240 — RUN_MODE (16-bit enum; writes Control, reads System State)
+REG_SP1_MODE = 736        # 0x02E0 — SETPOINT_1_MODE (16-bit enum; 0=Absolute, 1=Deviation, …)
+REG_OUTPUT1_MODE = 1025   # 0x0401 — OUTPUT_1_MODE (16-bit enum; 0=Off, 1=PID, 2=On/Off, …)
 
-# Manual §3.2.1 "Control" enumeration.
+# Run-mode reads return the System State enum (manual §3.2.1).
 RUN_MODE_LABELS = {
-    0: "STOP",
-    1: "RUN",
-    2: "CANCEL",
-    3: "AUTO",
-    4: "CONT",
+    0: "LOAD",
+    1: "IDLE",
+    2: "INPUT_ADJ",
+    3: "CTRL_ADJ",
+    4: "MODIFY",
+    5: "WAIT",
+    6: "RUN",
+    7: "STANDBY",
+    8: "STOP",
+    9: "PAUSE",
+    10: "FAULT",
+    11: "SHUTDOWN",
+    12: "AUTOTUNE",
+}
+
+SETPOINT_MODE_LABELS = {
+    0: "ABSOLUTE",
+    1: "DEVIATION",
+    2: "REMOTE",
+    3: "EXTERNAL",
+    4: "RAMP_SOAK",
+}
+
+OUTPUT_MODE_LABELS = {
+    0: "OFF",
+    1: "PID",
+    2: "ON_OFF",
+    3: "RETRANS",
+    4: "ALARM_1",
+    5: "ALARM_2",
+    6: "RAMP_EVT",
+    7: "SOAK_EVT",
 }
 
 
@@ -93,6 +122,12 @@ class OmegaPlatinum:
 
     def output(self) -> float:
         return self._read_float(REG_PID_OUTPUT)
+
+    def setpoint_mode(self) -> int:
+        return self._read_int(REG_SP1_MODE)
+
+    def output_1_mode(self) -> int:
+        return self._read_int(REG_OUTPUT1_MODE)
 
     # --- writes (use with intent) ---
     def set_setpoint(self, value: float) -> None:
