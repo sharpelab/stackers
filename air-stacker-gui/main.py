@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import sys
 from pathlib import Path
 
@@ -34,6 +36,22 @@ def load_config() -> dict:
         raise FileNotFoundError(f"missing config: {CONFIG_PATH}")
     with CONFIG_PATH.open("rb") as f:
         return tomllib.load(f)
+
+
+@contextlib.contextmanager
+def silenced_stderr():
+    """Mute OS-level stderr (fd 2) so C-side prints from genicam don't leak."""
+    sys.stderr.flush()
+    old_fd = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 2)
+        yield
+    finally:
+        sys.stderr.flush()
+        os.dup2(old_fd, 2)
+        os.close(devnull)
+        os.close(old_fd)
 
 
 def resolve_cti(producer: str) -> str:
@@ -91,13 +109,14 @@ class CameraWindow(QMainWindow):
         cti = resolve_cti(config["gentl"]["producer"])
         device_index = int(config.get("camera", {}).get("device_index", 0))
 
-        self.harvester = Harvester()
-        self.harvester.add_file(cti)
-        self.harvester.update()
-        if not self.harvester.device_info_list:
-            raise RuntimeError("no cameras enumerated by GenTL producer")
-        self.acquirer = self.harvester.create(device_index)
-        self.acquirer.start()
+        with silenced_stderr():
+            self.harvester = Harvester()
+            self.harvester.add_file(cti)
+            self.harvester.update()
+            if not self.harvester.device_info_list:
+                raise RuntimeError("no cameras enumerated by GenTL producer")
+            self.acquirer = self.harvester.create(device_index)
+            self.acquirer.start()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
