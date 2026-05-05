@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QMainWindow,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -108,6 +109,15 @@ class CameraWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        recording = QGroupBox("Recording")
+        recording_layout = QHBoxLayout(recording)
+        record_btn = QPushButton("Record")
+        record_btn.setEnabled(False)
+        stop_btn = QPushButton("Stop")
+        stop_btn.setEnabled(False)
+        recording_layout.addWidget(record_btn)
+        recording_layout.addWidget(stop_btn)
+
         presets = QGroupBox("Presets")
         presets_layout = QVBoxLayout(presets)
         presets_layout.addWidget(QLabel("TODO"))
@@ -116,6 +126,7 @@ class CameraWindow(QMainWindow):
         options_layout = QVBoxLayout(options)
         options_layout.addWidget(QLabel("TODO"))
 
+        layout.addWidget(recording)
         layout.addWidget(presets)
         layout.addWidget(options, stretch=1)
         return panel
