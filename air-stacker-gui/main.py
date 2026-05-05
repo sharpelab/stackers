@@ -311,7 +311,9 @@ class HeaterPanel(QGroupBox):
 
     def _on_run(self) -> None:
         try:
-            self.heater.set_run_mode(1)
+            # AUTO_ON (3) rather than START (1): "immediately started",
+            # the closest thing in the Control enum to "leave manual override."
+            self.heater.set_run_mode(3)
         except Exception as e:
             self.status_label.setText(f"run err: {e}")
 
