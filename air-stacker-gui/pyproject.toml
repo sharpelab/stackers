@@ -9,4 +9,5 @@ dependencies = [
     "numpy>=1.22",
     "opencv-python>=4.5",
     "tomli>=2.0; python_version < '3.11'",
+    "pyserial>=3.5",
 ]

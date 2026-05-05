@@ -14,6 +14,8 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDoubleSpinBox,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
@@ -22,6 +24,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from conex import ConexAxis, ConexError, state_label
 
 try:
     import tomllib
@@ -89,6 +93,168 @@ def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
     raise ValueError(f"unsupported pixel format: {fmt}")
 
 
+class ConexAxisPanel(QGroupBox):
+    """Newport-style control surface for a single CONEX-CC axis."""
+
+    POLL_MS = 100
+
+    def __init__(self, axis_config: dict) -> None:
+        super().__init__(axis_config.get("name", "Axis"))
+        self.units = axis_config.get("units", "")
+        self.axis = ConexAxis(
+            port=axis_config["port"],
+            baud=int(axis_config.get("baud", 921600)),
+        )
+
+        self.status_label = QLabel("disconnected")
+        self.position_label = QLabel("—")
+        font = self.position_label.font()
+        font.setPointSize(font.pointSize() + 4)
+        self.position_label.setFont(font)
+        self.id_label = QLabel("")
+        self.id_label.setStyleSheet("color: #888;")
+
+        self.target_spin = QDoubleSpinBox()
+        self.target_spin.setRange(-1e6, 1e6)
+        self.target_spin.setDecimals(6)
+        self.target_spin.setSingleStep(0.01)
+        self.go_btn = QPushButton("Go")
+
+        self.step_spin = QDoubleSpinBox()
+        self.step_spin.setRange(0.0, 1e6)
+        self.step_spin.setDecimals(6)
+        self.step_spin.setValue(float(axis_config.get("step", 0.01)))
+
+        self.jog_minus_btn = QPushButton("−")
+        self.jog_plus_btn = QPushButton("+")
+        self.stop_btn = QPushButton("Stop")
+        self.home_btn = QPushButton("Home")
+        self.enable_btn = QPushButton("Enable")
+        self.disable_btn = QPushButton("Disable")
+
+        self._build_layout()
+        self._wire_signals()
+
+        try:
+            self.axis.open()
+            self._refresh_id()
+            self.status_label.setText(f"connected on {self.axis.port}")
+        except (serial_exception_safe(), ConexError) as e:
+            self.status_label.setText(f"open failed: {e}")
+            self._set_motion_enabled(False)
+            return
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+        self.timer.start(self.POLL_MS)
+
+    def _build_layout(self) -> None:
+        outer = QVBoxLayout(self)
+
+        outer.addWidget(self.status_label)
+        outer.addWidget(self.position_label)
+        outer.addWidget(self.id_label)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(sep)
+
+        abs_row = QHBoxLayout()
+        abs_row.addWidget(QLabel("Target:"))
+        abs_row.addWidget(self.target_spin, stretch=1)
+        abs_row.addWidget(self.go_btn)
+        outer.addLayout(abs_row)
+
+        step_row = QHBoxLayout()
+        step_row.addWidget(QLabel("Step:"))
+        step_row.addWidget(self.step_spin, stretch=1)
+        outer.addLayout(step_row)
+
+        jog_row = QHBoxLayout()
+        jog_row.addWidget(self.jog_minus_btn)
+        jog_row.addWidget(self.jog_plus_btn)
+        outer.addLayout(jog_row)
+
+        action_row = QHBoxLayout()
+        action_row.addWidget(self.stop_btn)
+        action_row.addWidget(self.home_btn)
+        outer.addLayout(action_row)
+
+        enable_row = QHBoxLayout()
+        enable_row.addWidget(self.enable_btn)
+        enable_row.addWidget(self.disable_btn)
+        outer.addLayout(enable_row)
+
+        outer.addStretch(1)
+
+    def _wire_signals(self) -> None:
+        self.go_btn.clicked.connect(self._on_go)
+        self.jog_minus_btn.clicked.connect(lambda: self._safe(self.axis.move_relative, -self.step_spin.value()))
+        self.jog_plus_btn.clicked.connect(lambda: self._safe(self.axis.move_relative, self.step_spin.value()))
+        self.stop_btn.clicked.connect(lambda: self._safe(self.axis.stop))
+        self.home_btn.clicked.connect(lambda: self._safe(self.axis.home))
+        self.enable_btn.clicked.connect(lambda: self._safe(self.axis.enable))
+        self.disable_btn.clicked.connect(lambda: self._safe(self.axis.disable))
+
+    def _set_motion_enabled(self, enabled: bool) -> None:
+        for btn in (
+            self.go_btn,
+            self.jog_minus_btn,
+            self.jog_plus_btn,
+            self.stop_btn,
+            self.home_btn,
+            self.enable_btn,
+            self.disable_btn,
+        ):
+            btn.setEnabled(enabled)
+
+    def _on_go(self) -> None:
+        self._safe(self.axis.move_absolute, self.target_spin.value())
+
+    def _safe(self, fn, *args) -> None:
+        try:
+            fn(*args)
+        except Exception as e:
+            self.status_label.setText(f"err: {e}")
+
+    def _refresh_id(self) -> None:
+        try:
+            self.id_label.setText(self.axis.identify())
+        except Exception:
+            self.id_label.setText("")
+
+    def poll(self) -> None:
+        if not self.axis.is_open:
+            return
+        try:
+            pos = self.axis.position()
+            self.position_label.setText(f"{pos:.6f} {self.units}")
+        except Exception as e:
+            self.position_label.setText(f"pos err: {e}")
+        try:
+            state_code, error_code = self.axis.state()
+            label = state_label(state_code)
+            err_suffix = "" if error_code == "00" else f"  [err {error_code}]"
+            self.status_label.setText(f"{label}{err_suffix}")
+        except Exception as e:
+            self.status_label.setText(f"state err: {e}")
+
+    def shutdown(self) -> None:
+        if hasattr(self, "timer"):
+            self.timer.stop()
+        self.axis.close()
+
+
+def serial_exception_safe():
+    """Return pyserial's SerialException if importable, else a sentinel."""
+    try:
+        from serial import SerialException
+        return SerialException
+    except Exception:
+        return RuntimeError
+
+
 class CameraWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -97,15 +263,18 @@ class CameraWindow(QMainWindow):
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMinimumSize(640, 480)
 
+        config = load_config()
+
         settings_panel = self._build_settings_panel()
+        axes_panel, self.axis_panels = self._build_axes_panel(config.get("axis", []))
 
         central = QWidget()
         layout = QHBoxLayout(central)
         layout.addWidget(settings_panel)
         layout.addWidget(self.label, stretch=1)
+        layout.addWidget(axes_panel)
         self.setCentralWidget(central)
 
-        config = load_config()
         cti = resolve_cti(config["gentl"]["producer"])
         device_index = int(config.get("camera", {}).get("device_index", 0))
 
@@ -150,6 +319,19 @@ class CameraWindow(QMainWindow):
         layout.addWidget(options, stretch=1)
         return panel
 
+    def _build_axes_panel(self, axes_cfg: list[dict]) -> tuple[QWidget, list[ConexAxisPanel]]:
+        panel = QWidget()
+        panel.setFixedWidth(280)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        panels: list[ConexAxisPanel] = []
+        for cfg in axes_cfg:
+            ap = ConexAxisPanel(cfg)
+            panels.append(ap)
+            layout.addWidget(ap)
+        layout.addStretch(1)
+        return panel, panels
+
     def tick(self) -> None:
         try:
             with self.acquirer.fetch(timeout=1.0) as buffer:
@@ -168,6 +350,11 @@ class CameraWindow(QMainWindow):
             self.label.setText(f"frame error: {e}")
 
     def closeEvent(self, event) -> None:
+        for ap in getattr(self, "axis_panels", []):
+            try:
+                ap.shutdown()
+            except Exception:
+                pass
         try:
             self.acquirer.stop()
             self.acquirer.destroy()

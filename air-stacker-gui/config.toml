@@ -8,3 +8,19 @@ producer = 'C:\Program Files\FLIR Systems\Spinnaker\cti64\vs2015'
 [camera]
 # Zero-based index into the producer's enumerated device list.
 device_index = 0
+
+# CONEX-CC axes. Each entry is one controller on its own COM port (address 1 by convention).
+# Z vs spin assignment is unconfirmed — rename and reorder once we identify the stages.
+[[axis]]
+name = "Axis A"
+port = "COM3"
+baud = 921600
+units = "mm"
+step = 0.01
+
+[[axis]]
+name = "Axis B"
+port = "COM4"
+baud = 921600
+units = "mm"
+step = 0.01
