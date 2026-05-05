@@ -294,13 +294,18 @@ class CameraWindow(QMainWindow):
         presets_layout = QVBoxLayout(presets)
         presets_layout.addWidget(QLabel("TODO"))
 
-        options = QGroupBox("Options")
-        options_layout = QVBoxLayout(options)
-        options_layout.addWidget(QLabel("TODO"))
+        camera_options = QGroupBox("Camera Options")
+        camera_options_layout = QVBoxLayout(camera_options)
+        camera_options_layout.addWidget(QLabel("TODO"))
+
+        heater = QGroupBox("Heater")
+        heater_layout = QVBoxLayout(heater)
+        heater_layout.addWidget(QLabel("TODO"))
 
         layout.addWidget(recording)
         layout.addWidget(presets)
-        layout.addWidget(options, stretch=1)
+        layout.addWidget(camera_options)
+        layout.addWidget(heater, stretch=1)
         return panel
 
     def _build_axes_panel(self, axes_cfg: list[dict]) -> QWidget:
