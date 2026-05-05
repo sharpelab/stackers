@@ -12,6 +12,8 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QGroupBox,
+    QHBoxLayout,
     QLabel,
     QMainWindow,
     QVBoxLayout,
@@ -75,9 +77,13 @@ class CameraWindow(QMainWindow):
         self.label = QLabel("connecting…")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMinimumSize(640, 480)
+
+        settings_panel = self._build_settings_panel()
+
         central = QWidget()
-        layout = QVBoxLayout(central)
-        layout.addWidget(self.label)
+        layout = QHBoxLayout(central)
+        layout.addWidget(settings_panel)
+        layout.addWidget(self.label, stretch=1)
         self.setCentralWidget(central)
 
         config = load_config()
@@ -95,6 +101,24 @@ class CameraWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
         self.timer.start(33)
+
+    def _build_settings_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setFixedWidth(240)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        presets = QGroupBox("Presets")
+        presets_layout = QVBoxLayout(presets)
+        presets_layout.addWidget(QLabel("TODO"))
+
+        options = QGroupBox("Options")
+        options_layout = QVBoxLayout(options)
+        options_layout.addWidget(QLabel("TODO"))
+
+        layout.addWidget(presets)
+        layout.addWidget(options, stretch=1)
+        return panel
 
     def tick(self) -> None:
         try:
