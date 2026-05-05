@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from conex import ConexAxis, ConexError, state_label
+from conex import ConexAxis, state_label
 
 try:
     import tomllib
@@ -135,17 +135,18 @@ class ConexAxisPanel(QGroupBox):
         self._build_layout()
         self._wire_signals()
 
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.poll)
+
         try:
             self.axis.open()
-            self._refresh_id()
-            self.status_label.setText(f"connected on {self.axis.port}")
-        except (serial_exception_safe(), ConexError) as e:
+        except Exception as e:
             self.status_label.setText(f"open failed: {e}")
             self._set_motion_enabled(False)
             return
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.poll)
+        self.id_label.setText(self.axis.identify())
+        self.status_label.setText(f"connected on {self.axis.port}")
         self.timer.start(self.POLL_MS)
 
     def _build_layout(self) -> None:
@@ -218,15 +219,7 @@ class ConexAxisPanel(QGroupBox):
         except Exception as e:
             self.status_label.setText(f"err: {e}")
 
-    def _refresh_id(self) -> None:
-        try:
-            self.id_label.setText(self.axis.identify())
-        except Exception:
-            self.id_label.setText("")
-
     def poll(self) -> None:
-        if not self.axis.is_open:
-            return
         try:
             pos = self.axis.position()
             self.position_label.setText(f"{pos:.6f} {self.units}")
@@ -241,18 +234,8 @@ class ConexAxisPanel(QGroupBox):
             self.status_label.setText(f"state err: {e}")
 
     def shutdown(self) -> None:
-        if hasattr(self, "timer"):
-            self.timer.stop()
+        self.timer.stop()
         self.axis.close()
-
-
-def serial_exception_safe():
-    """Return pyserial's SerialException if importable, else a sentinel."""
-    try:
-        from serial import SerialException
-        return SerialException
-    except Exception:
-        return RuntimeError
 
 
 class CameraWindow(QMainWindow):
@@ -263,10 +246,11 @@ class CameraWindow(QMainWindow):
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMinimumSize(640, 480)
 
-        config = load_config()
+        self.axis_panels: list[ConexAxisPanel] = []
 
+        config = load_config()
         settings_panel = self._build_settings_panel()
-        axes_panel, self.axis_panels = self._build_axes_panel(config.get("axis", []))
+        axes_panel = self._build_axes_panel(config.get("axis", []))
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -319,18 +303,17 @@ class CameraWindow(QMainWindow):
         layout.addWidget(options, stretch=1)
         return panel
 
-    def _build_axes_panel(self, axes_cfg: list[dict]) -> tuple[QWidget, list[ConexAxisPanel]]:
+    def _build_axes_panel(self, axes_cfg: list[dict]) -> QWidget:
         panel = QWidget()
         panel.setFixedWidth(280)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-        panels: list[ConexAxisPanel] = []
         for cfg in axes_cfg:
             ap = ConexAxisPanel(cfg)
-            panels.append(ap)
+            self.axis_panels.append(ap)
             layout.addWidget(ap)
         layout.addStretch(1)
-        return panel, panels
+        return panel
 
     def tick(self) -> None:
         try:
@@ -350,16 +333,11 @@ class CameraWindow(QMainWindow):
             self.label.setText(f"frame error: {e}")
 
     def closeEvent(self, event) -> None:
-        for ap in getattr(self, "axis_panels", []):
-            try:
-                ap.shutdown()
-            except Exception:
-                pass
-        try:
-            self.acquirer.stop()
-            self.acquirer.destroy()
-        finally:
-            self.harvester.reset()
+        for ap in self.axis_panels:
+            ap.shutdown()
+        self.acquirer.stop()
+        self.acquirer.destroy()
+        self.harvester.reset()
         super().closeEvent(event)
 
 
