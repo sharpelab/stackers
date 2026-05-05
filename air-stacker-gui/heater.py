@@ -20,21 +20,14 @@ REG_RUN_MODE = 576        # 0x0240 — RUN_MODE (16-bit enum; writes Control, re
 REG_SP1_MODE = 736        # 0x02E0 — SETPOINT_1_MODE (16-bit enum; 0=Absolute, 1=Deviation, …)
 REG_OUTPUT1_MODE = 1025   # 0x0401 — OUTPUT_1_MODE (16-bit enum; 0=Off, 1=PID, 2=On/Off, …)
 
-# Run-mode reads return the System State enum (manual §3.2.1).
+# RUN_MODE reads echo the Control enum we wrote (manual §3.2.1), not
+# the broader System State enum (which lives at SYSTEM_STATUS / 0x0204).
 RUN_MODE_LABELS = {
-    0: "LOAD",
-    1: "IDLE",
-    2: "INPUT_ADJ",
-    3: "CTRL_ADJ",
-    4: "MODIFY",
-    5: "WAIT",
-    6: "RUN",
-    7: "STANDBY",
-    8: "STOP",
-    9: "PAUSE",
-    10: "FAULT",
-    11: "SHUTDOWN",
-    12: "AUTOTUNE",
+    0: "STOP",
+    1: "RUN",
+    2: "CANCEL",
+    3: "AUTO_ON",
+    4: "CONTINUOUS",
 }
 
 SETPOINT_MODE_LABELS = {
