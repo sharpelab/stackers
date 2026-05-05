@@ -1,95 +1,75 @@
 # Heater driver handoff
 
-Pause point on the Air Stacker heater panel. The current
-`heater.py` is patched into a working state for setpoint + run/stop, but
-the controller still won't produce output ("OPER manual" on the front
-panel display, output stuck at 0%). Decision: stop swatting individual
-register bugs and rewrite the driver properly when picked back up.
+Driver rewritten as the `heater/` package (was `heater.py`). The remaining
+known-broken behaviour is the front-panel **Manual Mode (M.CNt)** override
+holding output at 0%.
 
-Reference: [Omega Platinum M5458 Modbus Interface manual](../docs/omega-platinum-m5458-modbus.pdf)
-(now committed in `docs/`).
+References committed in `docs/`:
+- [M5458 Modbus interface](../../docs/omega-platinum-m5458-modbus.pdf) — register map + enums
+- [M5451 controller user guide](../../docs/omega-platinum-m5451-user-manual.pdf) — front-panel menus, OPER modes (M5451 §6.4 documents M.CNt / M.INP)
 
-## What works
+## Package layout
 
-- `REG_PV` (0x0210) — process value reads ✓
-- `REG_SP1_CURRENT` (0x0220) — active SP1 read ✓
-- `REG_SP1_ABSOLUTE` (0x02E2) — SP1 *write* target ✓ (writes to the
-  volatile working copy at 0x0220 alone get stomped each loop; the
-  controller refreshes it from the NV absolute value)
-- `REG_PID_OUTPUT` (0x022A) — output % read ✓
-- `REG_RUN_MODE` (0x0240) — run/stop writes ✓
-- UI: setpoint auto-applies on `editingFinished`, Run/Stop buttons
-  separate, no Set button.
+```
+heater/
+  __init__.py    # public API: OmegaPlatinum, Control, SystemState, diagnose, ...
+  registers.py   # Register dataclass + every register we touch (single source of truth)
+  enums.py       # Control, SystemState, SetpointMode, OutputMode, ProcessMode
+  driver.py      # OmegaPlatinum class
+  diagnose.py    # one-shot state snapshot
+```
 
-## What's broken
+Key API decisions:
+- **Setpoint writes go to `CURRENT_SETPOINT_1` (0x0220) only.** Never the NV
+  `ABSOLUTE_SETPOINT_1` (0x02E2) — per M5458 §3.1 NV registers should only
+  be written during configuration.
+- **`run()` writes `Control.CONTINUOUS` (4)** — "continuously (repeatedly)
+  enabled" reads as steady-state PID, vs `START` (1) / `AUTO_ON` (3) which
+  read as one-shot triggers.
+- **Reads of `RUN_MODE` (0x0240) decode as `SystemState`**, not `Control`.
+  M5458 §3.2.1 defines both enums; the register is asymmetric (write Control,
+  read SystemState). The `SystemState.STANDBY` (7) and `PAUSE` (9) values
+  are diagnostic gold — both suppress output while the controller is
+  technically "in OPER".
+- **Low-level `set_control(Control)`** is exposed so we can A/B test other
+  enum values from a REPL without code edits.
+- **`Diag` button** in the heater panel calls `diagnose()` and prints to
+  stdout: PV, SP, control_setpoint, output%, system_state, system_status,
+  setpoint_mode, output_mode, process_mode — one shot, one place.
 
-Controller boots in OPER + manual override. Output % is held at 0
-regardless of SP. None of the writes we tried to RUN_MODE flip it
-out of manual:
+## Open: M.CNt manual-output hold
 
-- `START (1)` → state shows IDLE (or AUTO_ON label echoes back), no output
-- `AUTO_ON (3)` → state shows AUTO_ON / 6, no output
-- `STOP (0)` → STOP, no output (expected)
+The front panel "OPER manual" hold at boot is M5451 §6.4 Manual Mode →
+M.CNt ("manually vary the control output(s)"). The official Platinum
+Configurator GUI exposes this as a button, so it's reachable via *some*
+protocol — we just haven't found the register.
 
-Steven's note: this is a manual-output hold, separate from RUN/STOP,
-toggleable from the front panel on the old Platinum software. We have
-not yet found the Modbus register (or magic command sequence) that
-clears it.
+What we've ruled out:
+- `PROCESS_SCALE_ENABLE` (0x0245) LIVE/MANUAL is **input-side** (M.INP),
+  not output-side (M.CNt). M5458 §3.2.4 + register description.
+- M5458 has no register named or described as "manual output mode".
 
-## Asymmetric `RUN_MODE` reads
-
-Discovered late: reads from `RUN_MODE` (0x0240) sometimes return the
-**Control** enum we wrote (0=STOP, 1=START, 3=AUTO_ON) and sometimes
-return values from the **System State** enum (e.g. 6=RUN). We've been
-flipping the label table back and forth without a clean answer. The
-right move is probably to read **`SYSTEM_STATUS`** (0x0204, 32-bit L)
-for the displayed state and treat `RUN_MODE` strictly as a control
-write target. (`SYSTEM_STATUS` enum is in M5458 §3.2.1.)
-
-## Things to try when picking it back up
-
-1. **Read `SYSTEM_STATUS` (0x0204) for display state**, leave
-   `RUN_MODE` write-only in the API. This drops the dual-enum mess.
-2. **`PROCESS_SCALE_ENABLE` (0x0245)** — values are LIVE_MODE (0) /
-   MANUAL_MODE (1). Description is about *input* scaling but worth
-   reading and (carefully) toggling — possibly the hook for the
-   manual-vs-live behavior we're seeing.
-3. **Read `OUTPUT_1_MODE` (0x0401)** — confirm it's `PID (1)` not
-   `OFF (0)`. We added `OmegaPlatinum.output_1_mode()` for this.
-4. **Read `SETPOINT_1_MODE` (0x02E0)** — confirm it's `ABSOLUTE (0)`
-   so writes to `ABSOLUTE_SETPOINT_1` actually drive PID. Helper
-   already exists: `OmegaPlatinum.setpoint_mode()`.
-5. **Capture USB serial traffic from the old Platinum software**
-   when the user clicks its Manual/Auto toggle. That's the cheapest
-   way to find the magic register/sequence — point a serial sniffer
-   at the USB-CDC port (or run the app in a VM with logging).
-6. **Talk to Steven** for the front-panel key combo and any tribal
-   knowledge about the old software's manual-toggle implementation.
-
-## Direction for the rewrite
-
-`heater.py` has accreted comment-on-comment-of-corrections. When picking
-back up, suggest a clean redo:
-
-- Single source of truth for register definitions (a dataclass per
-  register: address, name, type, RW, NV).
-- Separate read API (`status()` returns `SystemState`) from write API
-  (`start()`, `stop()`, `set_sp(...)`).
-- Explicit handling of NV writes (rate limit, optional verify-readback).
-- A `diagnose()` that dumps SP mode, output mode, system status, run
-  mode, PV, SP, output% in one shot — for troubleshooting like this.
-- Probably move it into its own package (`air_stacker_gui/heater/`)
-  with manual transcripts from the M5458 PDF as docstrings on the
-  enum classes.
+Things to try next (in order of cheapness):
+1. **`Diag` button while controller is in M.CNt** — capture system_state,
+   system_status, output_mode. Will tell us whether the hold maps to a
+   known enum value (e.g. STANDBY=7) and is clearable via `set_control()`.
+2. **Try writing `PID_OUTPUT` (0x022A) directly.** Manual marks it R but
+   the Configurator might write here for M.CNt — read-only labels in
+   Omega manuals have been wrong before.
+3. **USB-CDC sniff** the Platinum Configurator while clicking Manual/Auto
+   — `wireshark + usbmon` on Linux, or Free Serial Port Monitor on the
+   Windows box. Cheapest source-of-truth.
+4. **Front-panel EXIT** clears M.CNt (M5451 §6.4 last line). Combined with
+   `SAFETY_DELAYED_OPER_RUN` (0x02C1) defaulting to *return to last OPER
+   mode at power-on*, the controller boots back into M.CNt unless EXIT
+   was pressed before power-down. Documenting as the manual-recovery path.
 
 ## Recent commits in flight
 
 ```
+66acb9e heater: stash manual + handoff before driver rewrite
 9d06869 heater: use AUTO_ON on Run to bypass manual override
 3a68b7f heater: revert run-mode labels to Control enum
 0862e4a heater: auto-apply setpoint, add Run button, expand state labels
 646d036 heater: correct register map per M5458 manual
-34f422d heater: Set enters RUN, add Stop button
-552487c add PID output % readout to heater panel
-a86f44b add Omega Platinum heater driver and panel
 ```

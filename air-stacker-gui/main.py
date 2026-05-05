@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
 )
 
 from conex import ConexAxis, state_label
-from heater import OmegaPlatinum, run_mode_label
+from heater import OmegaPlatinum, diagnose
 
 try:
     import tomllib
@@ -267,6 +267,7 @@ class HeaterPanel(QGroupBox):
         self.setpoint_spin.setKeyboardTracking(False)
         self.run_btn = QPushButton("Run")
         self.stop_btn = QPushButton("Stop")
+        self.diag_btn = QPushButton("Diag")
 
         outer = QVBoxLayout(self)
         outer.addWidget(self.status_label)
@@ -281,12 +282,14 @@ class HeaterPanel(QGroupBox):
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.stop_btn)
+        btn_row.addWidget(self.diag_btn)
         outer.addLayout(btn_row)
         outer.addStretch(1)
 
         self.setpoint_spin.editingFinished.connect(self._on_set)
         self.run_btn.clicked.connect(self._on_run)
         self.stop_btn.clicked.connect(self._on_stop)
+        self.diag_btn.clicked.connect(self._on_diag)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -298,6 +301,7 @@ class HeaterPanel(QGroupBox):
             self.setpoint_spin.setEnabled(False)
             self.run_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
+            self.diag_btn.setEnabled(False)
             return
 
         self.status_label.setText(f"connected on {self.heater.port}")
@@ -311,17 +315,21 @@ class HeaterPanel(QGroupBox):
 
     def _on_run(self) -> None:
         try:
-            # AUTO_ON (3) rather than START (1): "immediately started",
-            # the closest thing in the Control enum to "leave manual override."
-            self.heater.set_run_mode(3)
+            self.heater.run()
         except Exception as e:
             self.status_label.setText(f"run err: {e}")
 
     def _on_stop(self) -> None:
         try:
-            self.heater.set_run_mode(0)
+            self.heater.stop()
         except Exception as e:
             self.status_label.setText(f"stop err: {e}")
+
+    def _on_diag(self) -> None:
+        try:
+            print(diagnose(self.heater).summary(), flush=True)
+        except Exception as e:
+            self.status_label.setText(f"diag err: {e}")
 
     def poll(self) -> None:
         try:
@@ -336,12 +344,12 @@ class HeaterPanel(QGroupBox):
         except Exception:
             pass
         try:
-            mode = self.heater.run_mode()
-            self.run_label.setText(f"run: {run_mode_label(mode)}")
+            state = self.heater.system_state()
+            self.run_label.setText(f"state: {state.name}")
         except Exception:
             self.run_label.setText("")
         try:
-            out = self.heater.output()
+            out = self.heater.output_percent()
             self.output_label.setText(f"output: {out:.1f} %")
         except Exception as e:
             self.output_label.setText(f"output err: {e}")
