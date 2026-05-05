@@ -5,6 +5,8 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import time
+from collections import deque
 from pathlib import Path
 
 import cv2
@@ -93,6 +95,35 @@ def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
     if fmt.startswith("BGR"):
         return cv2.cvtColor(data.reshape(height, width, 3), cv2.COLOR_BGR2RGB)
     raise ValueError(f"unsupported pixel format: {fmt}")
+
+
+class CameraDisplay(QLabel):
+    """Camera frame view with a bottom-left FPS overlay."""
+
+    OVERLAY_MARGIN = 8
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fps_label = QLabel("-- fps", self)
+        self.fps_label.setStyleSheet(
+            "color: white; background-color: rgba(0, 0, 0, 140);"
+            " padding: 2px 6px; border-radius: 3px;"
+        )
+        self.fps_label.adjustSize()
+        self._reposition_overlay()
+
+    def set_fps(self, fps: float | None) -> None:
+        self.fps_label.setText("-- fps" if fps is None else f"{fps:.1f} fps")
+        self.fps_label.adjustSize()
+        self._reposition_overlay()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._reposition_overlay()
+
+    def _reposition_overlay(self) -> None:
+        m = self.OVERLAY_MARGIN
+        self.fps_label.move(m, self.height() - self.fps_label.height() - m)
 
 
 class ConexAxisPanel(QGroupBox):
@@ -456,9 +487,12 @@ class CameraWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Air Stacker — live")
-        self.label = QLabel("connecting…")
+        self.label = CameraDisplay()
+        self.label.setText("connecting…")
         self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMinimumSize(640, 480)
+        self._frame_times: deque[float] = deque(maxlen=60)
+        self._fps_last_update = 0.0
 
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
@@ -565,8 +599,22 @@ class CameraWindow(QMainWindow):
                     Qt.TransformationMode.SmoothTransformation,
                 )
                 self.label.setPixmap(pix)
+                self._update_fps()
         except Exception as e:
             self.label.setText(f"frame error: {e}")
+            self._frame_times.clear()
+            self.label.set_fps(None)
+
+    def _update_fps(self) -> None:
+        now = time.monotonic()
+        self._frame_times.append(now)
+        if now - self._fps_last_update < 0.25:
+            return
+        self._fps_last_update = now
+        if len(self._frame_times) >= 2:
+            span = self._frame_times[-1] - self._frame_times[0]
+            fps = (len(self._frame_times) - 1) / span if span > 0 else None
+            self.label.set_fps(fps)
 
     def closeEvent(self, event) -> None:
         for ap in self.axis_panels:
