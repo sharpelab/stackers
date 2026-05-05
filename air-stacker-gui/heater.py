@@ -98,3 +98,7 @@ class OmegaPlatinum:
     # --- writes (use with intent) ---
     def set_setpoint(self, value: float) -> None:
         self._write_float(REG_SP1, value)
+
+    def set_run_mode(self, code: int) -> None:
+        with self._lock:
+            self._inst.write_register(REG_RUN_MODE, code, functioncode=6)

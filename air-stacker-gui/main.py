@@ -265,6 +265,7 @@ class HeaterPanel(QGroupBox):
         self.setpoint_spin.setDecimals(2)
         self.setpoint_spin.setSingleStep(1.0)
         self.set_btn = QPushButton("Set")
+        self.stop_btn = QPushButton("Stop")
 
         outer = QVBoxLayout(self)
         outer.addWidget(self.status_label)
@@ -277,9 +278,13 @@ class HeaterPanel(QGroupBox):
         sp_row.addWidget(self.setpoint_spin, stretch=1)
         sp_row.addWidget(self.set_btn)
         outer.addLayout(sp_row)
+        btn_row = QHBoxLayout()
+        btn_row.addWidget(self.stop_btn)
+        outer.addLayout(btn_row)
         outer.addStretch(1)
 
         self.set_btn.clicked.connect(self._on_set)
+        self.stop_btn.clicked.connect(self._on_stop)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
@@ -289,6 +294,7 @@ class HeaterPanel(QGroupBox):
         except Exception as e:
             self.status_label.setText(f"open failed: {e}")
             self.set_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
             return
 
         self.status_label.setText(f"connected on {self.heater.port}")
@@ -297,8 +303,15 @@ class HeaterPanel(QGroupBox):
     def _on_set(self) -> None:
         try:
             self.heater.set_setpoint(self.setpoint_spin.value())
+            self.heater.set_run_mode(1)
         except Exception as e:
             self.status_label.setText(f"set err: {e}")
+
+    def _on_stop(self) -> None:
+        try:
+            self.heater.set_run_mode(0)
+        except Exception as e:
+            self.status_label.setText(f"stop err: {e}")
 
     def poll(self) -> None:
         try:
