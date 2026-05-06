@@ -7,10 +7,9 @@ Manuals in `docs/`:
 
 from .diagnose import Diagnosis, diagnose
 from .driver import OmegaPlatinum
-from .enums import Control, OutputMode, ProcessMode, SetpointMode, SystemState
+from .enums import OutputMode, ProcessMode, SetpointMode, SystemState
 
 __all__ = [
-    "Control",
     "Diagnosis",
     "OmegaPlatinum",
     "OutputMode",

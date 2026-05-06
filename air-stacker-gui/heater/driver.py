@@ -12,7 +12,7 @@ import threading
 import minimalmodbus
 
 from . import registers as R
-from .enums import Control, OutputMode, ProcessMode, SetpointMode, SystemState
+from .enums import OutputMode, ProcessMode, SetpointMode, SystemState
 
 
 class OmegaPlatinum:
@@ -84,7 +84,13 @@ class OmegaPlatinum:
         return float(self.read(R.PV))
 
     def setpoint(self) -> float:
-        return float(self.read(R.SETPOINT_1))
+        """Read configured ABSOLUTE_SETPOINT_1 (0x02E2).
+
+        Matches the write target in ABSOLUTE mode, so round-trips with
+        set_setpoint(). 0x0220 (CURRENT_SETPOINT_1) mirrors this value
+        in ABSOLUTE mode but is exposed via diagnose() rather than here.
+        """
+        return float(self.read(R.ABSOLUTE_SETPOINT_1))
 
     def control_setpoint(self) -> float:
         return float(self.read(R.CONTROL_SETPOINT))
@@ -110,21 +116,35 @@ class OmegaPlatinum:
     # --- public writes ---
 
     def set_setpoint(self, value: float) -> None:
-        """Write the volatile working SP1 (CURRENT_SETPOINT_1, 0x0220).
+        """Write SP1, dispatching to the right register by SETPOINT_1_MODE.
 
-        Never writes the NV ABSOLUTE_SETPOINT_1 — per the manual, NV registers
-        should only be written during configuration.
+        In ABSOLUTE mode (the only one we have a USB capture for), the
+        active SP source is ABSOLUTE_SETPOINT_1 (0x02E2). Writes to the
+        working register CURRENT_SETPOINT_1 (0x0220) are silently dropped
+        in this mode. Other modes (DEVIATION, REMOTE, EXTERNAL,
+        RAMP_SOAK) raise NotImplementedError until we capture how
+        Configurator handles them.
         """
-        self.write(R.SETPOINT_1, value)
+        mode = self.setpoint_mode()
+        if mode is SetpointMode.ABSOLUTE:
+            self.write(R.ABSOLUTE_SETPOINT_1, value)
+        else:
+            raise NotImplementedError(
+                f"setpoint write in {mode.name} mode not supported"
+            )
 
-    def set_control(self, command: Control) -> None:
-        """Low-level RUN_MODE write. Use run()/stop() for the common cases."""
-        self.write(R.RUN_MODE, int(command))
+    def set_run_mode(self, state: SystemState) -> None:
+        """Write a SystemState value to RUN_MODE (0x0240).
+
+        RUN_MODE is symmetric: write SystemState `N`, read SystemState
+        `N` back (verified by USB capture of the Omega Configurator).
+        """
+        self.write(R.RUN_MODE, int(state))
 
     def run(self) -> None:
-        """Engage continuous PID control (Control.CONTINUOUS = 4)."""
-        self.set_control(Control.CONTINUOUS)
+        """Engage PID control (SystemState.RUN = 6)."""
+        self.set_run_mode(SystemState.RUN)
 
     def stop(self) -> None:
-        """Halt control output (Control.STOP = 0)."""
-        self.set_control(Control.STOP)
+        """Halt control output (SystemState.STOP = 8)."""
+        self.set_run_mode(SystemState.STOP)

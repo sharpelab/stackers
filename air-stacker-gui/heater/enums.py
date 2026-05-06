@@ -5,24 +5,19 @@ from __future__ import annotations
 from enum import IntEnum
 
 
-class Control(IntEnum):
-    """Commands written to RUN_MODE (0x0240). M5458 §3.2.1.
-
-    Reads of the same register return SystemState values, not these.
-    """
-
-    STOP = 0
-    START = 1
-    CANCEL = 2
-    AUTO_ON = 3
-    CONTINUOUS = 4
-
-
 class SystemState(IntEnum):
-    """Decoded reads of RUN_MODE (0x0240). M5458 §3.2.1.
+    """RUN_MODE (0x0240) values, used for both reads and writes.
 
-    STANDBY (7) and PAUSE (9) suppress output even when the controller
-    appears "running" — useful flags when output is stuck at 0%.
+    USB capture of the Omega Configurator (2026-05-06) confirmed the
+    register is symmetric: writing N puts the controller in state N,
+    and reads return the same values. The M5458 §3.2.1 "Control" enum
+    (STOP/START/CANCEL/AUTO_ON/CONTINUOUS) is documented but does not
+    bind to this register — it applies to trigger registers like
+    FACTORY_RESET and PID_AUTOTUNE_START.
+
+    Writing RUN (6) engages PID. Writing STOP (8) halts control.
+    Other values (STANDBY, PAUSE, ...) are mostly observed in reads
+    rather than commanded, but the register accepts them.
     """
 
     LOAD = 0
