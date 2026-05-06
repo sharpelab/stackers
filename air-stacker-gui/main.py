@@ -12,7 +12,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from harvesters.core import Harvester
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -124,6 +124,44 @@ class CameraDisplay(QLabel):
     def _reposition_overlay(self) -> None:
         m = self.OVERLAY_MARGIN
         self.fps_label.move(m, self.height() - self.fps_label.height() - m)
+
+
+class CameraWorker(QObject):
+    """Pulls frames off the harvesters acquirer in a worker thread.
+
+    Emits each fully-converted RGB ndarray via `frame_ready`. The signal
+    crosses to the GUI thread automatically (queued connection), keeping
+    the main thread free for blits and input handling.
+    """
+
+    frame_ready = Signal(object)  # np.ndarray, but keep meta-type as object
+    error = Signal(str)
+    finished = Signal()
+
+    def __init__(self, acquirer) -> None:
+        super().__init__()
+        self._acquirer = acquirer
+        self._running = False
+
+    @Slot()
+    def run(self) -> None:
+        self._running = True
+        while self._running:
+            try:
+                with self._acquirer.fetch(timeout=0.5) as buffer:
+                    comp = buffer.payload.components[0]
+                    rgb = np.ascontiguousarray(
+                        to_rgb(comp.data, comp.width, comp.height, comp.data_format)
+                    ).copy()
+                self.frame_ready.emit(rgb)
+            except Exception as e:  # noqa: BLE001 — surface errors then keep trying
+                self.error.emit(str(e))
+                time.sleep(0.1)
+        self.finished.emit()
+
+    def stop(self) -> None:
+        """Request loop exit. Safe to call from any thread."""
+        self._running = False
 
 
 class ConexAxisPanel(QGroupBox):
@@ -524,9 +562,14 @@ class CameraWindow(QMainWindow):
         layout.addWidget(right_panel)
         self.setCentralWidget(central)
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.tick)
-        self.timer.start(16)
+        self.camera_thread = QThread()
+        self.camera_worker = CameraWorker(self.acquirer)
+        self.camera_worker.moveToThread(self.camera_thread)
+        self.camera_thread.started.connect(self.camera_worker.run)
+        self.camera_worker.frame_ready.connect(self._on_frame)
+        self.camera_worker.error.connect(self._on_frame_error)
+        self.camera_worker.finished.connect(self.camera_thread.quit)
+        self.camera_thread.start()
 
     def _apply_camera_startup(self) -> None:
         """Set acquisition mode + balance-white-auto before .start().
@@ -585,29 +628,21 @@ class CameraWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
-    def tick(self) -> None:
-        try:
-            with self.acquirer.fetch(timeout=0.5) as buffer:
-                comp = buffer.payload.components[0]
-                # Force a copy so rgb owns its memory (some to_rgb paths
-                # return a view into the buffer that becomes invalid on
-                # release).
-                rgb = np.ascontiguousarray(
-                    to_rgb(comp.data, comp.width, comp.height, comp.data_format)
-                ).copy()
-            h, w, _ = rgb.shape
-            qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
-            pix = QPixmap.fromImage(qimg).scaled(
-                self.label.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.FastTransformation,
-            )
-            self.label.setPixmap(pix)
-            self._update_fps()
-        except Exception as e:
-            self.label.setText(f"frame error: {e}")
-            self._frame_times.clear()
-            self.label.set_fps(None)
+    def _on_frame(self, rgb) -> None:
+        h, w, _ = rgb.shape
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.FastTransformation,
+        )
+        self.label.setPixmap(pix)
+        self._update_fps()
+
+    def _on_frame_error(self, msg: str) -> None:
+        self.label.setText(f"frame error: {msg}")
+        self._frame_times.clear()
+        self.label.set_fps(None)
 
     def _update_fps(self) -> None:
         now = time.monotonic()
@@ -621,6 +656,10 @@ class CameraWindow(QMainWindow):
             self.label.set_fps(fps)
 
     def closeEvent(self, event) -> None:
+        self.camera_worker.stop()
+        self.camera_thread.quit()
+        if not self.camera_thread.wait(2000):
+            print("camera thread did not exit cleanly", file=sys.stderr)
         for ap in self.axis_panels:
             ap.shutdown()
         if self.heater_panel is not None:
