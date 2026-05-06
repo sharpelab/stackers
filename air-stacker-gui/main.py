@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import os
 import sys
+import threading
 import time
 from collections import deque
 from pathlib import Path
@@ -129,12 +130,14 @@ class CameraDisplay(QLabel):
 class CameraWorker(QObject):
     """Pulls frames off the harvesters acquirer in a worker thread.
 
-    Emits each fully-converted RGB ndarray via `frame_ready`. The signal
-    crosses to the GUI thread automatically (queued connection), keeping
-    the main thread free for blits and input handling.
+    Latest-frame mailbox: each new RGB array overwrites the slot. The
+    `frame_ready` signal is emitted only on the empty→full transition,
+    so at most one notification is in-flight; if the GUI thread is
+    behind, it picks up the newest frame on next slot run rather than
+    backlogging older ones.
     """
 
-    frame_ready = Signal(object)  # np.ndarray, but keep meta-type as object
+    frame_ready = Signal()  # mailbox notify only; main thread pulls via take_latest()
     error = Signal(str)
     finished = Signal()
 
@@ -142,6 +145,8 @@ class CameraWorker(QObject):
         super().__init__()
         self._acquirer = acquirer
         self._running = False
+        self._lock = threading.Lock()
+        self._latest: np.ndarray | None = None
 
     @Slot()
     def run(self) -> None:
@@ -153,11 +158,22 @@ class CameraWorker(QObject):
                     rgb = np.ascontiguousarray(
                         to_rgb(comp.data, comp.width, comp.height, comp.data_format)
                     ).copy()
-                self.frame_ready.emit(rgb)
+                with self._lock:
+                    notify = self._latest is None
+                    self._latest = rgb
+                if notify:
+                    self.frame_ready.emit()
             except Exception as e:  # noqa: BLE001 — surface errors then keep trying
                 self.error.emit(str(e))
                 time.sleep(0.1)
         self.finished.emit()
+
+    def take_latest(self) -> np.ndarray | None:
+        """Pop the most-recent frame, or None if already drained."""
+        with self._lock:
+            f = self._latest
+            self._latest = None
+            return f
 
     def stop(self) -> None:
         """Request loop exit. Safe to call from any thread."""
@@ -628,7 +644,10 @@ class CameraWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
-    def _on_frame(self, rgb) -> None:
+    def _on_frame(self) -> None:
+        rgb = self.camera_worker.take_latest()
+        if rgb is None:
+            return  # drained by a previous slot run
         h, w, _ = rgb.shape
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
         pix = QPixmap.fromImage(qimg).scaled(
