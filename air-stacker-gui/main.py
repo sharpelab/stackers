@@ -526,7 +526,7 @@ class CameraWindow(QMainWindow):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(33)
+        self.timer.start(16)
 
     def _apply_camera_startup(self) -> None:
         """Set acquisition mode + balance-white-auto before .start().
@@ -587,19 +587,23 @@ class CameraWindow(QMainWindow):
 
     def tick(self) -> None:
         try:
-            with self.acquirer.fetch(timeout=1.0) as buffer:
+            with self.acquirer.fetch(timeout=0.5) as buffer:
                 comp = buffer.payload.components[0]
-                rgb = to_rgb(comp.data, comp.width, comp.height, comp.data_format)
-                rgb = np.ascontiguousarray(rgb)
-                h, w, _ = rgb.shape
-                qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
-                pix = QPixmap.fromImage(qimg).scaled(
-                    self.label.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                self.label.setPixmap(pix)
-                self._update_fps()
+                # Force a copy so rgb owns its memory (some to_rgb paths
+                # return a view into the buffer that becomes invalid on
+                # release).
+                rgb = np.ascontiguousarray(
+                    to_rgb(comp.data, comp.width, comp.height, comp.data_format)
+                ).copy()
+            h, w, _ = rgb.shape
+            qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+            pix = QPixmap.fromImage(qimg).scaled(
+                self.label.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.FastTransformation,
+            )
+            self.label.setPixmap(pix)
+            self._update_fps()
         except Exception as e:
             self.label.setText(f"frame error: {e}")
             self._frame_times.clear()
