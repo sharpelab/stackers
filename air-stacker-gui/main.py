@@ -389,7 +389,7 @@ class CameraOptionsPanel(QGroupBox):
             spin.setValue(current)
         except Exception as e:
             spin.setEnabled(False)
-            print(f"camera {name}: {e}", file=sys.stderr)
+            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
 
     def _init_auto(self, name: str, cb: QCheckBox, manual_spin: QDoubleSpinBox, default_on: bool) -> None:
         try:
@@ -399,14 +399,14 @@ class CameraOptionsPanel(QGroupBox):
             manual_spin.setEnabled(not default_on)
         except Exception as e:
             cb.setEnabled(False)
-            print(f"camera {name}: {e}", file=sys.stderr)
+            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
 
     def _set_float(self, name: str, value: float) -> None:
         try:
             node = getattr(self.node_map, name)
             node.value = max(node.min, min(node.max, float(value)))
         except Exception as e:
-            print(f"camera {name}: {e}", file=sys.stderr)
+            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
 
     def _set_auto(self, name: str, on: bool, manual_spin: QDoubleSpinBox) -> None:
         try:
@@ -414,7 +414,7 @@ class CameraOptionsPanel(QGroupBox):
             node.value = "Continuous" if on else "Off"
             manual_spin.setEnabled(not on)
         except Exception as e:
-            print(f"camera {name}: {e}", file=sys.stderr)
+            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
 
 
 class HeaterPanel(QGroupBox):
@@ -569,8 +569,12 @@ class CameraWindow(QMainWindow):
             if not self.harvester.device_info_list:
                 raise RuntimeError("no cameras enumerated by GenTL producer")
             self.acquirer = self.harvester.create(device_index)
-            self._apply_camera_startup()
-            self.acquirer.start()
+
+        # Camera config + start: outside silenced_stderr so any errors and
+        # our diagnostic prints are visible. silenced_stderr was originally
+        # only there to mute the GenTL producer's enumeration noise.
+        self._apply_camera_startup()
+        self.acquirer.start()
 
         settings_panel = self._build_settings_panel(camera_cfg)
         right_panel = self._build_right_panel(config.get("axis", []), config.get("heater"))
@@ -611,7 +615,7 @@ class CameraWindow(QMainWindow):
             try:
                 getattr(nm, name).value = value
             except Exception as e:
-                print(f"camera {name}: {e}", file=sys.stderr)
+                print(f"camera {name}: {e}", file=sys.stderr, flush=True)
         # The "enabled" node is named differently across FLIR generations.
         for name in ("AcquisitionFrameRateEnabled", "AcquisitionFrameRateEnable"):
             try:
@@ -626,9 +630,10 @@ class CameraWindow(QMainWindow):
                 f"camera AcquisitionFrameRate = {rate.value:.2f} Hz "
                 f"(range {rate.min:.2f}..{rate.max:.2f})",
                 file=sys.stderr,
+                flush=True,
             )
         except Exception as e:
-            print(f"camera AcquisitionFrameRate: {e}", file=sys.stderr)
+            print(f"camera AcquisitionFrameRate: {e}", file=sys.stderr, flush=True)
 
     def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
         panel = QWidget()
@@ -708,7 +713,7 @@ class CameraWindow(QMainWindow):
         self.camera_worker.stop()
         self.camera_thread.quit()
         if not self.camera_thread.wait(2000):
-            print("camera thread did not exit cleanly", file=sys.stderr)
+            print("camera thread did not exit cleanly", file=sys.stderr, flush=True)
         for ap in self.axis_panels:
             ap.shutdown()
         if self.heater_panel is not None:
