@@ -236,6 +236,9 @@ class ConexAxisPanel(QGroupBox):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
+        self._poll_total = 0.0
+        self._poll_max = 0.0
+        self._poll_count = 0
 
         try:
             self.axis.open()
@@ -319,6 +322,7 @@ class ConexAxisPanel(QGroupBox):
             self.status_label.setText(f"err: {e}")
 
     def poll(self) -> None:
+        t0 = time.monotonic()
         try:
             pos = self.axis.position()
             self.position_label.setText(f"{pos:.6f} {self.units}")
@@ -334,6 +338,22 @@ class ConexAxisPanel(QGroupBox):
             self.status_label.setText(f"{label}{err_suffix}")
         except Exception as e:
             self.status_label.setText(f"state err: {e}")
+        elapsed = time.monotonic() - t0
+        self._poll_total += elapsed
+        self._poll_max = max(self._poll_max, elapsed)
+        self._poll_count += 1
+        if self._poll_count >= 20:
+            avg_ms = self._poll_total / self._poll_count * 1000
+            max_ms = self._poll_max * 1000
+            print(
+                f"[axis {self.title()}] poll avg={avg_ms:.1f}ms "
+                f"max={max_ms:.1f}ms n={self._poll_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._poll_total = 0.0
+            self._poll_max = 0.0
+            self._poll_count = 0
 
     def shutdown(self) -> None:
         self.timer.stop()
@@ -483,6 +503,9 @@ class HeaterPanel(QGroupBox):
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll)
+        self._poll_total = 0.0
+        self._poll_max = 0.0
+        self._poll_count = 0
 
         try:
             self.heater.open()
@@ -526,6 +549,7 @@ class HeaterPanel(QGroupBox):
             self.status_label.setText(f"diag err: {e}")
 
     def poll(self) -> None:
+        t0 = time.monotonic()
         try:
             pv = self.heater.process_value()
             self.pv_label.setText(f"{pv:.2f} {self.units}")
@@ -547,6 +571,22 @@ class HeaterPanel(QGroupBox):
             self.output_label.setText(f"output: {out:.1f} %")
         except Exception as e:
             self.output_label.setText(f"output err: {e}")
+        elapsed = time.monotonic() - t0
+        self._poll_total += elapsed
+        self._poll_max = max(self._poll_max, elapsed)
+        self._poll_count += 1
+        if self._poll_count >= 5:
+            avg_ms = self._poll_total / self._poll_count * 1000
+            max_ms = self._poll_max * 1000
+            print(
+                f"[heater] poll avg={avg_ms:.1f}ms "
+                f"max={max_ms:.1f}ms n={self._poll_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._poll_total = 0.0
+            self._poll_max = 0.0
+            self._poll_count = 0
 
     def shutdown(self) -> None:
         self.timer.stop()
