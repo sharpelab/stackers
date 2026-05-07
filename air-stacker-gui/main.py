@@ -151,6 +151,8 @@ class CameraWorker(QObject):
     @Slot()
     def run(self) -> None:
         self._running = True
+        log_count = 0
+        log_start = time.monotonic()
         while self._running:
             try:
                 with self._acquirer.fetch(timeout=0.5) as buffer:
@@ -163,6 +165,16 @@ class CameraWorker(QObject):
                     self._latest = rgb
                 if notify:
                     self.frame_ready.emit()
+                log_count += 1
+                now = time.monotonic()
+                if now - log_start > 2.0:
+                    print(
+                        f"[camera] produced {log_count / (now - log_start):.1f} fps",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    log_count = 0
+                    log_start = now
             except Exception as e:  # noqa: BLE001 — surface errors then keep trying
                 self.error.emit(str(e))
                 time.sleep(0.1)
@@ -551,6 +563,9 @@ class CameraWindow(QMainWindow):
         self.label.setMinimumSize(640, 480)
         self._frame_times: deque[float] = deque(maxlen=60)
         self._fps_last_update = 0.0
+        self._proc_total = 0.0
+        self._proc_max = 0.0
+        self._proc_count = 0
 
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
@@ -683,15 +698,34 @@ class CameraWindow(QMainWindow):
         rgb = self.camera_worker.take_latest()
         if rgb is None:
             return  # drained by a previous slot run
+        t0 = time.monotonic()
         h, w, _ = rgb.shape
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
-        pix = QPixmap.fromImage(qimg).scaled(
+        # Scale on the QImage (smaller buffer) before converting to QPixmap
+        # — QPixmap.fromImage on a full 1280x1024 frame is the dominant
+        # blit cost on Windows.
+        scaled = qimg.scaled(
             self.label.size(),
             Qt.AspectRatioMode.KeepAspectRatio,
             Qt.TransformationMode.FastTransformation,
         )
-        self.label.setPixmap(pix)
+        self.label.setPixmap(QPixmap.fromImage(scaled))
         self._update_fps()
+        elapsed = time.monotonic() - t0
+        self._proc_total += elapsed
+        self._proc_max = max(self._proc_max, elapsed)
+        self._proc_count += 1
+        if self._proc_count >= 60:
+            avg_ms = self._proc_total / self._proc_count * 1000
+            max_ms = self._proc_max * 1000
+            print(
+                f"[gui] _on_frame avg={avg_ms:.1f}ms max={max_ms:.1f}ms n={self._proc_count}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._proc_total = 0.0
+            self._proc_max = 0.0
+            self._proc_count = 0
 
     def _on_frame_error(self, msg: str) -> None:
         self.label.setText(f"frame error: {msg}")
