@@ -483,6 +483,10 @@ class HeaterPanel(QGroupBox):
             return
 
         self.status_label.setText(f"connected on {self.heater.port}")
+        # Pre-populate the panel from the controller before the periodic
+        # timer kicks in, so the setpoint spinner and labels reflect the
+        # heater's real state from t=0 instead of the spinner's default 0.
+        self.poll()
         self.timer.start(int(cfg.get("poll_interval_ms", 1000)))
 
     def _on_set(self) -> None:
