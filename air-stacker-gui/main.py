@@ -13,7 +13,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 from harvesters.core import Harvester
-from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -127,6 +127,43 @@ class CameraDisplay(QLabel):
         self.fps_label.move(m, self.height() - self.fps_label.height() - m)
 
 
+class PollWorker(QObject):
+    """Generic device-polling worker.
+
+    Calls `read_fn()` in its own thread, emits the result via
+    `state_ready`, sleeps `poll_interval_s` between iterations. The
+    main thread connects a slot to `state_ready` and updates Qt
+    widgets there (queued connection across threads).
+
+    `read_fn` runs on the worker thread, so it must not touch Qt
+    widgets — only do the device I/O and return a payload (dict
+    works well for partial-failure handling).
+    """
+
+    state_ready = Signal(object)
+    finished = Signal()
+
+    def __init__(self, read_fn, poll_interval_s: float) -> None:
+        super().__init__()
+        self._read = read_fn
+        self._interval = poll_interval_s
+        self._stop_event = threading.Event()
+
+    @Slot()
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                payload = self._read()
+            except Exception as e:  # noqa: BLE001 — surface and continue
+                payload = {"_worker_err": str(e)}
+            self.state_ready.emit(payload)
+            self._stop_event.wait(self._interval)
+        self.finished.emit()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
 class CameraWorker(QObject):
     """Pulls frames off the harvesters acquirer in a worker thread.
 
@@ -234,11 +271,8 @@ class ConexAxisPanel(QGroupBox):
         self._build_layout()
         self._wire_signals()
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.poll)
-        self._poll_total = 0.0
-        self._poll_max = 0.0
-        self._poll_count = 0
+        self._worker: PollWorker | None = None
+        self._worker_thread: QThread | None = None
 
         try:
             self.axis.open()
@@ -249,7 +283,14 @@ class ConexAxisPanel(QGroupBox):
 
         self.id_label.setText(self.axis.identify())
         self.status_label.setText(f"connected on {self.axis.port}")
-        self.timer.start(self.POLL_MS)
+
+        self._worker_thread = QThread()
+        self._worker = PollWorker(self._read_state, self.POLL_MS / 1000.0)
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.state_ready.connect(self._apply_state)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.start()
 
     def _build_layout(self) -> None:
         outer = QVBoxLayout(self)
@@ -321,42 +362,49 @@ class ConexAxisPanel(QGroupBox):
         except Exception as e:
             self.status_label.setText(f"err: {e}")
 
-    def poll(self) -> None:
-        t0 = time.monotonic()
+    def _read_state(self) -> dict:
+        """Worker-thread: read axis state. Must not touch Qt widgets."""
+        payload: dict = {}
         try:
-            pos = self.axis.position()
-            self.position_label.setText(f"{pos:.6f} {self.units}")
-        except Exception as e:
-            self.position_label.setText(f"pos err: {e}")
+            payload["pos"] = self.axis.position()
+        except Exception as e:  # noqa: BLE001
+            payload["pos_err"] = str(e)
         try:
-            state_code, error_code = self.axis.state()
-            label = state_label(state_code)
+            sc, ec = self.axis.state()
+            payload["state_code"] = sc
+            payload["error_code"] = ec
+        except Exception as e:  # noqa: BLE001
+            payload["state_err"] = str(e)
+        return payload
+
+    @Slot(object)
+    def _apply_state(self, payload: dict) -> None:
+        """Main-thread: render a payload from the polling worker."""
+        if "pos" in payload:
+            self.position_label.setText(f"{payload['pos']:.6f} {self.units}")
+        elif "pos_err" in payload:
+            self.position_label.setText(f"pos err: {payload['pos_err']}")
+        if "state_code" in payload:
+            label = state_label(payload["state_code"])
+            err = payload["error_code"]
             err_suffix = (
-                "" if error_code == "0000"
-                else f"  [err {error_code}: {error_label(error_code)}]"
+                "" if err == "0000"
+                else f"  [err {err}: {error_label(err)}]"
             )
             self.status_label.setText(f"{label}{err_suffix}")
-        except Exception as e:
-            self.status_label.setText(f"state err: {e}")
-        elapsed = time.monotonic() - t0
-        self._poll_total += elapsed
-        self._poll_max = max(self._poll_max, elapsed)
-        self._poll_count += 1
-        if self._poll_count >= 20:
-            avg_ms = self._poll_total / self._poll_count * 1000
-            max_ms = self._poll_max * 1000
-            print(
-                f"[axis {self.title()}] poll avg={avg_ms:.1f}ms "
-                f"max={max_ms:.1f}ms n={self._poll_count}",
-                file=sys.stderr,
-                flush=True,
-            )
-            self._poll_total = 0.0
-            self._poll_max = 0.0
-            self._poll_count = 0
+        elif "state_err" in payload:
+            self.status_label.setText(f"state err: {payload['state_err']}")
 
     def shutdown(self) -> None:
-        self.timer.stop()
+        if self._worker is not None and self._worker_thread is not None:
+            self._worker.stop()
+            self._worker_thread.quit()
+            if not self._worker_thread.wait(2000):
+                print(
+                    f"axis {self.title()} thread did not exit cleanly",
+                    file=sys.stderr,
+                    flush=True,
+                )
         self.axis.close()
 
 
@@ -501,11 +549,9 @@ class HeaterPanel(QGroupBox):
         self.stop_btn.clicked.connect(self._on_stop)
         self.diag_btn.clicked.connect(self._on_diag)
 
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.poll)
-        self._poll_total = 0.0
-        self._poll_max = 0.0
-        self._poll_count = 0
+        self._poll_interval_s = int(cfg.get("poll_interval_ms", 1000)) / 1000.0
+        self._worker: PollWorker | None = None
+        self._worker_thread: QThread | None = None
 
         try:
             self.heater.open()
@@ -518,11 +564,17 @@ class HeaterPanel(QGroupBox):
             return
 
         self.status_label.setText(f"connected on {self.heater.port}")
-        # Pre-populate the panel from the controller before the periodic
-        # timer kicks in, so the setpoint spinner and labels reflect the
-        # heater's real state from t=0 instead of the spinner's default 0.
-        self.poll()
-        self.timer.start(int(cfg.get("poll_interval_ms", 1000)))
+        # Pre-populate before the worker starts so the spinner and labels
+        # show real values from t=0 instead of QDoubleSpinBox's default 0.
+        self._apply_state(self._read_state())
+
+        self._worker_thread = QThread()
+        self._worker = PollWorker(self._read_state, self._poll_interval_s)
+        self._worker.moveToThread(self._worker_thread)
+        self._worker_thread.started.connect(self._worker.run)
+        self._worker.state_ready.connect(self._apply_state)
+        self._worker.finished.connect(self._worker_thread.quit)
+        self._worker_thread.start()
 
     def _on_set(self) -> None:
         try:
@@ -548,48 +600,55 @@ class HeaterPanel(QGroupBox):
         except Exception as e:
             self.status_label.setText(f"diag err: {e}")
 
-    def poll(self) -> None:
-        t0 = time.monotonic()
+    def _read_state(self) -> dict:
+        """Worker-thread: read heater state. Must not touch Qt widgets."""
+        payload: dict = {}
         try:
-            pv = self.heater.process_value()
-            self.pv_label.setText(f"{pv:.2f} {self.units}")
-        except Exception as e:
-            self.pv_label.setText(f"pv err: {e}")
+            payload["pv"] = self.heater.process_value()
+        except Exception as e:  # noqa: BLE001
+            payload["pv_err"] = str(e)
         try:
-            sp = self.heater.setpoint()
-            if not self.setpoint_spin.hasFocus():
-                self.setpoint_spin.setValue(sp)
-        except Exception:
+            payload["sp"] = self.heater.setpoint()
+        except Exception:  # noqa: BLE001 — keep going
             pass
         try:
-            state = self.heater.system_state()
-            self.run_label.setText(f"state: {state.name}")
-        except Exception:
-            self.run_label.setText("")
+            payload["state"] = self.heater.system_state()
+        except Exception:  # noqa: BLE001
+            pass
         try:
-            out = self.heater.output_percent()
-            self.output_label.setText(f"output: {out:.1f} %")
-        except Exception as e:
-            self.output_label.setText(f"output err: {e}")
-        elapsed = time.monotonic() - t0
-        self._poll_total += elapsed
-        self._poll_max = max(self._poll_max, elapsed)
-        self._poll_count += 1
-        if self._poll_count >= 5:
-            avg_ms = self._poll_total / self._poll_count * 1000
-            max_ms = self._poll_max * 1000
-            print(
-                f"[heater] poll avg={avg_ms:.1f}ms "
-                f"max={max_ms:.1f}ms n={self._poll_count}",
-                file=sys.stderr,
-                flush=True,
-            )
-            self._poll_total = 0.0
-            self._poll_max = 0.0
-            self._poll_count = 0
+            payload["out"] = self.heater.output_percent()
+        except Exception as e:  # noqa: BLE001
+            payload["out_err"] = str(e)
+        return payload
+
+    @Slot(object)
+    def _apply_state(self, payload: dict) -> None:
+        """Main-thread: render a payload from the polling worker."""
+        if "pv" in payload:
+            self.pv_label.setText(f"{payload['pv']:.2f} {self.units}")
+        elif "pv_err" in payload:
+            self.pv_label.setText(f"pv err: {payload['pv_err']}")
+        if "sp" in payload and not self.setpoint_spin.hasFocus():
+            self.setpoint_spin.setValue(payload["sp"])
+        if "state" in payload:
+            self.run_label.setText(f"state: {payload['state'].name}")
+        else:
+            self.run_label.setText("")
+        if "out" in payload:
+            self.output_label.setText(f"output: {payload['out']:.1f} %")
+        elif "out_err" in payload:
+            self.output_label.setText(f"output err: {payload['out_err']}")
 
     def shutdown(self) -> None:
-        self.timer.stop()
+        if self._worker is not None and self._worker_thread is not None:
+            self._worker.stop()
+            self._worker_thread.quit()
+            if not self._worker_thread.wait(2000):
+                print(
+                    "heater thread did not exit cleanly",
+                    file=sys.stderr,
+                    flush=True,
+                )
         self.heater.close()
 
 
