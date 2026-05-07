@@ -588,17 +588,43 @@ class CameraWindow(QMainWindow):
         self.camera_thread.start()
 
     def _apply_camera_startup(self) -> None:
-        """Set acquisition mode + balance-white-auto before .start().
+        """Set acquisition mode, balance-white-auto, and unlock the frame rate.
 
-        Gain / exposure / their auto modes are applied by CameraOptionsPanel
-        from the camera section of config.toml.
+        Frame rate matters: SpinView leaves AcquisitionFrameRate set on the
+        camera (it's persistent), so without resetting it we inherit
+        whatever the last user picked. We turn off auto, enable explicit
+        control, and pin to the camera's max for live preview.
+
+        Gain / exposure / their auto modes are applied later by
+        CameraOptionsPanel from the camera section of config.toml.
         """
         nm = self.acquirer.remote_device.node_map
-        for name, value in (("AcquisitionMode", "Continuous"), ("BalanceWhiteAuto", "Continuous")):
+        for name, value in (
+            ("AcquisitionMode", "Continuous"),
+            ("BalanceWhiteAuto", "Continuous"),
+            ("AcquisitionFrameRateAuto", "Off"),
+        ):
             try:
                 getattr(nm, name).value = value
             except Exception as e:
                 print(f"camera {name}: {e}", file=sys.stderr)
+        # The "enabled" node is named differently across FLIR generations.
+        for name in ("AcquisitionFrameRateEnabled", "AcquisitionFrameRateEnable"):
+            try:
+                getattr(nm, name).value = True
+                break
+            except Exception:
+                continue
+        try:
+            rate = nm.AcquisitionFrameRate
+            rate.value = float(rate.max)
+            print(
+                f"camera AcquisitionFrameRate = {rate.value:.2f} Hz "
+                f"(range {rate.min:.2f}..{rate.max:.2f})",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(f"camera AcquisitionFrameRate: {e}", file=sys.stderr)
 
     def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
         panel = QWidget()
