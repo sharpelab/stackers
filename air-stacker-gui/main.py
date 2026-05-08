@@ -356,10 +356,13 @@ class _CameraGLWindow(QOpenGLWindow):
             self._ensure_texture(sw, sh)
             assert self._tex is not None  # set by _ensure_texture
             if self._frame_dirty:
+                # Pass the numpy buffer directly via the buffer protocol —
+                # avoids the ~5 MB tobytes() copy that occasionally spikes
+                # paint past the 16.7 ms vsync boundary.
                 self._tex.setData(
                     QOpenGLTexture.PixelFormat.RGB,
                     QOpenGLTexture.PixelType.UInt8,
-                    self._frame_ref.tobytes(),
+                    self._frame_ref.data,
                 )
                 self._frame_dirty = False
             tw, th = self.width(), self.height()
