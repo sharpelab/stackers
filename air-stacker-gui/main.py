@@ -358,26 +358,120 @@ class PollWorker(QObject):
         self._stop_event.set()
 
 
-class CameraWorker(QObject):
-    """Pulls frames off the harvesters acquirer in a worker thread.
+class FrameMailbox:
+    """Single-slot, latest-wins mailbox between worker threads.
 
-    Latest-frame mailbox: each new RGB array overwrites the slot. The
-    `frame_ready` signal is emitted only on the empty→full transition,
-    so at most one notification is in-flight; if the GUI thread is
-    behind, it picks up the newest frame on next slot run rather than
-    backlogging older ones.
+    publish() overwrites whatever's there and wakes a waiting taker.
+    take(timeout) blocks until a frame is published or the timeout
+    expires. Drops intermediate frames silently — by design, since
+    the consumer always wants the freshest one.
     """
 
-    frame_ready = Signal()  # mailbox notify only; main thread pulls via take_latest()
-    histograms_ready = Signal(object)  # carries (3, 256) int64 ndarray
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._latest: np.ndarray | None = None
+        self._wake = threading.Event()
+
+    def publish(self, frame: np.ndarray) -> None:
+        with self._lock:
+            self._latest = frame
+        self._wake.set()
+
+    def take(self, timeout: float | None = None) -> np.ndarray | None:
+        if not self._wake.wait(timeout):
+            return None
+        self._wake.clear()
+        with self._lock:
+            f = self._latest
+            self._latest = None
+            return f
+
+    def wake(self) -> None:
+        """Unblock any taker — used to break the take() wait at shutdown."""
+        self._wake.set()
+
+
+class CameraAcquireWorker(QObject):
+    """Thread A: pull from harvesters, debayer, hand off to processing.
+
+    Stays pinned to the camera frame rate. Pushes debayered RGB
+    frames into a FrameMailbox; if processing is slower than the
+    camera, intermediate frames drop at that mailbox (latest-wins),
+    but the camera buffer queue stays drained.
+    """
+
     error = Signal(str)
     finished = Signal()
 
-    HIST_INTERVAL_S = 0.2  # ~5 Hz (camera runs at ~60 Hz)
-
-    def __init__(self, acquirer, adjustments: ImageAdjustments | None = None) -> None:
+    def __init__(self, acquirer, mailbox: FrameMailbox) -> None:
         super().__init__()
         self._acquirer = acquirer
+        self._mailbox = mailbox
+        self._running = False
+
+    @Slot()
+    def run(self) -> None:
+        self._running = True
+        log_count = 0
+        log_start = time.monotonic()
+        t_fetch = t_debayer = t_publish = 0.0
+        while self._running:
+            try:
+                t0 = time.monotonic()
+                with self._acquirer.fetch(timeout=0.5) as buffer:
+                    comp = buffer.payload.components[0]
+                    t1 = time.monotonic()
+                    rgb = to_rgb(comp.data, comp.width, comp.height, comp.data_format)
+                t2 = time.monotonic()
+                self._mailbox.publish(rgb)
+                t3 = time.monotonic()
+                t_fetch += t1 - t0
+                t_debayer += t2 - t1
+                t_publish += t3 - t2
+                log_count += 1
+                if t3 - log_start > 2.0:
+                    span = t3 - log_start
+                    log.info(
+                        "acq    %.1f fps  fetch=%.1f deb=%.1f pub=%.2f ms/frame",
+                        log_count / span,
+                        t_fetch / log_count * 1000,
+                        t_debayer / log_count * 1000,
+                        t_publish / log_count * 1000,
+                    )
+                    log_count = 0
+                    log_start = t3
+                    t_fetch = t_debayer = t_publish = 0.0
+            except Exception as e:  # noqa: BLE001 — surface errors then keep trying
+                self.error.emit(str(e))
+                time.sleep(0.1)
+        self.finished.emit()
+
+    def stop(self) -> None:
+        self._running = False
+
+
+class CameraProcessWorker(QObject):
+    """Thread B: histogram + adjustments + GUI handoff.
+
+    Decoupled from the camera: takes the latest debayered frame
+    from the acquire mailbox, runs the heavy per-pixel work, and
+    publishes the result for the GUI. Slow adjustments don't back
+    up the camera queue — they just reduce the *processed* fps.
+    """
+
+    frame_ready = Signal()
+    histograms_ready = Signal(object)
+    finished = Signal()
+
+    HIST_INTERVAL_S = 0.2  # ~5 Hz
+
+    def __init__(
+        self,
+        source: FrameMailbox,
+        adjustments: ImageAdjustments | None = None,
+    ) -> None:
+        super().__init__()
+        self._source = source
         self._adjustments = adjustments
         self._running = False
         self._lock = threading.Lock()
@@ -389,76 +483,63 @@ class CameraWorker(QObject):
         log_count = 0
         log_start = time.monotonic()
         hist_last = 0.0
-        # Per-step timing accumulators.
-        t_fetch = t_debayer = t_hist = t_adjust = t_publish = 0.0
+        t_wait = t_hist = t_adjust = t_publish = 0.0
         while self._running:
-            try:
-                t0 = time.monotonic()
-                with self._acquirer.fetch(timeout=0.5) as buffer:
-                    comp = buffer.payload.components[0]
-                    t1 = time.monotonic()
-                    # to_rgb returns an owned contiguous buffer for every
-                    # input format — safe to use after the buffer requeues.
-                    rgb = to_rgb(comp.data, comp.width, comp.height, comp.data_format)
-                t2 = time.monotonic()
-                # Histograms are computed on the raw frame (pre-adjustment)
-                # so they read like a stable baseline of the sensor output.
-                if t2 - hist_last > self.HIST_INTERVAL_S:
-                    hist_last = t2
+            t0 = time.monotonic()
+            rgb = self._source.take(timeout=0.1)
+            if rgb is None:
+                continue
+            t1 = time.monotonic()
+            if t1 - hist_last > self.HIST_INTERVAL_S:
+                hist_last = t1
+                try:
+                    self.histograms_ready.emit(compute_histograms(rgb))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("histogram err: %s", e)
+            t2 = time.monotonic()
+            if self._adjustments is not None:
+                snap = self._adjustments.get()
+                if not snap.is_identity:
                     try:
-                        self.histograms_ready.emit(compute_histograms(rgb))
+                        rgb = apply_adjustments(rgb, snap)
                     except Exception as e:  # noqa: BLE001
-                        log.warning("camera histogram err: %s", e)
-                t3 = time.monotonic()
-                if self._adjustments is not None:
-                    snap = self._adjustments.get()
-                    if not snap.is_identity:
-                        try:
-                            rgb = apply_adjustments(rgb, snap)
-                        except Exception as e:  # noqa: BLE001
-                            log.warning("camera adjustment err: %s", e)
-                t4 = time.monotonic()
-                with self._lock:
-                    notify = self._latest is None
-                    self._latest = rgb
-                if notify:
-                    self.frame_ready.emit()
-                t5 = time.monotonic()
-                t_fetch += t1 - t0
-                t_debayer += t2 - t1
-                t_hist += t3 - t2
-                t_adjust += t4 - t3
-                t_publish += t5 - t4
-                log_count += 1
-                if t5 - log_start > 2.0:
-                    span = t5 - log_start
-                    log.info(
-                        "camera produced %.1f fps  fetch=%.1f deb=%.1f hist=%.1f adj=%.1f pub=%.2f ms/frame",
-                        log_count / span,
-                        t_fetch / log_count * 1000,
-                        t_debayer / log_count * 1000,
-                        t_hist / log_count * 1000,
-                        t_adjust / log_count * 1000,
-                        t_publish / log_count * 1000,
-                    )
-                    log_count = 0
-                    log_start = t5
-                    t_fetch = t_debayer = t_hist = t_adjust = t_publish = 0.0
-            except Exception as e:  # noqa: BLE001 — surface errors then keep trying
-                self.error.emit(str(e))
-                time.sleep(0.1)
+                        log.warning("adjustment err: %s", e)
+            t3 = time.monotonic()
+            with self._lock:
+                notify = self._latest is None
+                self._latest = rgb
+            if notify:
+                self.frame_ready.emit()
+            t4 = time.monotonic()
+            t_wait += t1 - t0
+            t_hist += t2 - t1
+            t_adjust += t3 - t2
+            t_publish += t4 - t3
+            log_count += 1
+            if t4 - log_start > 2.0:
+                span = t4 - log_start
+                log.info(
+                    "proc   %.1f fps  wait=%.1f hist=%.1f adj=%.1f pub=%.2f ms/frame",
+                    log_count / span,
+                    t_wait / log_count * 1000,
+                    t_hist / log_count * 1000,
+                    t_adjust / log_count * 1000,
+                    t_publish / log_count * 1000,
+                )
+                log_count = 0
+                log_start = t4
+                t_wait = t_hist = t_adjust = t_publish = 0.0
         self.finished.emit()
 
     def take_latest(self) -> np.ndarray | None:
-        """Pop the most-recent frame, or None if already drained."""
         with self._lock:
             f = self._latest
             self._latest = None
             return f
 
     def stop(self) -> None:
-        """Request loop exit. Safe to call from any thread."""
         self._running = False
+        self._source.wake()  # unblock the take(timeout) wait
 
 
 class ConexAxisPanel(QGroupBox):
@@ -1072,7 +1153,7 @@ class ImageAdjustmentsPanel(QGroupBox):
 
     @Slot(object)
     def set_histograms(self, hist: np.ndarray) -> None:
-        """Slot for CameraWorker.histograms_ready ((3, 256) int array)."""
+        """Slot for CameraProcessWorker.histograms_ready ((3, 256) int array)."""
         if hist.shape != (3, 256):
             return
         self.r_hist.set_data(hist[0])
@@ -1372,19 +1453,33 @@ class CameraWindow(QMainWindow):
         layout.addWidget(right_panel)
         self.setCentralWidget(central)
 
-        self.camera_thread = QThread()
-        self.camera_worker = CameraWorker(self.acquirer, self.adjustments)
-        self.camera_worker.moveToThread(self.camera_thread)
-        self.camera_thread.started.connect(self.camera_worker.run)
-        self.camera_worker.frame_ready.connect(self._on_frame)
-        self.camera_worker.error.connect(self._on_frame_error)
-        self.camera_worker.finished.connect(self.camera_thread.quit)
+        # Two-stage pipeline: acq thread fetches+debayers and pushes
+        # into the acq mailbox; proc thread takes the latest, runs
+        # histogram + adjustments, and publishes for the GUI. Slow
+        # adjustments slow the proc rate but never the acq rate.
+        self.acq_mailbox = FrameMailbox()
+
+        self.acq_thread = QThread()
+        self.acq_worker = CameraAcquireWorker(self.acquirer, self.acq_mailbox)
+        self.acq_worker.moveToThread(self.acq_thread)
+        self.acq_thread.started.connect(self.acq_worker.run)
+        self.acq_worker.error.connect(self._on_frame_error)
+        self.acq_worker.finished.connect(self.acq_thread.quit)
+
+        self.proc_thread = QThread()
+        self.proc_worker = CameraProcessWorker(self.acq_mailbox, self.adjustments)
+        self.proc_worker.moveToThread(self.proc_thread)
+        self.proc_thread.started.connect(self.proc_worker.run)
+        self.proc_worker.frame_ready.connect(self._on_frame)
+        self.proc_worker.finished.connect(self.proc_thread.quit)
         if self.adjustments_panel is not None:
-            self.camera_worker.histograms_ready.connect(
+            self.proc_worker.histograms_ready.connect(
                 self.adjustments_panel.set_histograms,
                 Qt.ConnectionType.QueuedConnection,
             )
-        self.camera_thread.start()
+
+        self.acq_thread.start()
+        self.proc_thread.start()
 
     def _apply_camera_startup(self) -> None:
         """Set acquisition mode, balance-white-auto, and unlock the frame rate.
@@ -1470,7 +1565,7 @@ class CameraWindow(QMainWindow):
         return panel
 
     def _on_frame(self) -> None:
-        rgb = self.camera_worker.take_latest()
+        rgb = self.proc_worker.take_latest()
         if rgb is None:
             return  # drained by a previous slot run
         t0 = time.monotonic()
@@ -1515,10 +1610,16 @@ class CameraWindow(QMainWindow):
             self.label.set_fps(fps)
 
     def closeEvent(self, event) -> None:
-        self.camera_worker.stop()
-        self.camera_thread.quit()
-        if not self.camera_thread.wait(2000):
-            log.warning("camera thread did not exit cleanly")
+        # Stop acq first so no new frames land in the mailbox; then
+        # proc, which will drain its take(timeout) wait via the wake.
+        self.acq_worker.stop()
+        self.proc_worker.stop()
+        self.acq_thread.quit()
+        self.proc_thread.quit()
+        if not self.acq_thread.wait(2000):
+            log.warning("acq thread did not exit cleanly")
+        if not self.proc_thread.wait(2000):
+            log.warning("proc thread did not exit cleanly")
         for ap in self.axis_panels:
             ap.shutdown()
         if self.heater_panel is not None:
