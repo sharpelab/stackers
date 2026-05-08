@@ -16,8 +16,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 from harvesters.core import Harvester
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
+from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -245,12 +245,21 @@ def compute_histograms(rgb: np.ndarray) -> np.ndarray:
 
 
 class CameraDisplay(QLabel):
-    """Camera frame view with a bottom-left FPS overlay."""
+    """Camera frame view with a bottom-left FPS overlay.
+
+    Frames are accepted at full source size via set_frame(); scaling
+    happens in paintEvent via QPainter.drawImage so per-frame CPU
+    cost is bounded by the source, not by the window size.
+    """
 
     OVERLAY_MARGIN = 8
 
     def __init__(self) -> None:
         super().__init__()
+        self._image: QImage | None = None
+        # Hold the numpy buffer the QImage views into until the next
+        # frame arrives — QImage(data, ...) does not own its bytes.
+        self._frame_ref = None
         self.fps_label = QLabel("-- fps", self)
         self.fps_label.setStyleSheet(
             "color: white; background-color: rgba(0, 0, 0, 140);"
@@ -258,6 +267,16 @@ class CameraDisplay(QLabel):
         )
         self.fps_label.adjustSize()
         self._reposition_overlay()
+
+    def set_frame(self, image: QImage, frame_ref) -> None:
+        self._image = image
+        self._frame_ref = frame_ref
+        self.update()
+
+    def clear_frame(self) -> None:
+        self._image = None
+        self._frame_ref = None
+        self.update()
 
     def set_fps(self, fps: float | None) -> None:
         self.fps_label.setText("-- fps" if fps is None else f"{fps:.1f} fps")
@@ -267,6 +286,23 @@ class CameraDisplay(QLabel):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._reposition_overlay()
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        if self._image is None:
+            # Fall back to QLabel's text rendering ("connecting…", error msg).
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        sw, sh = self._image.width(), self._image.height()
+        tw, th = self.width(), self.height()
+        if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+            return
+        scale = min(tw / sw, th / sh)
+        dw = int(sw * scale)
+        dh = int(sh * scale)
+        x = (tw - dw) // 2
+        y = (th - dh) // 2
+        painter.drawImage(QRect(x, y, dw, dh), self._image)
 
     def _reposition_overlay(self) -> None:
         m = self.OVERLAY_MARGIN
@@ -1429,15 +1465,9 @@ class CameraWindow(QMainWindow):
         t0 = time.monotonic()
         h, w, _ = rgb.shape
         qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
-        # Scale on the QImage (smaller buffer) before converting to QPixmap
-        # — QPixmap.fromImage on a full 1280x1024 frame is the dominant
-        # blit cost on Windows.
-        scaled = qimg.scaled(
-            self.label.size(),
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.FastTransformation,
-        )
-        self.label.setPixmap(QPixmap.fromImage(scaled))
+        # No CPU pre-scale, no QPixmap copy — paintEvent does an
+        # aspect-preserving drawImage at the widget's current size.
+        self.label.set_frame(qimg, rgb)
         self._update_fps()
         elapsed = time.monotonic() - t0
         self._proc_total += elapsed
@@ -1457,6 +1487,7 @@ class CameraWindow(QMainWindow):
             self._proc_count = 0
 
     def _on_frame_error(self, msg: str) -> None:
+        self.label.clear_frame()
         self.label.setText(f"frame error: {msg}")
         self._frame_times.clear()
         self.label.set_fps(None)
