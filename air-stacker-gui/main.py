@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -409,12 +410,32 @@ class ConexAxisPanel(QGroupBox):
 
 
 class CameraOptionsPanel(QGroupBox):
-    """Live gain / exposure controls (GenICam node map). Auto checkboxes
-    map to GainAuto / ExposureAuto Off ↔ Continuous."""
+    """Live camera controls (GenICam node map): gain / exposure (with
+    auto), white balance (auto + manual Red/Blue ratios), gamma, sharpness.
+
+    The Defaults button reverts everything to OUR_DEFAULTS — factory values
+    plus the lab's preferred gain/exposure tweaks. config.toml's [camera]
+    section can override gain/exposure for those keys it provides.
+    """
+
+    OUR_DEFAULTS: dict = {
+        "Gain": 10.0,
+        "ExposureTime": 5000.0,
+        "GainAuto": "Off",
+        "ExposureAuto": "Off",
+        "BalanceWhiteAuto": "Continuous",
+        "Gamma": 1.0,
+        "Sharpness": 1024,
+    }
 
     def __init__(self, node_map, defaults: dict) -> None:
         super().__init__("Camera Options")
         self.node_map = node_map
+        self._defaults = dict(self.OUR_DEFAULTS)
+        if defaults.get("gain") is not None:
+            self._defaults["Gain"] = float(defaults["gain"])
+        if defaults.get("exposure_us") is not None:
+            self._defaults["ExposureTime"] = float(defaults["exposure_us"])
 
         self.gain_spin = QDoubleSpinBox()
         self.gain_spin.setKeyboardTracking(False)
@@ -429,22 +450,65 @@ class CameraOptionsPanel(QGroupBox):
         self.exp_spin.setSuffix(" μs")
         self.exp_auto = QCheckBox("auto")
 
-        outer = QVBoxLayout(self)
-        gain_row = QHBoxLayout()
-        gain_row.addWidget(QLabel("Gain:"))
-        gain_row.addWidget(self.gain_spin, stretch=1)
-        gain_row.addWidget(self.gain_auto)
-        outer.addLayout(gain_row)
-        exp_row = QHBoxLayout()
-        exp_row.addWidget(QLabel("Exposure:"))
-        exp_row.addWidget(self.exp_spin, stretch=1)
-        exp_row.addWidget(self.exp_auto)
-        outer.addLayout(exp_row)
+        self.wb_red_spin = QDoubleSpinBox()
+        self.wb_red_spin.setKeyboardTracking(False)
+        self.wb_red_spin.setDecimals(3)
+        self.wb_red_spin.setSingleStep(0.05)
+        self.wb_blue_spin = QDoubleSpinBox()
+        self.wb_blue_spin.setKeyboardTracking(False)
+        self.wb_blue_spin.setDecimals(3)
+        self.wb_blue_spin.setSingleStep(0.05)
+        self.wb_auto = QCheckBox("auto")
 
-        self._init_float("Gain", self.gain_spin, defaults.get("gain"))
-        self._init_float("ExposureTime", self.exp_spin, defaults.get("exposure_us"))
-        self._init_auto("GainAuto", self.gain_auto, self.gain_spin, default_on=False)
-        self._init_auto("ExposureAuto", self.exp_auto, self.exp_spin, default_on=False)
+        self.gamma_spin = QDoubleSpinBox()
+        self.gamma_spin.setKeyboardTracking(False)
+        self.gamma_spin.setDecimals(2)
+        self.gamma_spin.setSingleStep(0.05)
+
+        self.sharpness_spin = QSpinBox()
+        self.sharpness_spin.setKeyboardTracking(False)
+        self.sharpness_spin.setSingleStep(64)
+
+        self.defaults_btn = QPushButton("Defaults")
+
+        outer = QVBoxLayout(self)
+        for label, spin, auto in (
+            ("Gain:", self.gain_spin, self.gain_auto),
+            ("Exposure:", self.exp_spin, self.exp_auto),
+            ("WB Red:", self.wb_red_spin, self.wb_auto),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(spin, stretch=1)
+            row.addWidget(auto)
+            outer.addLayout(row)
+        for label, spin in (
+            ("WB Blue:", self.wb_blue_spin),
+            ("Gamma:", self.gamma_spin),
+            ("Sharpness:", self.sharpness_spin),
+        ):
+            row = QHBoxLayout()
+            row.addWidget(QLabel(label))
+            row.addWidget(spin, stretch=1)
+            outer.addLayout(row)
+        outer.addWidget(self.defaults_btn)
+
+        self._setup_range_float("Gain", self.gain_spin)
+        self._setup_range_float("ExposureTime", self.exp_spin)
+        self._setup_range_float("Gamma", self.gamma_spin)
+        self._setup_range_int("Sharpness", self.sharpness_spin)
+        # BalanceRatio is locked while WB auto is on. Try to read the
+        # node's bounds anyway; fall back to Flea3-observed [0.25, 4.0].
+        lo, hi = 0.25, 4.0
+        try:
+            br = self.node_map.BalanceRatio
+            lo, hi = float(br.min), float(br.max)
+        except Exception:
+            pass
+        self.wb_red_spin.setRange(lo, hi)
+        self.wb_blue_spin.setRange(lo, hi)
+
+        self._apply_defaults()
 
         self.gain_spin.editingFinished.connect(
             lambda: self._set_float("Gain", self.gain_spin.value())
@@ -453,32 +517,40 @@ class CameraOptionsPanel(QGroupBox):
             lambda: self._set_float("ExposureTime", self.exp_spin.value())
         )
         self.gain_auto.toggled.connect(
-            lambda on: self._set_auto("GainAuto", on, self.gain_spin)
+            lambda on: self._on_auto_toggled("GainAuto", on, self.gain_spin, "Gain")
         )
         self.exp_auto.toggled.connect(
-            lambda on: self._set_auto("ExposureAuto", on, self.exp_spin)
+            lambda on: self._on_auto_toggled("ExposureAuto", on, self.exp_spin, "ExposureTime")
         )
+        self.wb_auto.toggled.connect(self._on_wb_auto_toggled)
+        self.wb_red_spin.editingFinished.connect(
+            lambda: self._set_balance_ratio("Red", self.wb_red_spin.value())
+        )
+        self.wb_blue_spin.editingFinished.connect(
+            lambda: self._set_balance_ratio("Blue", self.wb_blue_spin.value())
+        )
+        self.gamma_spin.editingFinished.connect(
+            lambda: self._set_float("Gamma", self.gamma_spin.value())
+        )
+        self.sharpness_spin.editingFinished.connect(
+            lambda: self._set_int("Sharpness", self.sharpness_spin.value())
+        )
+        self.defaults_btn.clicked.connect(self._apply_defaults)
 
-    def _init_float(self, name: str, spin: QDoubleSpinBox, default) -> None:
+    def _setup_range_float(self, name: str, spin: QDoubleSpinBox) -> None:
         try:
             node = getattr(self.node_map, name)
             spin.setRange(float(node.min), float(node.max))
-            current = float(default) if default is not None else float(node.value)
-            current = max(node.min, min(node.max, current))
-            node.value = current
-            spin.setValue(current)
         except Exception as e:
             spin.setEnabled(False)
             print(f"camera {name}: {e}", file=sys.stderr, flush=True)
 
-    def _init_auto(self, name: str, cb: QCheckBox, manual_spin: QDoubleSpinBox, default_on: bool) -> None:
+    def _setup_range_int(self, name: str, spin: QSpinBox) -> None:
         try:
             node = getattr(self.node_map, name)
-            node.value = "Continuous" if default_on else "Off"
-            cb.setChecked(default_on)
-            manual_spin.setEnabled(not default_on)
+            spin.setRange(int(node.min), int(node.max))
         except Exception as e:
-            cb.setEnabled(False)
+            spin.setEnabled(False)
             print(f"camera {name}: {e}", file=sys.stderr, flush=True)
 
     def _set_float(self, name: str, value: float) -> None:
@@ -488,13 +560,85 @@ class CameraOptionsPanel(QGroupBox):
         except Exception as e:
             print(f"camera {name}: {e}", file=sys.stderr, flush=True)
 
-    def _set_auto(self, name: str, on: bool, manual_spin: QDoubleSpinBox) -> None:
+    def _set_int(self, name: str, value: int) -> None:
         try:
             node = getattr(self.node_map, name)
-            node.value = "Continuous" if on else "Off"
-            manual_spin.setEnabled(not on)
+            node.value = max(node.min, min(node.max, int(value)))
         except Exception as e:
             print(f"camera {name}: {e}", file=sys.stderr, flush=True)
+
+    def _set_enum(self, name: str, value: str) -> None:
+        try:
+            getattr(self.node_map, name).value = value
+        except Exception as e:
+            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
+
+    def _on_auto_toggled(
+        self, auto_name: str, on: bool, manual_spin: QDoubleSpinBox, value_name: str
+    ) -> None:
+        self._set_enum(auto_name, "Continuous" if on else "Off")
+        manual_spin.setEnabled(not on)
+        if not on:
+            # Surface whatever auto-mode converged to.
+            try:
+                manual_spin.setValue(float(getattr(self.node_map, value_name).value))
+            except Exception:
+                pass
+
+    def _on_wb_auto_toggled(self, on: bool) -> None:
+        self._set_enum("BalanceWhiteAuto", "Continuous" if on else "Off")
+        self.wb_red_spin.setEnabled(not on)
+        self.wb_blue_spin.setEnabled(not on)
+        if not on:
+            for color, spin in (("Red", self.wb_red_spin), ("Blue", self.wb_blue_spin)):
+                try:
+                    self.node_map.BalanceRatioSelector.value = color
+                    spin.setValue(float(self.node_map.BalanceRatio.value))
+                except Exception as e:
+                    print(f"camera BalanceRatio {color}: {e}", file=sys.stderr, flush=True)
+
+    def _set_balance_ratio(self, color: str, value: float) -> None:
+        if self.wb_auto.isChecked():
+            return
+        try:
+            self.node_map.BalanceRatioSelector.value = color
+            node = self.node_map.BalanceRatio
+            node.value = max(node.min, min(node.max, float(value)))
+        except Exception as e:
+            print(f"camera BalanceRatio {color}: {e}", file=sys.stderr, flush=True)
+
+    def _apply_defaults(self) -> None:
+        """Push OUR_DEFAULTS to the camera and sync the widgets. Used at
+        startup and by the Defaults button."""
+        d = self._defaults
+        self._set_enum("GainAuto", d["GainAuto"])
+        self._set_enum("ExposureAuto", d["ExposureAuto"])
+        self._set_enum("BalanceWhiteAuto", d["BalanceWhiteAuto"])
+        self._set_float("Gain", d["Gain"])
+        self._set_float("ExposureTime", d["ExposureTime"])
+        self._set_float("Gamma", d["Gamma"])
+        self._set_int("Sharpness", d["Sharpness"])
+        gain_auto_on = d["GainAuto"] == "Continuous"
+        exp_auto_on = d["ExposureAuto"] == "Continuous"
+        wb_auto_on = d["BalanceWhiteAuto"] == "Continuous"
+        # blockSignals so toggling these from code doesn't re-trigger the
+        # auto-toggled handlers (which would do redundant writes).
+        for cb, on in (
+            (self.gain_auto, gain_auto_on),
+            (self.exp_auto, exp_auto_on),
+            (self.wb_auto, wb_auto_on),
+        ):
+            cb.blockSignals(True)
+            cb.setChecked(on)
+            cb.blockSignals(False)
+        self.gain_spin.setEnabled(not gain_auto_on)
+        self.exp_spin.setEnabled(not exp_auto_on)
+        self.wb_red_spin.setEnabled(not wb_auto_on)
+        self.wb_blue_spin.setEnabled(not wb_auto_on)
+        self.gain_spin.setValue(float(d["Gain"]))
+        self.exp_spin.setValue(float(d["ExposureTime"]))
+        self.gamma_spin.setValue(float(d["Gamma"]))
+        self.sharpness_spin.setValue(int(d["Sharpness"]))
 
 
 class HeaterPanel(QGroupBox):
