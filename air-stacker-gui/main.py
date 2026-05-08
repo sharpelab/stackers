@@ -292,6 +292,12 @@ class CameraDisplay(QOpenGLWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        # Force vsync off on this widget's surface format too — setting
+        # only the default format isn't always honored by QOpenGLWidget.
+        fmt = self.format()
+        fmt.setSwapInterval(0)
+        self.setFormat(fmt)
+
         self._frame_ref: np.ndarray | None = None
         self._frame_dirty = False
         self._tex: QOpenGLTexture | None = None
@@ -301,6 +307,9 @@ class CameraDisplay(QOpenGLWidget):
         self._paint_total = 0.0
         self._paint_max = 0.0
         self._paint_count = 0
+        self._paint_last_t = 0.0
+        self._paint_cycle_total = 0.0
+        self._paint_cycle_max = 0.0
 
         self.text_label = QLabel("", self)
         self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -352,6 +361,9 @@ class CameraDisplay(QOpenGLWidget):
         # Texture is allocated lazily on the first frame so we get the
         # actual camera resolution rather than guessing — wrong size
         # here produces stride-shifted garbage in the display.
+        log.info(
+            "CameraDisplay GL ctx swapInterval=%d", self.format().swapInterval()
+        )
         self._blitter = QOpenGLTextureBlitter()
         self._blitter.create()
 
@@ -379,6 +391,16 @@ class CameraDisplay(QOpenGLWidget):
         if self._blitter is None:
             return
         t0 = time.monotonic()
+        # Cycle time = wall time between paintGL invocations. Includes
+        # swapBuffers, FBO compositing of child widgets, and Qt event
+        # dispatch. If this is much larger than `avg`, the GUI thread
+        # is spending most of its time outside paintGL — usually
+        # waiting on the compositor.
+        if self._paint_last_t > 0.0:
+            cycle = t0 - self._paint_last_t
+            self._paint_cycle_total += cycle
+            self._paint_cycle_max = max(self._paint_cycle_max, cycle)
+        self._paint_last_t = t0
         gl = self.context().functions()
         gl.glClearColor(0.0, 0.0, 0.0, 1.0)
         gl.glClear(0x4000)  # GL_COLOR_BUFFER_BIT
@@ -414,16 +436,21 @@ class CameraDisplay(QOpenGLWidget):
         self._paint_max = max(self._paint_max, elapsed)
         self._paint_count += 1
         if self._paint_count >= 60:
+            cycles = max(self._paint_count - 1, 1)
             log.info(
-                "paintGL avg=%.1fms max=%.1fms widget=%dx%d n=%d",
+                "paintGL avg=%.1fms max=%.1fms cycle=%.1fms cycle_max=%.1fms widget=%dx%d n=%d",
                 self._paint_total / self._paint_count * 1000,
                 self._paint_max * 1000,
+                self._paint_cycle_total / cycles * 1000,
+                self._paint_cycle_max * 1000,
                 self.width(), self.height(),
                 self._paint_count,
             )
             self._paint_total = 0.0
             self._paint_max = 0.0
             self._paint_count = 0
+            self._paint_cycle_total = 0.0
+            self._paint_cycle_max = 0.0
 
     def _reposition_overlay(self) -> None:
         m = self.OVERLAY_MARGIN
