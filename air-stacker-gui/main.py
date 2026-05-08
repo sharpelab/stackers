@@ -240,13 +240,16 @@ def apply_adjustments(rgb: np.ndarray, adj: AdjustmentSnapshot) -> np.ndarray:
 def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     """256-bin per-channel histogram of an RGB uint8 frame.
 
-    Returns a (3, 256) int64 array. Cheap (~1-2 ms at 1280x1024).
+    Returns a (3, 256) int64 array. cv2.split unpacks the
+    interleaved RGB into contiguous per-channel buffers — bincount
+    on a strided view (every 3rd byte) is dramatically slower than
+    on contiguous data because it defeats the cache.
     """
     out = np.empty((3, 256), dtype=np.int64)
-    flat = rgb.reshape(-1, 3)
-    out[0] = np.bincount(flat[:, 0], minlength=256)
-    out[1] = np.bincount(flat[:, 1], minlength=256)
-    out[2] = np.bincount(flat[:, 2], minlength=256)
+    r, g, b = cv2.split(rgb)
+    out[0] = np.bincount(r.ravel(), minlength=256)
+    out[1] = np.bincount(g.ravel(), minlength=256)
+    out[2] = np.bincount(b.ravel(), minlength=256)
     return out
 
 
