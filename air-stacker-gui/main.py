@@ -17,7 +17,16 @@ import cv2
 import numpy as np
 from harvesters.core import Harvester
 from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QSurfaceFormat,
+)
 from PySide6.QtOpenGL import QOpenGLTexture, QOpenGLTextureBlitter
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
@@ -280,14 +289,14 @@ class CameraDisplay(QOpenGLWidget):
     """
 
     OVERLAY_MARGIN = 8
-    SOURCE_W = 1280
-    SOURCE_H = 1024
 
     def __init__(self) -> None:
         super().__init__()
         self._frame_ref: np.ndarray | None = None
         self._frame_dirty = False
         self._tex: QOpenGLTexture | None = None
+        self._tex_w = 0
+        self._tex_h = 0
         self._blitter: QOpenGLTextureBlitter | None = None
         self._paint_total = 0.0
         self._paint_max = 0.0
@@ -340,8 +349,19 @@ class CameraDisplay(QOpenGLWidget):
         self._reposition_overlay()
 
     def initializeGL(self) -> None:
+        # Texture is allocated lazily on the first frame so we get the
+        # actual camera resolution rather than guessing — wrong size
+        # here produces stride-shifted garbage in the display.
+        self._blitter = QOpenGLTextureBlitter()
+        self._blitter.create()
+
+    def _ensure_texture(self, w: int, h: int) -> None:
+        if self._tex is not None and self._tex_w == w and self._tex_h == h:
+            return
+        if self._tex is not None:
+            self._tex.destroy()
         self._tex = QOpenGLTexture(QOpenGLTexture.Target.Target2D)
-        self._tex.setSize(self.SOURCE_W, self.SOURCE_H)
+        self._tex.setSize(w, h)
         self._tex.setFormat(QOpenGLTexture.TextureFormat.RGB8_UNorm)
         self._tex.setMipLevels(1)
         self._tex.setMinificationFilter(QOpenGLTexture.Filter.Linear)
@@ -351,27 +371,28 @@ class CameraDisplay(QOpenGLWidget):
             QOpenGLTexture.PixelFormat.RGB,
             QOpenGLTexture.PixelType.UInt8,
         )
-        self._blitter = QOpenGLTextureBlitter()
-        self._blitter.create()
+        self._tex_w = w
+        self._tex_h = h
+        log.info("CameraDisplay GL texture allocated %dx%d", w, h)
 
     def paintGL(self) -> None:
-        if self._tex is None or self._blitter is None:
+        if self._blitter is None:
             return
         t0 = time.monotonic()
         gl = self.context().functions()
         gl.glClearColor(0.0, 0.0, 0.0, 1.0)
         gl.glClear(0x4000)  # GL_COLOR_BUFFER_BIT
         if self._frame_ref is not None:
+            sh, sw, _ = self._frame_ref.shape
+            self._ensure_texture(sw, sh)
+            assert self._tex is not None  # set by _ensure_texture
             if self._frame_dirty:
-                # Persistent storage allocated in initializeGL — setData
-                # here issues glTexSubImage2D under the hood.
                 self._tex.setData(
                     QOpenGLTexture.PixelFormat.RGB,
                     QOpenGLTexture.PixelType.UInt8,
                     self._frame_ref.tobytes(),
                 )
                 self._frame_dirty = False
-            sw, sh = self.SOURCE_W, self.SOURCE_H
             tw, th = self.width(), self.height()
             scale = min(tw / sw, th / sh, 1.0)
             dw = int(sw * scale)
@@ -1770,6 +1791,16 @@ def main() -> int:
             )
         except Exception as e:  # noqa: BLE001
             log.debug("AppUserModelID set failed: %s", e)
+
+    # Disable vsync on the default GL surface — paintGL is fast (~5 ms)
+    # and we want it to run at the camera rate (59 Hz), not be paced by
+    # the display refresh. With vsync on, swapBuffers blocks ~16 ms per
+    # paint, which jitters against the 16.8 ms proc-emit interval and
+    # causes back-to-back emits to land in one event-loop turn (the
+    # second drains an empty mailbox = noop).
+    fmt = QSurfaceFormat()
+    fmt.setSwapInterval(0)
+    QSurfaceFormat.setDefaultFormat(fmt)
 
     app = QApplication([sys.argv[0]] + qt_args)
     if ICON_PATH.exists():
