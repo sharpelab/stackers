@@ -790,6 +790,105 @@ class CameraOptionsPanel(QGroupBox):
         self.sharpness_spin.setValue(int(d["Sharpness"]))
 
 
+class ChannelHistogram(QWidget):
+    """Single-channel histogram with range markers / shaded out-of-range zones.
+
+    Each ImageAdjustmentsPanel embeds three of these — one beneath
+    each RGB row — so the histogram is visually attached to the
+    spinboxes that drive its remap range.
+    """
+
+    SMOOTH_RADIUS = 2
+
+    def __init__(self, color: tuple[int, int, int]) -> None:
+        super().__init__()
+        self._color = QColor(*color)
+        self._data: np.ndarray | None = None
+        self._lo = 0
+        self._hi = 255
+        self.setFixedHeight(48)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_data(self, data: np.ndarray) -> None:
+        if data.shape != (256,):
+            return
+        self._data = data
+        self.update()
+
+    def set_range(self, lo: int, hi: int) -> None:
+        if (lo, hi) == (self._lo, self._hi):
+            return
+        self._lo = lo
+        self._hi = hi
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(20, 20, 20))
+
+        w = self.width()
+        h = self.height()
+        if w <= 0 or h <= 0:
+            return
+
+        if self._data is not None:
+            curve = self._smoothed(self._data)
+            peak = float(curve.max())
+            if peak > 0:
+                ys = np.sqrt(curve / peak) * h
+                path = QPainterPath()
+                path.moveTo(0, h)
+                for i in range(256):
+                    x = i * (w / 255.0)
+                    y = h - ys[i]
+                    path.lineTo(x, y)
+                path.lineTo(w, h)
+                path.closeSubpath()
+                fill = QColor(self._color)
+                fill.setAlpha(80)
+                stroke = QColor(self._color)
+                stroke.setAlpha(200)
+                painter.setBrush(QBrush(fill))
+                pen = QPen(stroke)
+                pen.setWidthF(1.0)
+                painter.setPen(pen)
+                painter.drawPath(path)
+
+        # Shade [0, lo] and [hi, 255] to show what gets clipped to 0 / 255.
+        if self._lo > 0 or self._hi < 255:
+            shade = QColor(0, 0, 0, 110)
+            x_lo = self._lo / 255.0 * w
+            x_hi = self._hi / 255.0 * w
+            if self._lo > 0:
+                painter.fillRect(0, 0, int(x_lo), h, shade)
+            if self._hi < 255:
+                painter.fillRect(int(x_hi), 0, w - int(x_hi), h, shade)
+
+        # Range marker lines.
+        marker = QPen(QColor(255, 255, 255, 180))
+        marker.setWidthF(1.0)
+        painter.setPen(marker)
+        if self._lo > 0:
+            x = self._lo / 255.0 * w
+            painter.drawLine(int(x), 0, int(x), h)
+        if self._hi < 255:
+            x = self._hi / 255.0 * w
+            painter.drawLine(int(x), 0, int(x), h)
+
+    def _smoothed(self, arr: np.ndarray) -> np.ndarray:
+        r = self.SMOOTH_RADIUS
+        if r <= 0:
+            return arr.astype(np.float64)
+        x = arr.astype(np.float64)
+        n = x.size
+        cs = np.concatenate(([0.0], np.cumsum(x)))
+        idx = np.arange(n)
+        lo = np.maximum(0, idx - r)
+        hi = np.minimum(n - 1, idx + r)
+        return (cs[hi + 1] - cs[lo]) / (hi - lo + 1)
+
+
 class ImageAdjustmentsPanel(QGroupBox):
     """Software-side image adjustments applied per-frame on the camera worker.
 
@@ -802,53 +901,64 @@ class ImageAdjustmentsPanel(QGroupBox):
     CONTRAST_RANGE = (50, 300)
     SATURATION_RANGE = (0, 200)
 
+    CHANNEL_COLORS = (
+        (224, 49, 49),   # R
+        (47, 158, 68),   # G
+        (25, 113, 194),  # B
+    )
+
     def __init__(self, adjustments: ImageAdjustments) -> None:
         super().__init__("Image Adjustments")
         self._adj = adjustments
         self._building = True
 
         self.brightness_slider, self.brightness_label = self._make_slider_row(
-            "Brightness", self.BRIGHTNESS_RANGE, 100
+            self.BRIGHTNESS_RANGE, 100
         )
         self.contrast_slider, self.contrast_label = self._make_slider_row(
-            "Contrast", self.CONTRAST_RANGE, 100
+            self.CONTRAST_RANGE, 100
         )
         self.saturation_slider, self.saturation_label = self._make_slider_row(
-            "Saturation", self.SATURATION_RANGE, 100
+            self.SATURATION_RANGE, 100
         )
 
         self.r_lo, self.r_hi = self._make_range_spins()
         self.g_lo, self.g_hi = self._make_range_spins()
         self.b_lo, self.b_hi = self._make_range_spins()
 
+        self.r_hist = ChannelHistogram(self.CHANNEL_COLORS[0])
+        self.g_hist = ChannelHistogram(self.CHANNEL_COLORS[1])
+        self.b_hist = ChannelHistogram(self.CHANNEL_COLORS[2])
+
         self.defaults_btn = QPushButton("Defaults")
 
         outer = QVBoxLayout(self)
-        for label, slider, value_label in (
+        for name, slider, value_label in (
             ("Brightness", self.brightness_slider, self.brightness_label),
             ("Contrast", self.contrast_slider, self.contrast_label),
             ("Saturation", self.saturation_slider, self.saturation_label),
         ):
             head = QHBoxLayout()
-            head.addWidget(QLabel(f"{label}:"))
+            head.addWidget(QLabel(f"{name}:"))
             head.addStretch(1)
             head.addWidget(value_label)
             outer.addLayout(head)
             outer.addWidget(slider)
 
-        for label, color, lo, hi in (
-            ("R:", "#c92a2a", self.r_lo, self.r_hi),
-            ("G:", "#2f9e44", self.g_lo, self.g_hi),
-            ("B:", "#1971c2", self.b_lo, self.b_hi),
+        for label, css_color, lo, hi, hist in (
+            ("R:", "#c92a2a", self.r_lo, self.r_hi, self.r_hist),
+            ("G:", "#2f9e44", self.g_lo, self.g_hi, self.g_hist),
+            ("B:", "#1971c2", self.b_lo, self.b_hi, self.b_hist),
         ):
             row = QHBoxLayout()
             tag = QLabel(label)
-            tag.setStyleSheet(f"color: {color}; font-weight: bold;")
+            tag.setStyleSheet(f"color: {css_color}; font-weight: bold;")
             row.addWidget(tag)
             row.addWidget(lo, stretch=1)
             row.addWidget(QLabel("–"))
             row.addWidget(hi, stretch=1)
             outer.addLayout(row)
+            outer.addWidget(hist)
 
         outer.addWidget(self.defaults_btn)
 
@@ -866,8 +976,17 @@ class ImageAdjustmentsPanel(QGroupBox):
         self.defaults_btn.clicked.connect(self._apply_defaults)
         self._building = False
 
+    @Slot(object)
+    def set_histograms(self, hist: np.ndarray) -> None:
+        """Slot for CameraWorker.histograms_ready ((3, 256) int array)."""
+        if hist.shape != (3, 256):
+            return
+        self.r_hist.set_data(hist[0])
+        self.g_hist.set_data(hist[1])
+        self.b_hist.set_data(hist[2])
+
     def _make_slider_row(
-        self, _label: str, span: tuple[int, int], default: int
+        self, span: tuple[int, int], default: int
     ) -> tuple[QSlider, QLabel]:
         slider = QSlider(Qt.Orientation.Horizontal)
         slider.setRange(*span)
@@ -913,13 +1032,12 @@ class ImageAdjustmentsPanel(QGroupBox):
     def _on_range(self, name: str) -> None:
         if self._building:
             return
-        spins = {
-            "r_range": (self.r_lo, self.r_hi),
-            "g_range": (self.g_lo, self.g_hi),
-            "b_range": (self.b_lo, self.b_hi),
+        spins, hist = {
+            "r_range": ((self.r_lo, self.r_hi), self.r_hist),
+            "g_range": ((self.g_lo, self.g_hi), self.g_hist),
+            "b_range": ((self.b_lo, self.b_hi), self.b_hist),
         }[name]
         lo, hi = spins[0].value(), spins[1].value()
-        # Keep lo strictly below hi without fighting the user's typing.
         if lo >= hi:
             if self.sender() is spins[0]:
                 hi = min(255, lo + 1)
@@ -931,6 +1049,7 @@ class ImageAdjustmentsPanel(QGroupBox):
                 spins[0].blockSignals(True)
                 spins[0].setValue(lo)
                 spins[0].blockSignals(False)
+        hist.set_range(lo, hi)
         self._adj.update(**{name: (lo, hi)})
 
     def _apply_defaults(self) -> None:
@@ -940,103 +1059,19 @@ class ImageAdjustmentsPanel(QGroupBox):
             self.brightness_slider.setValue(snap.brightness)
             self.contrast_slider.setValue(snap.contrast)
             self.saturation_slider.setValue(snap.saturation)
-            for (lo_w, hi_w), rng in (
-                ((self.r_lo, self.r_hi), snap.r_range),
-                ((self.g_lo, self.g_hi), snap.g_range),
-                ((self.b_lo, self.b_hi), snap.b_range),
+            for (lo_w, hi_w), hist, rng in (
+                ((self.r_lo, self.r_hi), self.r_hist, snap.r_range),
+                ((self.g_lo, self.g_hi), self.g_hist, snap.g_range),
+                ((self.b_lo, self.b_hi), self.b_hist, snap.b_range),
             ):
                 lo_w.setValue(rng[0])
                 hi_w.setValue(rng[1])
+                hist.set_range(*rng)
             self.brightness_label.setText(f"{snap.brightness}%")
             self.contrast_label.setText(f"{snap.contrast}%")
             self.saturation_label.setText(f"{snap.saturation}%")
         finally:
             self._building = False
-
-
-class HistogramWidget(QWidget):
-    """Per-channel RGB histogram, drawn as three filled curves overlaid.
-
-    Receives (3, 256) int64 arrays via set_histograms() (typically
-    queued from CameraWorker.histograms_ready). Smoothing and √-axis
-    happen at paint time so the camera worker can stay cheap.
-    """
-
-    SMOOTH_RADIUS = 2
-    CHANNEL_COLORS = (
-        QColor(224, 49, 49),   # R
-        QColor(47, 158, 68),   # G
-        QColor(25, 113, 194),  # B
-    )
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._hist: np.ndarray | None = None
-        self.setMinimumHeight(120)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    @Slot(object)
-    def set_histograms(self, hist: np.ndarray) -> None:
-        if hist.shape != (3, 256):
-            return
-        self._hist = hist
-        self.update()
-
-    def paintEvent(self, event) -> None:  # noqa: ARG002
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(20, 20, 20))
-        if self._hist is None:
-            painter.setPen(QColor(150, 150, 150))
-            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "no data")
-            return
-
-        w = self.width()
-        h = self.height()
-        if w <= 0 or h <= 0:
-            return
-
-        for c, color in enumerate(self.CHANNEL_COLORS):
-            curve = self._smoothed(self._hist[c])
-            peak = float(curve.max())
-            if peak <= 0:
-                continue
-            # √-axis so low bins read.
-            ys = np.sqrt(curve / peak) * h
-            path = QPainterPath()
-            path.moveTo(0, h)
-            for i in range(256):
-                x = i * (w / 255.0)
-                y = h - ys[i]
-                path.lineTo(x, y)
-            path.lineTo(w, h)
-            path.closeSubpath()
-            fill = QColor(color)
-            fill.setAlpha(70)
-            stroke = QColor(color)
-            stroke.setAlpha(180)
-            painter.setBrush(QBrush(fill))
-            pen = QPen(stroke)
-            pen.setWidthF(1.0)
-            painter.setPen(pen)
-            painter.drawPath(path)
-
-    def _smoothed(self, arr: np.ndarray) -> np.ndarray:
-        """Box-filter smoothing matching the web app's rolling-mean."""
-        r = self.SMOOTH_RADIUS
-        if r <= 0:
-            return arr.astype(np.float32)
-        # Cumulative-sum trick keeps it O(n) and matches the JS implementation
-        # (mean over the window clamped at the array edges).
-        x = arr.astype(np.float64)
-        n = x.size
-        cs = np.concatenate(([0.0], np.cumsum(x)))
-        out = np.empty(n, dtype=np.float64)
-        for i in range(n):
-            lo = max(0, i - r)
-            hi = min(n - 1, i + r)
-            out[i] = (cs[hi + 1] - cs[lo]) / (hi - lo + 1)
-        return out
 
 
 class HeaterPanel(QGroupBox):
@@ -1239,7 +1274,6 @@ class CameraWindow(QMainWindow):
         self.heater_panel: HeaterPanel | None = None
         self.camera_options_panel: CameraOptionsPanel | None = None
         self.adjustments_panel: ImageAdjustmentsPanel | None = None
-        self.histogram_widget: HistogramWidget | None = None
         self.adjustments = ImageAdjustments()
 
         config = load_config()
@@ -1279,9 +1313,9 @@ class CameraWindow(QMainWindow):
         self.camera_worker.frame_ready.connect(self._on_frame)
         self.camera_worker.error.connect(self._on_frame_error)
         self.camera_worker.finished.connect(self.camera_thread.quit)
-        if self.histogram_widget is not None:
+        if self.adjustments_panel is not None:
             self.camera_worker.histograms_ready.connect(
-                self.histogram_widget.set_histograms,
+                self.adjustments_panel.set_histograms,
                 Qt.ConnectionType.QueuedConnection,
             )
         self.camera_thread.start()
@@ -1347,11 +1381,6 @@ class CameraWindow(QMainWindow):
 
         self.adjustments_panel = ImageAdjustmentsPanel(self.adjustments)
 
-        histogram_group = QGroupBox("Histograms")
-        histogram_layout = QVBoxLayout(histogram_group)
-        self.histogram_widget = HistogramWidget()
-        histogram_layout.addWidget(self.histogram_widget)
-
         self.camera_options_panel = CameraOptionsPanel(
             self.acquirer.remote_device.node_map, camera_cfg
         )
@@ -1359,7 +1388,6 @@ class CameraWindow(QMainWindow):
         layout.addWidget(recording)
         layout.addWidget(presets)
         layout.addWidget(self.adjustments_panel)
-        layout.addWidget(histogram_group)
         layout.addWidget(self.camera_options_panel)
         layout.addStretch(1)
         return panel
