@@ -511,7 +511,7 @@ class CameraProcessWorker(QObject):
         log_count = 0
         log_emits = 0
         log_start = time.monotonic()
-        t_wait = t_compute = t_emit = t_adjust = t_cvt = t_publish = 0.0
+        t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
         while self._running:
             t0 = time.monotonic()
             rgb = self._source.take(timeout=0.1)
@@ -534,17 +534,8 @@ class CameraProcessWorker(QObject):
                     except Exception as e:  # noqa: BLE001
                         log.warning("adjustment err: %s", e)
             t3 = time.monotonic()
-            # Pre-convert to BGRA so the GUI's QImage matches the raster
-            # backing surface (Qt's Format_RGB32 on little-endian = B,G,R,X
-            # bytes). Numpy path — cv2.cvtColor on the Windows opencv-python
-            # wheel runs ~15 ms here, defeating the paint savings.
-            h, w, _ = rgb.shape
-            bgra = np.empty((h, w, 4), dtype=np.uint8)
-            bgra[..., :3] = rgb[..., ::-1]
-            bgra[..., 3] = 255
-            t3b = time.monotonic()
             with self._lock:
-                self._latest = bgra
+                self._latest = rgb
             self.frame_ready.emit()
             log_emits += 1
             t4 = time.monotonic()
@@ -552,26 +543,24 @@ class CameraProcessWorker(QObject):
             t_compute += t1b - t1
             t_emit += t2 - t1b
             t_adjust += t3 - t2
-            t_cvt += t3b - t3
-            t_publish += t4 - t3b
+            t_publish += t4 - t3
             log_count += 1
             if t4 - log_start > 2.0:
                 span = t4 - log_start
                 log.info(
-                    "proc   %.1f fps emit=%.1f/s  wait=%.1f comp=%.1f hist-emit=%.1f adj=%.1f cvt=%.1f pub=%.2f ms/frame",
+                    "proc   %.1f fps emit=%.1f/s  wait=%.1f comp=%.1f hist-emit=%.1f adj=%.1f pub=%.2f ms/frame",
                     log_count / span,
                     log_emits / span,
                     t_wait / log_count * 1000,
                     t_compute / log_count * 1000,
                     t_emit / log_count * 1000,
                     t_adjust / log_count * 1000,
-                    t_cvt / log_count * 1000,
                     t_publish / log_count * 1000,
                 )
                 log_count = 0
                 log_emits = 0
                 log_start = t4
-                t_wait = t_compute = t_emit = t_adjust = t_cvt = t_publish = 0.0
+                t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
         self.finished.emit()
 
     def take_latest(self) -> np.ndarray | None:
@@ -1614,17 +1603,17 @@ class CameraWindow(QMainWindow):
 
     def _on_frame(self) -> None:
         self._on_frame_calls += 1
-        bgra = self.proc_worker.take_latest()
-        if bgra is None:
+        rgb = self.proc_worker.take_latest()
+        if rgb is None:
             self._on_frame_noops += 1
             self._maybe_log_on_frame_rates()
             return  # drained by a previous slot run
         t0 = time.monotonic()
-        h, w, _ = bgra.shape
-        # Format_RGB32: B,G,R,X bytes — matches the raster backing
-        # surface, so drawImage is a straight blit without conversion.
-        qimg = QImage(bgra.data, w, h, w * 4, QImage.Format.Format_RGB32)
-        self.label.set_frame(qimg, bgra)
+        h, w, _ = rgb.shape
+        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
+        # No CPU pre-scale, no QPixmap copy — paintEvent does an
+        # aspect-preserving drawImage at the widget's current size.
+        self.label.set_frame(qimg, rgb)
         self._update_fps()
         elapsed = time.monotonic() - t0
         self._proc_total += elapsed
