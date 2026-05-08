@@ -16,8 +16,10 @@ from pathlib import Path
 import cv2
 import numpy as np
 from harvesters.core import Harvester
-from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtOpenGL import QOpenGLTexture, QOpenGLTextureBlitter
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -259,26 +261,45 @@ def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     return out
 
 
-class CameraDisplay(QLabel):
-    """Camera frame view with a bottom-left FPS overlay.
+class CameraDisplay(QOpenGLWidget):
+    """Camera frame view rendered via OpenGL.
 
-    paintEvent does aspect-preserved drawImage with scale capped
-    at 1.0 — when the window exceeds the source, we render at
-    native size with letterboxing instead of CPU-upscaling.
-    Per-frame paint cost is bounded by source size.
+    Per-frame work in paintGL:
+      * upload RGB888 bytes into a persistent GL texture
+        (glTexSubImage2D, no realloc — storage allocated once
+        in initializeGL)
+      * draw a textured quad via QOpenGLTextureBlitter (Qt-provided
+        shader, vertex buffer, transform math)
+    No QPainter, no Qt-GL paint engine, no per-call QImage→texture
+    upload. Per-frame cost: ~1 ms upload + microseconds quad draw,
+    independent of widget size.
+
+    The placeholder text ("connecting…", error messages) and FPS
+    overlay are child QLabels — Qt composites them on top of the
+    GL surface without round-tripping through paintGL.
     """
 
     OVERLAY_MARGIN = 8
+    SOURCE_W = 1280
+    SOURCE_H = 1024
 
     def __init__(self) -> None:
         super().__init__()
-        self._image: QImage | None = None
-        # Hold the numpy buffer the QImage views into until the next
-        # frame arrives — QImage(data, ...) does not own its bytes.
-        self._frame_ref = None
+        self._frame_ref: np.ndarray | None = None
+        self._frame_dirty = False
+        self._tex: QOpenGLTexture | None = None
+        self._blitter: QOpenGLTextureBlitter | None = None
         self._paint_total = 0.0
         self._paint_max = 0.0
         self._paint_count = 0
+
+        self.text_label = QLabel("", self)
+        self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text_label.setStyleSheet(
+            "color: rgb(220, 220, 220); background: transparent;"
+        )
+        self.text_label.hide()
+
         self.fps_label = QLabel("-- fps", self)
         self.fps_label.setStyleSheet(
             "color: white; background-color: rgba(0, 0, 0, 140);"
@@ -287,14 +308,25 @@ class CameraDisplay(QLabel):
         self.fps_label.adjustSize()
         self._reposition_overlay()
 
-    def set_frame(self, image: QImage, frame_ref) -> None:
-        self._image = image
+    def set_frame(self, frame_ref: np.ndarray) -> None:
         self._frame_ref = frame_ref
+        self._frame_dirty = True
+        if self.text_label.isVisible():
+            self.text_label.hide()
         self.update()
 
     def clear_frame(self) -> None:
-        self._image = None
         self._frame_ref = None
+        self._frame_dirty = False
+        self.update()
+
+    def setText(self, text: str) -> None:
+        """Centered placeholder text — used pre-stream and on errors."""
+        self.text_label.setText(text)
+        self.text_label.setGeometry(self.rect())
+        self.text_label.show()
+        self._frame_ref = None
+        self._frame_dirty = False
         self.update()
 
     def set_fps(self, fps: float | None) -> None:
@@ -304,38 +336,68 @@ class CameraDisplay(QLabel):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self.text_label.setGeometry(self.rect())
         self._reposition_overlay()
 
-    def paintEvent(self, event) -> None:  # noqa: ARG002
-        if self._image is None:
-            super().paintEvent(event)  # QLabel text path
+    def initializeGL(self) -> None:
+        self._tex = QOpenGLTexture(QOpenGLTexture.Target.Target2D)
+        self._tex.setSize(self.SOURCE_W, self.SOURCE_H)
+        self._tex.setFormat(QOpenGLTexture.TextureFormat.RGB8_UNorm)
+        self._tex.setMipLevels(1)
+        self._tex.setMinificationFilter(QOpenGLTexture.Filter.Linear)
+        self._tex.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+        self._tex.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+        self._tex.allocateStorage(
+            QOpenGLTexture.PixelFormat.RGB,
+            QOpenGLTexture.PixelType.UInt8,
+        )
+        self._blitter = QOpenGLTextureBlitter()
+        self._blitter.create()
+
+    def paintGL(self) -> None:
+        if self._tex is None or self._blitter is None:
             return
         t0 = time.monotonic()
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor(0, 0, 0))
-        sw, sh = self._image.width(), self._image.height()
-        tw, th = self.width(), self.height()
-        if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
-            return
-        # Cap at 1.0 — never CPU-upscale. Above source size we
-        # letterbox at native size; below we downscale (cheap).
-        scale = min(tw / sw, th / sh, 1.0)
-        dw = int(sw * scale)
-        dh = int(sh * scale)
-        x = (tw - dw) // 2
-        y = (th - dh) // 2
-        painter.drawImage(QRect(x, y, dw, dh), self._image)
-        painter.end()
+        gl = self.context().functions()
+        gl.glClearColor(0.0, 0.0, 0.0, 1.0)
+        gl.glClear(0x4000)  # GL_COLOR_BUFFER_BIT
+        if self._frame_ref is not None:
+            if self._frame_dirty:
+                # Persistent storage allocated in initializeGL — setData
+                # here issues glTexSubImage2D under the hood.
+                self._tex.setData(
+                    QOpenGLTexture.PixelFormat.RGB,
+                    QOpenGLTexture.PixelType.UInt8,
+                    self._frame_ref.tobytes(),
+                )
+                self._frame_dirty = False
+            sw, sh = self.SOURCE_W, self.SOURCE_H
+            tw, th = self.width(), self.height()
+            scale = min(tw / sw, th / sh, 1.0)
+            dw = int(sw * scale)
+            dh = int(sh * scale)
+            x = (tw - dw) // 2
+            y = (th - dh) // 2
+            target = QRectF(x, y, dw, dh)
+            viewport = QRect(0, 0, tw, th)
+            transform = QOpenGLTextureBlitter.targetTransform(target, viewport)
+            self._blitter.bind()
+            self._blitter.blit(
+                self._tex.textureId(),
+                transform,
+                QOpenGLTextureBlitter.Origin.OriginTopLeft,
+            )
+            self._blitter.release()
         elapsed = time.monotonic() - t0
         self._paint_total += elapsed
         self._paint_max = max(self._paint_max, elapsed)
         self._paint_count += 1
         if self._paint_count >= 60:
             log.info(
-                "paintEvent avg=%.1fms max=%.1fms widget=%dx%d draw=%dx%d n=%d",
+                "paintGL avg=%.1fms max=%.1fms widget=%dx%d n=%d",
                 self._paint_total / self._paint_count * 1000,
                 self._paint_max * 1000,
-                tw, th, dw, dh,
+                self.width(), self.height(),
                 self._paint_count,
             )
             self._paint_total = 0.0
@@ -1609,11 +1671,9 @@ class CameraWindow(QMainWindow):
             self._maybe_log_on_frame_rates()
             return  # drained by a previous slot run
         t0 = time.monotonic()
-        h, w, _ = rgb.shape
-        qimg = QImage(rgb.data, w, h, w * 3, QImage.Format.Format_RGB888)
-        # No CPU pre-scale, no QPixmap copy — paintEvent does an
-        # aspect-preserving drawImage at the widget's current size.
-        self.label.set_frame(qimg, rgb)
+        # GL display: hand the numpy array straight to paintGL — no
+        # QImage build, no CPU pre-scale. paintGL uploads to texture.
+        self.label.set_frame(rgb)
         self._update_fps()
         elapsed = time.monotonic() - t0
         self._proc_total += elapsed
