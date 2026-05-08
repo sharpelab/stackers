@@ -324,6 +324,12 @@ class CameraDisplay(QOpenGLWidget):
             " padding: 2px 6px; border-radius: 3px;"
         )
         self.fps_label.adjustSize()
+        # DIAGNOSTIC: hide FPS overlay so the QOpenGLWidget has no
+        # visible child widgets — testing whether child compositing is
+        # what's forcing cycle=41 ms (24 Hz) when paintGL itself is
+        # only ~6 ms. text_label is also a child but already hidden
+        # by default.
+        self.fps_label.hide()
         self._reposition_overlay()
 
     def set_frame(self, frame_ref: np.ndarray) -> None:
