@@ -479,7 +479,7 @@ class CameraProcessWorker(QObject):
         self._running = True
         log_count = 0
         log_start = time.monotonic()
-        t_wait = t_hist = t_adjust = t_publish = 0.0
+        t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
         while self._running:
             t0 = time.monotonic()
             rgb = self._source.take(timeout=0.1)
@@ -487,9 +487,13 @@ class CameraProcessWorker(QObject):
                 continue
             t1 = time.monotonic()
             try:
-                self.histograms_ready.emit(compute_histograms(rgb))
+                hist = compute_histograms(rgb)
             except Exception as e:  # noqa: BLE001
                 log.warning("histogram err: %s", e)
+                hist = None
+            t1b = time.monotonic()
+            if hist is not None:
+                self.histograms_ready.emit(hist)
             t2 = time.monotonic()
             if self._adjustments is not None:
                 snap = self._adjustments.get()
@@ -506,23 +510,25 @@ class CameraProcessWorker(QObject):
                 self.frame_ready.emit()
             t4 = time.monotonic()
             t_wait += t1 - t0
-            t_hist += t2 - t1
+            t_compute += t1b - t1
+            t_emit += t2 - t1b
             t_adjust += t3 - t2
             t_publish += t4 - t3
             log_count += 1
             if t4 - log_start > 2.0:
                 span = t4 - log_start
                 log.info(
-                    "proc   %.1f fps  wait=%.1f hist=%.1f adj=%.1f pub=%.2f ms/frame",
+                    "proc   %.1f fps  wait=%.1f comp=%.1f emit=%.1f adj=%.1f pub=%.2f ms/frame",
                     log_count / span,
                     t_wait / log_count * 1000,
-                    t_hist / log_count * 1000,
+                    t_compute / log_count * 1000,
+                    t_emit / log_count * 1000,
                     t_adjust / log_count * 1000,
                     t_publish / log_count * 1000,
                 )
                 log_count = 0
                 log_start = t4
-                t_wait = t_hist = t_adjust = t_publish = 0.0
+                t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
         self.finished.emit()
 
     def take_latest(self) -> np.ndarray | None:
