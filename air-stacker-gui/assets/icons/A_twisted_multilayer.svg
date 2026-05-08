@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="48" fill="#0D1B2A"/>
+  <g transform="rotate(0 128 128)">
+    <polygon points="218,128 173,50 83,50 38,128 83,206 173,206"
+             fill="#5DADE2" fill-opacity="0.55"
+             stroke="#85C1E9" stroke-width="2"/>
+  </g>
+  <g transform="rotate(15 128 128)">
+    <polygon points="218,128 173,50 83,50 38,128 83,206 173,206"
+             fill="#2874A6" fill-opacity="0.55"
+             stroke="#5499C7" stroke-width="2"/>
+  </g>
+  <g transform="rotate(30 128 128)">
+    <polygon points="218,128 173,50 83,50 38,128 83,206 173,206"
+             fill="#1A5276" fill-opacity="0.65"
+             stroke="#2874A6" stroke-width="2"/>
+  </g>
+</svg>
