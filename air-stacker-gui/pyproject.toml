@@ -13,6 +13,20 @@ dependencies = [
     "superqt>=0.8.1",
 ]
 
+[project.gui-scripts]
+# On Windows, gui-scripts entry points generate a pythonw-based .exe
+# wrapper, so launching from a shortcut doesn't flash a console window.
+air-stacker-gui = "main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Flat layout: main.py + conex.py at the root, heater as a subpackage.
+packages = ["heater"]
+include = ["main.py", "conex.py"]
+
 [dependency-groups]
 dev = [
     "ruff>=0.7",
