@@ -2,11 +2,29 @@
 
 from __future__ import annotations
 
+# Detach + hide any console allocated at startup, before heavy imports
+# kick off. uv 0.11.8's venv pythonw.exe is built as console subsystem
+# (the launcher trampoline doesn't carry the GUI flag), so launching us
+# from a Desktop .lnk pops a black console window for the lifetime of
+# the process. Hiding the window first avoids the brief flash; then
+# FreeConsole detaches us so any C-side stderr writes from the GenTL
+# producer don't keep it alive. Has to run before importing harvesters /
+# Qt / cv2 because those load DLLs that may write to stderr on import.
+import sys
+
+if sys.platform == "win32":
+    import ctypes
+
+    _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+    if _hwnd:
+        ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
+    ctypes.windll.kernel32.FreeConsole()
+    del _hwnd
+
 import argparse
 import contextlib
 import logging
 import os
-import sys
 import threading
 import time
 from collections import deque
@@ -238,16 +256,23 @@ def apply_adjustments(rgb: np.ndarray, adj: AdjustmentSnapshot) -> np.ndarray:
     return out
 
 
+_HIST_DOWNSAMPLE = (320, 256)  # 4x4 from 1280x1024; ~16x fewer pixels
+
+
 def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     """256-bin per-channel histogram of an RGB uint8 frame.
 
-    cv2.calcHist handles channel selection internally (no split copy)
-    and uses cv2's SIMD-tuned inner loop. Measured ~4x faster than
-    split+bincount and consistent across platforms.
+    Downsamples to ~80K pixels via cv2.resize before binning. The
+    histogram widget is 200x48 — full pixel coverage is wasted work.
+    On hardware where cv2.calcHist is slow per-pixel (some Windows
+    opencv-python wheels are ~50× slower than Linux), keeping the
+    work small here is what makes every-frame histogramming viable.
+    cv2.resize itself is heavily SIMD-optimized everywhere.
     """
+    sub = cv2.resize(rgb, _HIST_DOWNSAMPLE, interpolation=cv2.INTER_NEAREST)
     out = np.empty((3, 256), dtype=np.int64)
     for c in range(3):
-        h = cv2.calcHist([rgb], [c], None, [256], [0, 256])
+        h = cv2.calcHist([sub], [c], None, [256], [0, 256])
         out[c] = h.ravel().astype(np.int64)
     return out
 
