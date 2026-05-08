@@ -8,13 +8,14 @@ import sys
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 from harvesters.core import Harvester
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -25,6 +26,8 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
+    QSlider,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -97,6 +100,132 @@ def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
     if fmt.startswith("BGR"):
         return cv2.cvtColor(data.reshape(height, width, 3), cv2.COLOR_BGR2RGB)
     raise ValueError(f"unsupported pixel format: {fmt}")
+
+
+@dataclass(frozen=True)
+class AdjustmentSnapshot:
+    """Immutable snapshot of image-adjustment parameters.
+
+    Brightness / contrast / saturation are integer percent (100 = identity).
+    R/G/B ranges are inclusive [lo, hi] in [0, 255]; (0, 255) is identity.
+    """
+
+    brightness: int = 100
+    contrast: int = 100
+    saturation: int = 100
+    r_range: tuple[int, int] = (0, 255)
+    g_range: tuple[int, int] = (0, 255)
+    b_range: tuple[int, int] = (0, 255)
+
+    @property
+    def is_identity(self) -> bool:
+        return (
+            self.brightness == 100
+            and self.contrast == 100
+            and self.saturation == 100
+            and self.r_range == (0, 255)
+            and self.g_range == (0, 255)
+            and self.b_range == (0, 255)
+        )
+
+
+class ImageAdjustments:
+    """Thread-safe live container for an AdjustmentSnapshot.
+
+    The GUI thread mutates via update(); the camera worker reads
+    via get(). Snapshots are immutable so the worker can hold one
+    across a frame's adjustment pass without any locking.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._snap = AdjustmentSnapshot()
+
+    def get(self) -> AdjustmentSnapshot:
+        with self._lock:
+            return self._snap
+
+    def update(self, **kwargs) -> AdjustmentSnapshot:
+        with self._lock:
+            self._snap = replace(self._snap, **kwargs)
+            return self._snap
+
+    def reset(self) -> AdjustmentSnapshot:
+        with self._lock:
+            self._snap = AdjustmentSnapshot()
+            return self._snap
+
+
+def _build_brightness_lut(brightness_pct: int) -> np.ndarray:
+    """LUT for `out = clip(in * brightness/100)`."""
+    x = np.arange(256, dtype=np.float32)
+    return np.clip(x * (brightness_pct / 100.0), 0.0, 255.0).astype(np.uint8)
+
+
+def _build_channel_lut(contrast_pct: int, lo: int, hi: int) -> np.ndarray:
+    """LUT folding contrast (around 128) then per-channel range remap."""
+    x = np.arange(256, dtype=np.float32)
+    y = (x - 128.0) * (contrast_pct / 100.0) + 128.0
+    if (lo, hi) != (0, 255):
+        span = max(hi - lo, 1)
+        y = (y - lo) * (255.0 / span)
+    return np.clip(y, 0.0, 255.0).astype(np.uint8)
+
+
+def apply_adjustments(rgb: np.ndarray, adj: AdjustmentSnapshot) -> np.ndarray:
+    """Apply brightness/saturation/contrast/RGB-range to an RGB uint8 frame.
+
+    Order matches the flakes-website CSS filter chain:
+    brightness → saturate → contrast → per-channel range remap.
+
+    Returns a new array; input is not mutated. If `adj` is identity,
+    returns the input unchanged (fast path).
+    """
+    if adj.is_identity:
+        return rgb
+
+    out = rgb
+    if adj.brightness != 100:
+        out = cv2.LUT(out, _build_brightness_lut(adj.brightness))
+
+    if adj.saturation != 100:
+        hsv = cv2.cvtColor(out, cv2.COLOR_RGB2HSV)
+        s = hsv[..., 1].astype(np.float32) * (adj.saturation / 100.0)
+        hsv[..., 1] = np.clip(s, 0.0, 255.0).astype(np.uint8)
+        out = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+
+    needs_per_channel = (
+        adj.contrast != 100
+        or adj.r_range != (0, 255)
+        or adj.g_range != (0, 255)
+        or adj.b_range != (0, 255)
+    )
+    if needs_per_channel:
+        r_lut = _build_channel_lut(adj.contrast, *adj.r_range)
+        g_lut = _build_channel_lut(adj.contrast, *adj.g_range)
+        b_lut = _build_channel_lut(adj.contrast, *adj.b_range)
+        # Numpy fancy-indexing is comparable to cv2.LUT here and
+        # natively supports a different LUT per channel.
+        result = np.empty_like(out)
+        result[..., 0] = r_lut[out[..., 0]]
+        result[..., 1] = g_lut[out[..., 1]]
+        result[..., 2] = b_lut[out[..., 2]]
+        out = result
+
+    return out
+
+
+def compute_histograms(rgb: np.ndarray) -> np.ndarray:
+    """256-bin per-channel histogram of an RGB uint8 frame.
+
+    Returns a (3, 256) int64 array. Cheap (~1-2 ms at 1280x1024).
+    """
+    out = np.empty((3, 256), dtype=np.int64)
+    flat = rgb.reshape(-1, 3)
+    out[0] = np.bincount(flat[:, 0], minlength=256)
+    out[1] = np.bincount(flat[:, 1], minlength=256)
+    out[2] = np.bincount(flat[:, 2], minlength=256)
+    return out
 
 
 class CameraDisplay(QLabel):
@@ -176,12 +305,16 @@ class CameraWorker(QObject):
     """
 
     frame_ready = Signal()  # mailbox notify only; main thread pulls via take_latest()
+    histograms_ready = Signal(object)  # carries (3, 256) int64 ndarray
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, acquirer) -> None:
+    HIST_INTERVAL_S = 0.2  # ~5 Hz (camera runs at ~60 Hz)
+
+    def __init__(self, acquirer, adjustments: ImageAdjustments | None = None) -> None:
         super().__init__()
         self._acquirer = acquirer
+        self._adjustments = adjustments
         self._running = False
         self._lock = threading.Lock()
         self._latest: np.ndarray | None = None
@@ -191,6 +324,7 @@ class CameraWorker(QObject):
         self._running = True
         log_count = 0
         log_start = time.monotonic()
+        hist_last = 0.0
         while self._running:
             try:
                 with self._acquirer.fetch(timeout=0.5) as buffer:
@@ -198,13 +332,28 @@ class CameraWorker(QObject):
                     rgb = np.ascontiguousarray(
                         to_rgb(comp.data, comp.width, comp.height, comp.data_format)
                     ).copy()
+                # Histograms are computed on the raw frame (pre-adjustment)
+                # so they read like a stable baseline of the sensor output.
+                now = time.monotonic()
+                if now - hist_last > self.HIST_INTERVAL_S:
+                    hist_last = now
+                    try:
+                        self.histograms_ready.emit(compute_histograms(rgb))
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[camera] histogram err: {e}", file=sys.stderr, flush=True)
+                if self._adjustments is not None:
+                    snap = self._adjustments.get()
+                    if not snap.is_identity:
+                        try:
+                            rgb = np.ascontiguousarray(apply_adjustments(rgb, snap))
+                        except Exception as e:  # noqa: BLE001
+                            print(f"[camera] adjustment err: {e}", file=sys.stderr, flush=True)
                 with self._lock:
                     notify = self._latest is None
                     self._latest = rgb
                 if notify:
                     self.frame_ready.emit()
                 log_count += 1
-                now = time.monotonic()
                 if now - log_start > 2.0:
                     print(
                         f"[camera] produced {log_count / (now - log_start):.1f} fps",
@@ -641,6 +790,255 @@ class CameraOptionsPanel(QGroupBox):
         self.sharpness_spin.setValue(int(d["Sharpness"]))
 
 
+class ImageAdjustmentsPanel(QGroupBox):
+    """Software-side image adjustments applied per-frame on the camera worker.
+
+    Mutates a shared ImageAdjustments under a lock; the worker reads
+    immutable snapshots. UI controls publish on every change so feedback
+    is live.
+    """
+
+    BRIGHTNESS_RANGE = (50, 300)
+    CONTRAST_RANGE = (50, 300)
+    SATURATION_RANGE = (0, 200)
+
+    def __init__(self, adjustments: ImageAdjustments) -> None:
+        super().__init__("Image Adjustments")
+        self._adj = adjustments
+        self._building = True
+
+        self.brightness_slider, self.brightness_label = self._make_slider_row(
+            "Brightness", self.BRIGHTNESS_RANGE, 100
+        )
+        self.contrast_slider, self.contrast_label = self._make_slider_row(
+            "Contrast", self.CONTRAST_RANGE, 100
+        )
+        self.saturation_slider, self.saturation_label = self._make_slider_row(
+            "Saturation", self.SATURATION_RANGE, 100
+        )
+
+        self.r_lo, self.r_hi = self._make_range_spins()
+        self.g_lo, self.g_hi = self._make_range_spins()
+        self.b_lo, self.b_hi = self._make_range_spins()
+
+        self.defaults_btn = QPushButton("Defaults")
+
+        outer = QVBoxLayout(self)
+        for label, slider, value_label in (
+            ("Brightness", self.brightness_slider, self.brightness_label),
+            ("Contrast", self.contrast_slider, self.contrast_label),
+            ("Saturation", self.saturation_slider, self.saturation_label),
+        ):
+            head = QHBoxLayout()
+            head.addWidget(QLabel(f"{label}:"))
+            head.addStretch(1)
+            head.addWidget(value_label)
+            outer.addLayout(head)
+            outer.addWidget(slider)
+
+        for label, color, lo, hi in (
+            ("R:", "#c92a2a", self.r_lo, self.r_hi),
+            ("G:", "#2f9e44", self.g_lo, self.g_hi),
+            ("B:", "#1971c2", self.b_lo, self.b_hi),
+        ):
+            row = QHBoxLayout()
+            tag = QLabel(label)
+            tag.setStyleSheet(f"color: {color}; font-weight: bold;")
+            row.addWidget(tag)
+            row.addWidget(lo, stretch=1)
+            row.addWidget(QLabel("–"))
+            row.addWidget(hi, stretch=1)
+            outer.addLayout(row)
+
+        outer.addWidget(self.defaults_btn)
+
+        self.brightness_slider.valueChanged.connect(self._on_brightness)
+        self.contrast_slider.valueChanged.connect(self._on_contrast)
+        self.saturation_slider.valueChanged.connect(self._on_saturation)
+        for lo, hi, name in (
+            (self.r_lo, self.r_hi, "r_range"),
+            (self.g_lo, self.g_hi, "g_range"),
+            (self.b_lo, self.b_hi, "b_range"),
+        ):
+            lo.valueChanged.connect(lambda _v, n=name: self._on_range(n))
+            hi.valueChanged.connect(lambda _v, n=name: self._on_range(n))
+
+        self.defaults_btn.clicked.connect(self._apply_defaults)
+        self._building = False
+
+    def _make_slider_row(
+        self, _label: str, span: tuple[int, int], default: int
+    ) -> tuple[QSlider, QLabel]:
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(*span)
+        slider.setValue(default)
+        slider.setSingleStep(1)
+        slider.setPageStep(10)
+        value_label = QLabel(f"{default}%")
+        value_label.setMinimumWidth(48)
+        value_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        return slider, value_label
+
+    def _make_range_spins(self) -> tuple[QSpinBox, QSpinBox]:
+        lo = QSpinBox()
+        lo.setRange(0, 254)
+        lo.setValue(0)
+        lo.setKeyboardTracking(False)
+        hi = QSpinBox()
+        hi.setRange(1, 255)
+        hi.setValue(255)
+        hi.setKeyboardTracking(False)
+        return lo, hi
+
+    def _on_brightness(self, v: int) -> None:
+        self.brightness_label.setText(f"{v}%")
+        if self._building:
+            return
+        self._adj.update(brightness=v)
+
+    def _on_contrast(self, v: int) -> None:
+        self.contrast_label.setText(f"{v}%")
+        if self._building:
+            return
+        self._adj.update(contrast=v)
+
+    def _on_saturation(self, v: int) -> None:
+        self.saturation_label.setText(f"{v}%")
+        if self._building:
+            return
+        self._adj.update(saturation=v)
+
+    def _on_range(self, name: str) -> None:
+        if self._building:
+            return
+        spins = {
+            "r_range": (self.r_lo, self.r_hi),
+            "g_range": (self.g_lo, self.g_hi),
+            "b_range": (self.b_lo, self.b_hi),
+        }[name]
+        lo, hi = spins[0].value(), spins[1].value()
+        # Keep lo strictly below hi without fighting the user's typing.
+        if lo >= hi:
+            if self.sender() is spins[0]:
+                hi = min(255, lo + 1)
+                spins[1].blockSignals(True)
+                spins[1].setValue(hi)
+                spins[1].blockSignals(False)
+            else:
+                lo = max(0, hi - 1)
+                spins[0].blockSignals(True)
+                spins[0].setValue(lo)
+                spins[0].blockSignals(False)
+        self._adj.update(**{name: (lo, hi)})
+
+    def _apply_defaults(self) -> None:
+        snap = self._adj.reset()
+        self._building = True
+        try:
+            self.brightness_slider.setValue(snap.brightness)
+            self.contrast_slider.setValue(snap.contrast)
+            self.saturation_slider.setValue(snap.saturation)
+            for (lo_w, hi_w), rng in (
+                ((self.r_lo, self.r_hi), snap.r_range),
+                ((self.g_lo, self.g_hi), snap.g_range),
+                ((self.b_lo, self.b_hi), snap.b_range),
+            ):
+                lo_w.setValue(rng[0])
+                hi_w.setValue(rng[1])
+            self.brightness_label.setText(f"{snap.brightness}%")
+            self.contrast_label.setText(f"{snap.contrast}%")
+            self.saturation_label.setText(f"{snap.saturation}%")
+        finally:
+            self._building = False
+
+
+class HistogramWidget(QWidget):
+    """Per-channel RGB histogram, drawn as three filled curves overlaid.
+
+    Receives (3, 256) int64 arrays via set_histograms() (typically
+    queued from CameraWorker.histograms_ready). Smoothing and √-axis
+    happen at paint time so the camera worker can stay cheap.
+    """
+
+    SMOOTH_RADIUS = 2
+    CHANNEL_COLORS = (
+        QColor(224, 49, 49),   # R
+        QColor(47, 158, 68),   # G
+        QColor(25, 113, 194),  # B
+    )
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._hist: np.ndarray | None = None
+        self.setMinimumHeight(120)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    @Slot(object)
+    def set_histograms(self, hist: np.ndarray) -> None:
+        if hist.shape != (3, 256):
+            return
+        self._hist = hist
+        self.update()
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QColor(20, 20, 20))
+        if self._hist is None:
+            painter.setPen(QColor(150, 150, 150))
+            painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "no data")
+            return
+
+        w = self.width()
+        h = self.height()
+        if w <= 0 or h <= 0:
+            return
+
+        for c, color in enumerate(self.CHANNEL_COLORS):
+            curve = self._smoothed(self._hist[c])
+            peak = float(curve.max())
+            if peak <= 0:
+                continue
+            # √-axis so low bins read.
+            ys = np.sqrt(curve / peak) * h
+            path = QPainterPath()
+            path.moveTo(0, h)
+            for i in range(256):
+                x = i * (w / 255.0)
+                y = h - ys[i]
+                path.lineTo(x, y)
+            path.lineTo(w, h)
+            path.closeSubpath()
+            fill = QColor(color)
+            fill.setAlpha(70)
+            stroke = QColor(color)
+            stroke.setAlpha(180)
+            painter.setBrush(QBrush(fill))
+            pen = QPen(stroke)
+            pen.setWidthF(1.0)
+            painter.setPen(pen)
+            painter.drawPath(path)
+
+    def _smoothed(self, arr: np.ndarray) -> np.ndarray:
+        """Box-filter smoothing matching the web app's rolling-mean."""
+        r = self.SMOOTH_RADIUS
+        if r <= 0:
+            return arr.astype(np.float32)
+        # Cumulative-sum trick keeps it O(n) and matches the JS implementation
+        # (mean over the window clamped at the array edges).
+        x = arr.astype(np.float64)
+        n = x.size
+        cs = np.concatenate(([0.0], np.cumsum(x)))
+        out = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            lo = max(0, i - r)
+            hi = min(n - 1, i + r)
+            out[i] = (cs[hi + 1] - cs[lo]) / (hi - lo + 1)
+        return out
+
+
 class HeaterPanel(QGroupBox):
     """Live temperature + setpoint control for an Omega Platinum controller."""
 
@@ -840,6 +1238,9 @@ class CameraWindow(QMainWindow):
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
         self.camera_options_panel: CameraOptionsPanel | None = None
+        self.adjustments_panel: ImageAdjustmentsPanel | None = None
+        self.histogram_widget: HistogramWidget | None = None
+        self.adjustments = ImageAdjustments()
 
         config = load_config()
         camera_cfg = config.get("camera", {})
@@ -872,12 +1273,17 @@ class CameraWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.camera_thread = QThread()
-        self.camera_worker = CameraWorker(self.acquirer)
+        self.camera_worker = CameraWorker(self.acquirer, self.adjustments)
         self.camera_worker.moveToThread(self.camera_thread)
         self.camera_thread.started.connect(self.camera_worker.run)
         self.camera_worker.frame_ready.connect(self._on_frame)
         self.camera_worker.error.connect(self._on_frame_error)
         self.camera_worker.finished.connect(self.camera_thread.quit)
+        if self.histogram_widget is not None:
+            self.camera_worker.histograms_ready.connect(
+                self.histogram_widget.set_histograms,
+                Qt.ConnectionType.QueuedConnection,
+            )
         self.camera_thread.start()
 
     def _apply_camera_startup(self) -> None:
@@ -939,12 +1345,21 @@ class CameraWindow(QMainWindow):
         presets_layout = QVBoxLayout(presets)
         presets_layout.addWidget(QLabel("TODO"))
 
+        self.adjustments_panel = ImageAdjustmentsPanel(self.adjustments)
+
+        histogram_group = QGroupBox("Histograms")
+        histogram_layout = QVBoxLayout(histogram_group)
+        self.histogram_widget = HistogramWidget()
+        histogram_layout.addWidget(self.histogram_widget)
+
         self.camera_options_panel = CameraOptionsPanel(
             self.acquirer.remote_device.node_map, camera_cfg
         )
 
         layout.addWidget(recording)
         layout.addWidget(presets)
+        layout.addWidget(self.adjustments_panel)
+        layout.addWidget(histogram_group)
         layout.addWidget(self.camera_options_panel)
         layout.addStretch(1)
         return panel
