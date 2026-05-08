@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 from harvesters.core import Harvester
 from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -41,6 +41,7 @@ from heater import OmegaPlatinum
 import tomllib
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
+ICON_PATH = Path(__file__).resolve().parent / "assets" / "icons" / "air_stacker.ico"
 
 log = logging.getLogger("airstacker")
 
@@ -1635,7 +1636,21 @@ def main() -> int:
     args, qt_args = parser.parse_known_args()
     configure_logging(args.verbose)
 
+    # Set an explicit AppUserModelID on Windows so the taskbar uses our
+    # icon instead of grouping under the pythonw.exe parent.
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "sharpelab.airstacker.gui"
+            )
+        except Exception as e:  # noqa: BLE001
+            log.debug("AppUserModelID set failed: %s", e)
+
     app = QApplication([sys.argv[0]] + qt_args)
+    if ICON_PATH.exists():
+        app.setWindowIcon(QIcon(str(ICON_PATH)))
     win = CameraWindow()
     win.resize(960, 720)
     win.show()
