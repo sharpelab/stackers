@@ -282,13 +282,22 @@ def render_hist_image(
 ) -> QImage:
     """Render a single-channel histogram curve into an ARGB32 QImage.
 
-    Designed to run on the HistWorker thread — Qt allows QPainter
-    on standalone QImage objects off the GUI thread. Output is sized
-    fixed (256×48 by default); ChannelHistogram.paintEvent scales it
-    to the widget's current size via drawImage.
+    Pure-numpy path: writes directly into the QImage's pixel buffer
+    via memoryview. Avoids QPainter + a 256-iteration lineTo Python
+    loop, which on the HistWorker thread held the GIL for ~25 ms
+    per channel and starved the GUI thread of paint dispatches.
+    Trade: the curve edge is stair-stepped at column granularity
+    (no antialiasing). At 256-px-wide render scaled to ~200-px
+    widget the difference is barely visible.
     """
-    img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
-    img.fill(QColor(20, 20, 20))
+    qimg = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+    ptr = qimg.bits()
+    bgra = np.frombuffer(ptr, dtype=np.uint8).reshape(height, width, 4)
+    # Format_ARGB32 little-endian: B, G, R, A bytes. Background fill.
+    bgra[..., 0] = 20
+    bgra[..., 1] = 20
+    bgra[..., 2] = 20
+    bgra[..., 3] = 255
 
     r = _HIST_SMOOTH_RADIUS
     x = counts.astype(np.float64)
@@ -299,28 +308,29 @@ def render_hist_image(
     smoothed = (cs[hi_i + 1] - cs[lo_i]) / (hi_i - lo_i + 1)
     peak = float(smoothed.max())
     if peak <= 0:
-        return img
-    ys = np.sqrt(smoothed / peak) * height
+        return qimg
 
-    painter = QPainter(img)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-    path = QPainterPath()
-    path.moveTo(0, height)
-    for i in range(256):
-        path.lineTo(i * (width / 255.0), height - float(ys[i]))
-    path.lineTo(width, height)
-    path.closeSubpath()
-    fill = QColor(*color)
-    fill.setAlpha(80)
-    stroke = QColor(*color)
-    stroke.setAlpha(200)
-    painter.setBrush(QBrush(fill))
-    pen = QPen(stroke)
-    pen.setWidthF(1.0)
-    painter.setPen(pen)
-    painter.drawPath(path)
-    painter.end()
-    return img
+    ys = np.sqrt(smoothed / peak) * height
+    if width == 256:
+        ys_w = ys
+    else:
+        ys_w = np.interp(np.linspace(0, 255, width), np.arange(256), ys)
+
+    threshold = height - ys_w  # row index above which to fill (per column)
+    y_grid = np.arange(height).reshape(height, 1)
+    fill_mask = y_grid >= threshold[None, :]
+
+    # Composite source (channel color, alpha=80) over background (20,20,20).
+    # Premultiplied ARGB requires the RGB bytes to already be * (A/255).
+    a_src = 80
+    bg_factor = (255 - a_src) / 255.0
+    cb = int(color[2] * a_src / 255 + 20 * bg_factor)
+    cg = int(color[1] * a_src / 255 + 20 * bg_factor)
+    cr = int(color[0] * a_src / 255 + 20 * bg_factor)
+    bgra[fill_mask, 0] = cb
+    bgra[fill_mask, 1] = cg
+    bgra[fill_mask, 2] = cr
+    return qimg
 
 
 class _CameraGLWindow(QOpenGLWindow):
