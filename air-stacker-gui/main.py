@@ -244,18 +244,15 @@ _HIST_DOWNSAMPLE = (320, 256)  # 4x4 from 1280x1024; ~16x fewer pixels
 def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     """256-bin per-channel histogram of an RGB uint8 frame.
 
-    Downsamples to ~80K pixels via cv2.resize before binning. The
-    histogram widget is 200x48 — full pixel coverage is wasted work.
-    On hardware where cv2.calcHist is slow per-pixel (some Windows
-    opencv-python wheels are ~50× slower than Linux), keeping the
-    work small here is what makes every-frame histogramming viable.
-    cv2.resize itself is heavily SIMD-optimized everywhere.
+    Downsamples to ~80K pixels via cv2.resize, then uses np.bincount
+    per channel. cv2.calcHist on the Windows opencv-python wheel
+    runs ~50× slower than Linux, dragging proc compute to ~20 ms
+    even on the downsampled array; bincount on uint8 sidesteps that.
     """
     sub = cv2.resize(rgb, _HIST_DOWNSAMPLE, interpolation=cv2.INTER_NEAREST)
     out = np.empty((3, 256), dtype=np.int64)
     for c in range(3):
-        h = cv2.calcHist([sub], [c], None, [256], [0, 256])
-        out[c] = h.ravel().astype(np.int64)
+        out[c] = np.bincount(sub[..., c].ravel(), minlength=256)
     return out
 
 
