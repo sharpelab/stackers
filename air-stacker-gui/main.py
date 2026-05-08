@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import contextlib
+import logging
 import os
 import sys
 import threading
@@ -28,14 +30,13 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSlider,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 from superqt import QRangeSlider
 
 from conex import ConexAxis, error_label, state_label
-from heater import OmegaPlatinum, diagnose
+from heater import OmegaPlatinum
 
 try:
     import tomllib
@@ -43,6 +44,23 @@ except ModuleNotFoundError:
     import tomli as tomllib
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
+
+log = logging.getLogger("airstacker")
+
+
+def configure_logging(verbose: int) -> None:
+    """verbose=0 → WARNING (default); 1 → INFO; 2+ → DEBUG."""
+    if verbose >= 2:
+        level = logging.DEBUG
+    elif verbose >= 1:
+        level = logging.INFO
+    else:
+        level = logging.WARNING
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+    log.addHandler(handler)
+    log.setLevel(level)
+    log.propagate = False
 
 
 def load_config() -> dict:
@@ -341,14 +359,14 @@ class CameraWorker(QObject):
                     try:
                         self.histograms_ready.emit(compute_histograms(rgb))
                     except Exception as e:  # noqa: BLE001
-                        print(f"[camera] histogram err: {e}", file=sys.stderr, flush=True)
+                        log.warning("camera histogram err: %s", e)
                 if self._adjustments is not None:
                     snap = self._adjustments.get()
                     if not snap.is_identity:
                         try:
                             rgb = np.ascontiguousarray(apply_adjustments(rgb, snap))
                         except Exception as e:  # noqa: BLE001
-                            print(f"[camera] adjustment err: {e}", file=sys.stderr, flush=True)
+                            log.warning("camera adjustment err: %s", e)
                 with self._lock:
                     notify = self._latest is None
                     self._latest = rgb
@@ -356,11 +374,7 @@ class CameraWorker(QObject):
                     self.frame_ready.emit()
                 log_count += 1
                 if now - log_start > 2.0:
-                    print(
-                        f"[camera] produced {log_count / (now - log_start):.1f} fps",
-                        file=sys.stderr,
-                        flush=True,
-                    )
+                    log.info("camera produced %.1f fps", log_count / (now - log_start))
                     log_count = 0
                     log_start = now
             except Exception as e:  # noqa: BLE001 — surface errors then keep trying
@@ -551,31 +565,31 @@ class ConexAxisPanel(QGroupBox):
             self._worker.stop()
             self._worker_thread.quit()
             if not self._worker_thread.wait(2000):
-                print(
-                    f"axis {self.title()} thread did not exit cleanly",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                log.warning("axis %s thread did not exit cleanly", self.title())
         self.axis.close()
 
 
 class CameraOptionsPanel(QGroupBox):
     """Live camera controls (GenICam node map): gain / exposure (with
-    auto), white balance (auto + manual Red/Blue ratios), gamma, sharpness.
+    auto) and white balance (auto + manual Red/Blue ratios).
 
     The Defaults button reverts everything to OUR_DEFAULTS — factory values
     plus the lab's preferred gain/exposure tweaks. config.toml's [camera]
     section can override gain/exposure for those keys it provides.
+
+    Gamma and sharpness are intentionally not exposed: the on-board nodes
+    are read-only on this Flea3 / Spinnaker 2.3 combo. Software gamma
+    lives in the Image Adjustments panel.
     """
 
     OUR_DEFAULTS: dict = {
-        "Gain": 10.0,
-        "ExposureTime": 5000.0,
+        "Gain": 1.61,
+        "ExposureTime": 16798.0,
         "GainAuto": "Off",
         "ExposureAuto": "Off",
-        "BalanceWhiteAuto": "Continuous",
-        "Gamma": 1.0,
-        "Sharpness": 1024,
+        "BalanceWhiteAuto": "Off",
+        "BalanceRatioRed": 0.6,
+        "BalanceRatioBlue": 3.3,
     }
 
     def __init__(self, node_map, defaults: dict) -> None:
@@ -610,15 +624,6 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.setSingleStep(0.05)
         self.wb_auto = QCheckBox("auto")
 
-        self.gamma_spin = QDoubleSpinBox()
-        self.gamma_spin.setKeyboardTracking(False)
-        self.gamma_spin.setDecimals(2)
-        self.gamma_spin.setSingleStep(0.05)
-
-        self.sharpness_spin = QSpinBox()
-        self.sharpness_spin.setKeyboardTracking(False)
-        self.sharpness_spin.setSingleStep(64)
-
         self.defaults_btn = QPushButton("Defaults")
 
         outer = QVBoxLayout(self)
@@ -632,21 +637,14 @@ class CameraOptionsPanel(QGroupBox):
             row.addWidget(spin, stretch=1)
             row.addWidget(auto)
             outer.addLayout(row)
-        for label, spin in (
-            ("WB Blue:", self.wb_blue_spin),
-            ("Gamma:", self.gamma_spin),
-            ("Sharpness:", self.sharpness_spin),
-        ):
-            row = QHBoxLayout()
-            row.addWidget(QLabel(label))
-            row.addWidget(spin, stretch=1)
-            outer.addLayout(row)
+        wb_blue_row = QHBoxLayout()
+        wb_blue_row.addWidget(QLabel("WB Blue:"))
+        wb_blue_row.addWidget(self.wb_blue_spin, stretch=1)
+        outer.addLayout(wb_blue_row)
         outer.addWidget(self.defaults_btn)
 
         self._setup_range_float("Gain", self.gain_spin)
         self._setup_range_float("ExposureTime", self.exp_spin)
-        self._setup_range_float("Gamma", self.gamma_spin)
-        self._setup_range_int("Sharpness", self.sharpness_spin)
         # BalanceRatio is locked while WB auto is on. Try to read the
         # node's bounds anyway; fall back to Flea3-observed [0.25, 4.0].
         lo, hi = 0.25, 4.0
@@ -679,12 +677,6 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.editingFinished.connect(
             lambda: self._set_balance_ratio("Blue", self.wb_blue_spin.value())
         )
-        self.gamma_spin.editingFinished.connect(
-            lambda: self._set_float("Gamma", self.gamma_spin.value())
-        )
-        self.sharpness_spin.editingFinished.connect(
-            lambda: self._set_int("Sharpness", self.sharpness_spin.value())
-        )
         self.defaults_btn.clicked.connect(self._apply_defaults)
 
     def _setup_range_float(self, name: str, spin: QDoubleSpinBox) -> None:
@@ -693,35 +685,20 @@ class CameraOptionsPanel(QGroupBox):
             spin.setRange(float(node.min), float(node.max))
         except Exception as e:
             spin.setEnabled(False)
-            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
-
-    def _setup_range_int(self, name: str, spin: QSpinBox) -> None:
-        try:
-            node = getattr(self.node_map, name)
-            spin.setRange(int(node.min), int(node.max))
-        except Exception as e:
-            spin.setEnabled(False)
-            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
+            log.debug("camera %s range: %s", name, e)
 
     def _set_float(self, name: str, value: float) -> None:
         try:
             node = getattr(self.node_map, name)
             node.value = max(node.min, min(node.max, float(value)))
         except Exception as e:
-            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
-
-    def _set_int(self, name: str, value: int) -> None:
-        try:
-            node = getattr(self.node_map, name)
-            node.value = max(node.min, min(node.max, int(value)))
-        except Exception as e:
-            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
+            log.debug("camera %s: %s", name, e)
 
     def _set_enum(self, name: str, value: str) -> None:
         try:
             getattr(self.node_map, name).value = value
         except Exception as e:
-            print(f"camera {name}: {e}", file=sys.stderr, flush=True)
+            log.debug("camera %s: %s", name, e)
 
     def _on_auto_toggled(
         self, auto_name: str, on: bool, manual_spin: QDoubleSpinBox, value_name: str
@@ -745,7 +722,7 @@ class CameraOptionsPanel(QGroupBox):
                     self.node_map.BalanceRatioSelector.value = color
                     spin.setValue(float(self.node_map.BalanceRatio.value))
                 except Exception as e:
-                    print(f"camera BalanceRatio {color}: {e}", file=sys.stderr, flush=True)
+                    log.debug("camera BalanceRatio %s: %s", color, e)
 
     def _set_balance_ratio(self, color: str, value: float) -> None:
         if self.wb_auto.isChecked():
@@ -755,7 +732,7 @@ class CameraOptionsPanel(QGroupBox):
             node = self.node_map.BalanceRatio
             node.value = max(node.min, min(node.max, float(value)))
         except Exception as e:
-            print(f"camera BalanceRatio {color}: {e}", file=sys.stderr, flush=True)
+            log.debug("camera BalanceRatio %s: %s", color, e)
 
     def _apply_defaults(self) -> None:
         """Push OUR_DEFAULTS to the camera and sync the widgets. Used at
@@ -766,8 +743,15 @@ class CameraOptionsPanel(QGroupBox):
         self._set_enum("BalanceWhiteAuto", d["BalanceWhiteAuto"])
         self._set_float("Gain", d["Gain"])
         self._set_float("ExposureTime", d["ExposureTime"])
-        self._set_float("Gamma", d["Gamma"])
-        self._set_int("Sharpness", d["Sharpness"])
+        # WB ratios are only writable while BalanceWhiteAuto is Off.
+        if d["BalanceWhiteAuto"] != "Continuous":
+            for color, key in (("Red", "BalanceRatioRed"), ("Blue", "BalanceRatioBlue")):
+                try:
+                    self.node_map.BalanceRatioSelector.value = color
+                    node = self.node_map.BalanceRatio
+                    node.value = max(node.min, min(node.max, float(d[key])))
+                except Exception as e:
+                    log.debug("camera BalanceRatio %s: %s", color, e)
         gain_auto_on = d["GainAuto"] == "Continuous"
         exp_auto_on = d["ExposureAuto"] == "Continuous"
         wb_auto_on = d["BalanceWhiteAuto"] == "Continuous"
@@ -787,8 +771,8 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.setEnabled(not wb_auto_on)
         self.gain_spin.setValue(float(d["Gain"]))
         self.exp_spin.setValue(float(d["ExposureTime"]))
-        self.gamma_spin.setValue(float(d["Gamma"]))
-        self.sharpness_spin.setValue(int(d["Sharpness"]))
+        self.wb_red_spin.setValue(float(d["BalanceRatioRed"]))
+        self.wb_blue_spin.setValue(float(d["BalanceRatioBlue"]))
 
 
 class ChannelHistogram(QWidget):
@@ -1097,7 +1081,6 @@ class HeaterPanel(QGroupBox):
 
         self.run_btn = QPushButton("Run")
         self.stop_btn = QPushButton("Stop")
-        self.diag_btn = QPushButton("Diag")
 
         outer = QVBoxLayout(self)
         outer.addWidget(self.status_label)
@@ -1116,7 +1099,6 @@ class HeaterPanel(QGroupBox):
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.stop_btn)
-        btn_row.addWidget(self.diag_btn)
         outer.addLayout(btn_row)
         outer.addStretch(1)
 
@@ -1124,7 +1106,6 @@ class HeaterPanel(QGroupBox):
         self.max_output_spin.editingFinished.connect(self._on_set_max_output)
         self.run_btn.clicked.connect(self._on_run)
         self.stop_btn.clicked.connect(self._on_stop)
-        self.diag_btn.clicked.connect(self._on_diag)
 
         self._poll_interval_s = int(cfg.get("poll_interval_ms", 1000)) / 1000.0
         self._worker: PollWorker | None = None
@@ -1138,7 +1119,6 @@ class HeaterPanel(QGroupBox):
             self.max_output_spin.setEnabled(False)
             self.run_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
-            self.diag_btn.setEnabled(False)
             return
 
         self.status_label.setText(f"connected on {self.heater.port}")
@@ -1177,12 +1157,6 @@ class HeaterPanel(QGroupBox):
             self.heater.stop()
         except Exception as e:
             self.status_label.setText(f"stop err: {e}")
-
-    def _on_diag(self) -> None:
-        try:
-            print(diagnose(self.heater).summary(), flush=True)
-        except Exception as e:
-            self.status_label.setText(f"diag err: {e}")
 
     def _read_state(self) -> dict:
         """Worker-thread: read heater state. Must not touch Qt widgets."""
@@ -1234,11 +1208,7 @@ class HeaterPanel(QGroupBox):
             self._worker.stop()
             self._worker_thread.quit()
             if not self._worker_thread.wait(2000):
-                print(
-                    "heater thread did not exit cleanly",
-                    file=sys.stderr,
-                    flush=True,
-                )
+                log.warning("heater thread did not exit cleanly")
         self.heater.close()
 
 
@@ -1326,7 +1296,7 @@ class CameraWindow(QMainWindow):
             try:
                 getattr(nm, name).value = value
             except Exception as e:
-                print(f"camera {name}: {e}", file=sys.stderr, flush=True)
+                log.warning("camera %s: %s", name, e)
         # The "enabled" node is named differently across FLIR generations.
         for name in ("AcquisitionFrameRateEnabled", "AcquisitionFrameRateEnable"):
             try:
@@ -1337,14 +1307,14 @@ class CameraWindow(QMainWindow):
         try:
             rate = nm.AcquisitionFrameRate
             rate.value = float(rate.max)
-            print(
-                f"camera AcquisitionFrameRate = {rate.value:.2f} Hz "
-                f"(range {rate.min:.2f}..{rate.max:.2f})",
-                file=sys.stderr,
-                flush=True,
+            log.info(
+                "camera AcquisitionFrameRate = %.2f Hz (range %.2f..%.2f)",
+                rate.value,
+                rate.min,
+                rate.max,
             )
         except Exception as e:
-            print(f"camera AcquisitionFrameRate: {e}", file=sys.stderr, flush=True)
+            log.warning("camera AcquisitionFrameRate: %s", e)
 
     def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
         panel = QWidget()
@@ -1373,8 +1343,8 @@ class CameraWindow(QMainWindow):
 
         layout.addWidget(recording)
         layout.addWidget(presets)
-        layout.addWidget(self.adjustments_panel)
         layout.addWidget(self.camera_options_panel)
+        layout.addWidget(self.adjustments_panel)
         layout.addStretch(1)
         return panel
 
@@ -1417,10 +1387,11 @@ class CameraWindow(QMainWindow):
         if self._proc_count >= 60:
             avg_ms = self._proc_total / self._proc_count * 1000
             max_ms = self._proc_max * 1000
-            print(
-                f"[gui] _on_frame avg={avg_ms:.1f}ms max={max_ms:.1f}ms n={self._proc_count}",
-                file=sys.stderr,
-                flush=True,
+            log.debug(
+                "_on_frame avg=%.1fms max=%.1fms n=%d",
+                avg_ms,
+                max_ms,
+                self._proc_count,
             )
             self._proc_total = 0.0
             self._proc_max = 0.0
@@ -1446,7 +1417,7 @@ class CameraWindow(QMainWindow):
         self.camera_worker.stop()
         self.camera_thread.quit()
         if not self.camera_thread.wait(2000):
-            print("camera thread did not exit cleanly", file=sys.stderr, flush=True)
+            log.warning("camera thread did not exit cleanly")
         for ap in self.axis_panels:
             ap.shutdown()
         if self.heater_panel is not None:
@@ -1458,7 +1429,18 @@ class CameraWindow(QMainWindow):
 
 
 def main() -> int:
-    app = QApplication(sys.argv)
+    parser = argparse.ArgumentParser(prog="air-stacker-gui")
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="-v: include INFO messages; -vv: include DEBUG messages",
+    )
+    args, qt_args = parser.parse_known_args()
+    configure_logging(args.verbose)
+
+    app = QApplication([sys.argv[0]] + qt_args)
     win = CameraWindow()
     win.resize(960, 720)
     win.show()

@@ -8,16 +8,15 @@ producer = 'C:\Program Files\FLIR Systems\Spinnaker\cti64\vs2015'
 [camera]
 # Zero-based index into the producer's enumerated device list.
 device_index = 0
-# Defaults applied at startup. Per gui-notes on the Air Stacker PC.
-gain = 10.0
-exposure_us = 5000.0
-# Auto white balance is "Continuous" by default; gain/exposure auto are "Off".
+# Other startup camera defaults (gain, exposure, WB ratios, autos) live in
+# OUR_DEFAULTS in main.py. Re-add `gain = ...` / `exposure_us = ...` here
+# only if a per-deployment override is needed.
 
 # CONEX-CC axes. Each entry is one controller on its own COM port (address 1 by convention).
 # Axis A on COM3 is currently disconnected — re-add a [[axis]] entry when it's wired up:
 #   name = "Axis A", port = "COM3", baud = 921600, units = "mm", step = 0.01
 [[axis]]
-name = "Rotation"
+name = "Rotation Stage"
 port = "COM4"
 baud = 921600
 units = "°"
