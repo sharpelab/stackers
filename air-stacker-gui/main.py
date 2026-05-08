@@ -646,17 +646,20 @@ class CameraOptionsPanel(QGroupBox):
     lives in the Image Adjustments panel.
     """
 
-    FRAME_RATE_OPTIONS: tuple[int, ...] = (15, 30, 45, 60)
+    # Hard cap on the exposure spinbox. The camera's actual ceiling is
+    # ~1/AcquisitionFrameRate.min (≈900 ms on the Flea3); 1 s is the
+    # operator-friendly round number we expose, and writes are clamped
+    # to whatever the camera allows.
+    MAX_EXPOSURE_MS: float = 1000.0
 
     OUR_DEFAULTS: dict = {
         "Gain": 1.61,
-        "ExposureTime": 16798.0,
+        "ExposureTime": 16798.0,  # µs (camera-native units)
         "GainAuto": "Off",
         "ExposureAuto": "Off",
         "BalanceWhiteAuto": "Off",
         "BalanceRatioRed": 0.6,
         "BalanceRatioBlue": 3.3,
-        "AcquisitionFrameRate": 60,  # nominal Hz; clamped to camera max on write
     }
 
     def __init__(self, node_map, defaults: dict) -> None:
@@ -676,9 +679,9 @@ class CameraOptionsPanel(QGroupBox):
 
         self.exp_spin = QDoubleSpinBox()
         self.exp_spin.setKeyboardTracking(False)
-        self.exp_spin.setDecimals(0)
-        self.exp_spin.setSingleStep(100)
-        self.exp_spin.setSuffix(" μs")
+        self.exp_spin.setDecimals(2)
+        self.exp_spin.setSingleStep(1.0)
+        self.exp_spin.setSuffix(" ms")
         self.exp_auto = QCheckBox("auto")
 
         self.wb_red_spin = QDoubleSpinBox()
@@ -690,16 +693,6 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.setDecimals(3)
         self.wb_blue_spin.setSingleStep(0.05)
         self.wb_auto = QCheckBox("auto")
-
-        self.frame_rate_slider = QSlider(Qt.Orientation.Horizontal)
-        self.frame_rate_slider.setMinimum(0)
-        self.frame_rate_slider.setMaximum(len(self.FRAME_RATE_OPTIONS) - 1)
-        self.frame_rate_slider.setSingleStep(1)
-        self.frame_rate_slider.setPageStep(1)
-        self.frame_rate_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
-        self.frame_rate_slider.setTickInterval(1)
-        self.frame_rate_label = QLabel("— Hz")
-        self.frame_rate_label.setMinimumWidth(48)
 
         self.defaults_btn = QPushButton("Defaults")
 
@@ -713,11 +706,6 @@ class CameraOptionsPanel(QGroupBox):
             row.addWidget(spin, stretch=1)
             row.addWidget(auto)
             outer.addLayout(row)
-        rate_row = QHBoxLayout()
-        rate_row.addWidget(QLabel("Frame rate:"))
-        rate_row.addWidget(self.frame_rate_slider, stretch=1)
-        rate_row.addWidget(self.frame_rate_label)
-        outer.addLayout(rate_row)
         wb_red_row = QHBoxLayout()
         wb_red_row.addWidget(QLabel("WB Red:"))
         wb_red_row.addWidget(self.wb_red_spin, stretch=1)
@@ -730,7 +718,10 @@ class CameraOptionsPanel(QGroupBox):
         outer.addWidget(self.defaults_btn)
 
         self._setup_range_float("Gain", self.gain_spin)
-        self._setup_range_float("ExposureTime", self.exp_spin)
+        # Exposure spinbox is in ms; the camera reports ExposureTime in µs.
+        # Set a fixed range up to MAX_EXPOSURE_MS — writes are clamped to
+        # whatever the camera actually allows (gated by AcquisitionFrameRate).
+        self.exp_spin.setRange(0.05, self.MAX_EXPOSURE_MS)
         # BalanceRatio is locked while WB auto is on. Try to read the
         # node's bounds anyway; fall back to Flea3-observed [0.25, 4.0].
         lo, hi = 0.25, 4.0
@@ -748,14 +739,10 @@ class CameraOptionsPanel(QGroupBox):
             lambda: self._set_float("Gain", self.gain_spin.value())
         )
         self.exp_spin.editingFinished.connect(
-            lambda: self._set_float("ExposureTime", self.exp_spin.value())
+            lambda: self._set_exposure_us(self.exp_spin.value() * 1000.0)
         )
-        self.gain_auto.toggled.connect(
-            lambda on: self._on_auto_toggled("GainAuto", on, self.gain_spin, "Gain")
-        )
-        self.exp_auto.toggled.connect(
-            lambda on: self._on_auto_toggled("ExposureAuto", on, self.exp_spin, "ExposureTime")
-        )
+        self.gain_auto.toggled.connect(self._on_gain_auto_toggled)
+        self.exp_auto.toggled.connect(self._on_exp_auto_toggled)
         self.wb_auto.toggled.connect(self._on_wb_auto_toggled)
         self.wb_red_spin.editingFinished.connect(
             lambda: self._set_balance_ratio("Red", self.wb_red_spin.value())
@@ -763,7 +750,6 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.editingFinished.connect(
             lambda: self._set_balance_ratio("Blue", self.wb_blue_spin.value())
         )
-        self.frame_rate_slider.valueChanged.connect(self._on_frame_rate_changed)
         self.defaults_btn.clicked.connect(self._apply_defaults)
 
     def _setup_range_float(self, name: str, spin: QDoubleSpinBox) -> None:
@@ -787,15 +773,22 @@ class CameraOptionsPanel(QGroupBox):
         except Exception as e:
             log.debug("camera %s: %s", name, e)
 
-    def _on_auto_toggled(
-        self, auto_name: str, on: bool, manual_spin: QDoubleSpinBox, value_name: str
-    ) -> None:
-        self._set_enum(auto_name, "Continuous" if on else "Off")
-        manual_spin.setEnabled(not on)
+    def _on_gain_auto_toggled(self, on: bool) -> None:
+        self._set_enum("GainAuto", "Continuous" if on else "Off")
+        self.gain_spin.setEnabled(not on)
         if not on:
-            # Surface whatever auto-mode converged to.
             try:
-                manual_spin.setValue(float(getattr(self.node_map, value_name).value))
+                self.gain_spin.setValue(float(self.node_map.Gain.value))
+            except Exception:
+                pass
+
+    def _on_exp_auto_toggled(self, on: bool) -> None:
+        self._set_enum("ExposureAuto", "Continuous" if on else "Off")
+        self.exp_spin.setEnabled(not on)
+        if not on:
+            # Camera reports ExposureTime in µs; spinbox is in ms.
+            try:
+                self.exp_spin.setValue(float(self.node_map.ExposureTime.value) / 1000.0)
             except Exception:
                 pass
 
@@ -821,23 +814,32 @@ class CameraOptionsPanel(QGroupBox):
         except Exception as e:
             log.debug("camera BalanceRatio %s: %s", color, e)
 
-    def _on_frame_rate_changed(self, idx: int) -> None:
-        rate = self.FRAME_RATE_OPTIONS[idx]
-        self.frame_rate_label.setText(f"{rate} Hz")
+    def _set_exposure_us(self, value_us: float) -> None:
+        """Write ExposureTime (µs) and pin AcquisitionFrameRate to the
+        camera-computed max for that exposure.
+
+        ExposureTime.max is gated by the current AcquisitionFrameRate, so
+        going from a short exposure to a long one requires lowering
+        AcquisitionFrameRate first to unlock the range. Sequence:
+          1. AcquisitionFrameRate → its min (unlocks long exposures)
+          2. ExposureTime → desired
+          3. AcquisitionFrameRate → its (now-recomputed) max
+        """
         try:
-            node = self.node_map.AcquisitionFrameRate
-            node.value = float(min(rate, node.max))
+            afr = self.node_map.AcquisitionFrameRate
+            afr.value = float(afr.min)
         except Exception as e:
-            log.debug("camera AcquisitionFrameRate: %s", e)
-        # FrameRate caps ExposureTime: re-query the range so the spinbox
-        # reflects the new ceiling, and re-read the (possibly clamped) value.
+            log.debug("camera AcquisitionFrameRate (drop): %s", e)
         try:
             et = self.node_map.ExposureTime
-            self.exp_spin.setRange(float(et.min), float(et.max))
-            if not self.exp_spin.hasFocus():
-                self.exp_spin.setValue(float(et.value))
+            et.value = max(float(et.min), min(float(et.max), float(value_us)))
         except Exception as e:
-            log.debug("camera ExposureTime range: %s", e)
+            log.debug("camera ExposureTime: %s", e)
+        try:
+            afr = self.node_map.AcquisitionFrameRate
+            afr.value = float(afr.max)
+        except Exception as e:
+            log.debug("camera AcquisitionFrameRate (raise): %s", e)
 
     def _apply_defaults(self) -> None:
         """Push OUR_DEFAULTS to the camera and sync the widgets. Used at
@@ -847,20 +849,7 @@ class CameraOptionsPanel(QGroupBox):
         self._set_enum("ExposureAuto", d["ExposureAuto"])
         self._set_enum("BalanceWhiteAuto", d["BalanceWhiteAuto"])
         self._set_float("Gain", d["Gain"])
-        # AcquisitionFrameRate caps ExposureTime, so write it first; then
-        # refresh the exposure spinbox range to reflect the new ceiling.
-        rate = int(d["AcquisitionFrameRate"])
-        try:
-            node = self.node_map.AcquisitionFrameRate
-            node.value = float(min(rate, node.max))
-        except Exception as e:
-            log.debug("camera AcquisitionFrameRate: %s", e)
-        try:
-            et = self.node_map.ExposureTime
-            self.exp_spin.setRange(float(et.min), float(et.max))
-        except Exception as e:
-            log.debug("camera ExposureTime range: %s", e)
-        self._set_float("ExposureTime", d["ExposureTime"])
+        self._set_exposure_us(float(d["ExposureTime"]))
         # WB ratios are only writable while BalanceWhiteAuto is Off.
         if d["BalanceWhiteAuto"] != "Continuous":
             for color, key in (("Red", "BalanceRatioRed"), ("Blue", "BalanceRatioBlue")):
@@ -888,17 +877,10 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_red_spin.setEnabled(not wb_auto_on)
         self.wb_blue_spin.setEnabled(not wb_auto_on)
         self.gain_spin.setValue(float(d["Gain"]))
-        self.exp_spin.setValue(float(d["ExposureTime"]))
+        # Spinbox is ms; OUR_DEFAULTS stores µs.
+        self.exp_spin.setValue(float(d["ExposureTime"]) / 1000.0)
         self.wb_red_spin.setValue(float(d["BalanceRatioRed"]))
         self.wb_blue_spin.setValue(float(d["BalanceRatioBlue"]))
-        try:
-            rate_idx = self.FRAME_RATE_OPTIONS.index(rate)
-        except ValueError:
-            rate_idx = len(self.FRAME_RATE_OPTIONS) - 1
-        self.frame_rate_slider.blockSignals(True)
-        self.frame_rate_slider.setValue(rate_idx)
-        self.frame_rate_slider.blockSignals(False)
-        self.frame_rate_label.setText(f"{rate} Hz")
 
 
 class ChannelHistogram(QWidget):
