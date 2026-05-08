@@ -18,7 +18,6 @@ import numpy as np
 from harvesters.core import Harvester
 from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -97,7 +96,13 @@ def resolve_cti(producer: str) -> str:
 
 
 def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
-    """Convert a harvesters component buffer into an RGB888 ndarray."""
+    """Convert a harvesters component buffer into an owned RGB888 ndarray.
+
+    All paths return a fresh, owned, C-contiguous array — safe to use
+    after the harvesters buffer is requeued. cv2.cvtColor already
+    allocates fresh output; the RGB pass-through is the only path that
+    would otherwise return a view, so we copy it explicitly there.
+    """
     if "Bayer" in fmt:
         bayer = data.reshape(height, width)
         bayer_code = {
@@ -113,7 +118,7 @@ def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
     if "Mono" in fmt:
         return cv2.cvtColor(data.reshape(height, width), cv2.COLOR_GRAY2RGB)
     if fmt.startswith("RGB"):
-        return data.reshape(height, width, 3)
+        return data.reshape(height, width, 3).copy()
     if fmt.startswith("BGR"):
         return cv2.cvtColor(data.reshape(height, width, 3), cv2.COLOR_BGR2RGB)
     raise ValueError(f"unsupported pixel format: {fmt}")
@@ -245,13 +250,13 @@ def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     return out
 
 
-class CameraDisplay(QOpenGLWidget):
+class CameraDisplay(QLabel):
     """Camera frame view with a bottom-left FPS overlay.
 
-    GL-backed: paintGL drives QPainter, whose GL paint engine
-    uploads QImage to a texture and renders a textured quad.
-    Scaling is GPU-side, so per-frame GUI cost is independent of
-    window size.
+    paintEvent does aspect-preserved drawImage with scale capped
+    at 1.0 — when the window exceeds the source, we render at
+    native size with letterboxing instead of CPU-upscaling.
+    Per-frame paint cost is bounded by source size.
     """
 
     OVERLAY_MARGIN = 8
@@ -262,7 +267,6 @@ class CameraDisplay(QOpenGLWidget):
         # Hold the numpy buffer the QImage views into until the next
         # frame arrives — QImage(data, ...) does not own its bytes.
         self._frame_ref = None
-        self._text = ""
         self.fps_label = QLabel("-- fps", self)
         self.fps_label.setStyleSheet(
             "color: white; background-color: rgba(0, 0, 0, 140);"
@@ -274,17 +278,9 @@ class CameraDisplay(QOpenGLWidget):
     def set_frame(self, image: QImage, frame_ref) -> None:
         self._image = image
         self._frame_ref = frame_ref
-        self._text = ""
         self.update()
 
     def clear_frame(self) -> None:
-        self._image = None
-        self._frame_ref = None
-        self.update()
-
-    def setText(self, text: str) -> None:
-        """Pre-frame placeholder text ("connecting…" / error messages)."""
-        self._text = text
         self._image = None
         self._frame_ref = None
         self.update()
@@ -298,24 +294,24 @@ class CameraDisplay(QOpenGLWidget):
         super().resizeEvent(event)
         self._reposition_overlay()
 
-    def paintGL(self) -> None:
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        if self._image is None:
+            super().paintEvent(event)  # QLabel text path
+            return
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(0, 0, 0))
-        if self._image is not None:
-            sw, sh = self._image.width(), self._image.height()
-            tw, th = self.width(), self.height()
-            if sw > 0 and sh > 0 and tw > 0 and th > 0:
-                scale = min(tw / sw, th / sh)
-                dw = int(sw * scale)
-                dh = int(sh * scale)
-                x = (tw - dw) // 2
-                y = (th - dh) // 2
-                painter.drawImage(QRect(x, y, dw, dh), self._image)
-        elif self._text:
-            painter.setPen(QColor(220, 220, 220))
-            painter.drawText(
-                self.rect(), Qt.AlignmentFlag.AlignCenter, self._text
-            )
+        sw, sh = self._image.width(), self._image.height()
+        tw, th = self.width(), self.height()
+        if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
+            return
+        # Cap at 1.0 — never CPU-upscale. Above source size we
+        # letterbox at native size; below we downscale (cheap).
+        scale = min(tw / sw, th / sh, 1.0)
+        dw = int(sw * scale)
+        dh = int(sh * scale)
+        x = (tw - dw) // 2
+        y = (th - dh) // 2
+        painter.drawImage(QRect(x, y, dw, dh), self._image)
 
     def _reposition_overlay(self) -> None:
         m = self.OVERLAY_MARGIN
@@ -390,39 +386,61 @@ class CameraWorker(QObject):
         log_count = 0
         log_start = time.monotonic()
         hist_last = 0.0
+        # Per-step timing accumulators.
+        t_fetch = t_debayer = t_hist = t_adjust = t_publish = 0.0
         while self._running:
             try:
+                t0 = time.monotonic()
                 with self._acquirer.fetch(timeout=0.5) as buffer:
                     comp = buffer.payload.components[0]
-                    rgb = np.ascontiguousarray(
-                        to_rgb(comp.data, comp.width, comp.height, comp.data_format)
-                    ).copy()
+                    t1 = time.monotonic()
+                    # to_rgb returns an owned contiguous buffer for every
+                    # input format — safe to use after the buffer requeues.
+                    rgb = to_rgb(comp.data, comp.width, comp.height, comp.data_format)
+                t2 = time.monotonic()
                 # Histograms are computed on the raw frame (pre-adjustment)
                 # so they read like a stable baseline of the sensor output.
-                now = time.monotonic()
-                if now - hist_last > self.HIST_INTERVAL_S:
-                    hist_last = now
+                if t2 - hist_last > self.HIST_INTERVAL_S:
+                    hist_last = t2
                     try:
                         self.histograms_ready.emit(compute_histograms(rgb))
                     except Exception as e:  # noqa: BLE001
                         log.warning("camera histogram err: %s", e)
+                t3 = time.monotonic()
                 if self._adjustments is not None:
                     snap = self._adjustments.get()
                     if not snap.is_identity:
                         try:
-                            rgb = np.ascontiguousarray(apply_adjustments(rgb, snap))
+                            rgb = apply_adjustments(rgb, snap)
                         except Exception as e:  # noqa: BLE001
                             log.warning("camera adjustment err: %s", e)
+                t4 = time.monotonic()
                 with self._lock:
                     notify = self._latest is None
                     self._latest = rgb
                 if notify:
                     self.frame_ready.emit()
+                t5 = time.monotonic()
+                t_fetch += t1 - t0
+                t_debayer += t2 - t1
+                t_hist += t3 - t2
+                t_adjust += t4 - t3
+                t_publish += t5 - t4
                 log_count += 1
-                if now - log_start > 2.0:
-                    log.info("camera produced %.1f fps", log_count / (now - log_start))
+                if t5 - log_start > 2.0:
+                    span = t5 - log_start
+                    log.info(
+                        "camera produced %.1f fps  fetch=%.1f deb=%.1f hist=%.1f adj=%.1f pub=%.2f ms/frame",
+                        log_count / span,
+                        t_fetch / log_count * 1000,
+                        t_debayer / log_count * 1000,
+                        t_hist / log_count * 1000,
+                        t_adjust / log_count * 1000,
+                        t_publish / log_count * 1000,
+                    )
                     log_count = 0
-                    log_start = now
+                    log_start = t5
+                    t_fetch = t_debayer = t_hist = t_adjust = t_publish = 0.0
             except Exception as e:  # noqa: BLE001 — surface errors then keep trying
                 self.error.emit(str(e))
                 time.sleep(0.1)
