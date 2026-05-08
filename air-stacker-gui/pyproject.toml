@@ -11,4 +11,5 @@ dependencies = [
     "tomli>=2.0; python_version < '3.11'",
     "pyserial>=3.5",
     "minimalmodbus>=2.1",
+    "superqt>=0.8.1",
 ]

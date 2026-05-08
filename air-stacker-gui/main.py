@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from superqt import QRangeSlider
 
 from conex import ConexAxis, error_label, state_label
 from heater import OmegaPlatinum, diagnose
@@ -922,9 +923,9 @@ class ImageAdjustmentsPanel(QGroupBox):
             self.SATURATION_RANGE, 100
         )
 
-        self.r_lo, self.r_hi = self._make_range_sliders()
-        self.g_lo, self.g_hi = self._make_range_sliders()
-        self.b_lo, self.b_hi = self._make_range_sliders()
+        self.r_range = self._make_range_slider()
+        self.g_range = self._make_range_slider()
+        self.b_range = self._make_range_slider()
 
         self.r_hist = ChannelHistogram(self.CHANNEL_COLORS[0])
         self.g_hist = ChannelHistogram(self.CHANNEL_COLORS[1])
@@ -949,29 +950,27 @@ class ImageAdjustmentsPanel(QGroupBox):
             outer.addLayout(head)
             outer.addWidget(slider)
 
-        for css_color, header, lo, hi, hist in (
-            ("#c92a2a", self.r_header, self.r_lo, self.r_hi, self.r_hist),
-            ("#2f9e44", self.g_header, self.g_lo, self.g_hi, self.g_hist),
-            ("#1971c2", self.b_header, self.b_lo, self.b_hi, self.b_hist),
+        for css_color, header, slider, hist in (
+            ("#c92a2a", self.r_header, self.r_range, self.r_hist),
+            ("#2f9e44", self.g_header, self.g_range, self.g_hist),
+            ("#1971c2", self.b_header, self.b_range, self.b_hist),
         ):
             header.setStyleSheet(f"color: {css_color}; font-weight: bold;")
             outer.addWidget(header)
             outer.addWidget(hist)
-            outer.addWidget(lo)
-            outer.addWidget(hi)
+            outer.addWidget(slider)
 
         outer.addWidget(self.defaults_btn)
 
         self.brightness_slider.valueChanged.connect(self._on_brightness)
         self.contrast_slider.valueChanged.connect(self._on_contrast)
         self.saturation_slider.valueChanged.connect(self._on_saturation)
-        for lo, hi, name in (
-            (self.r_lo, self.r_hi, "r_range"),
-            (self.g_lo, self.g_hi, "g_range"),
-            (self.b_lo, self.b_hi, "b_range"),
+        for slider, name in (
+            (self.r_range, "r_range"),
+            (self.g_range, "g_range"),
+            (self.b_range, "b_range"),
         ):
-            lo.valueChanged.connect(lambda _v, n=name: self._on_range(n))
-            hi.valueChanged.connect(lambda _v, n=name: self._on_range(n))
+            slider.valueChanged.connect(lambda _v, n=name: self._on_range(n))
 
         self.defaults_btn.clicked.connect(self._apply_defaults)
         self._building = False
@@ -1000,18 +999,13 @@ class ImageAdjustmentsPanel(QGroupBox):
         )
         return slider, value_label
 
-    def _make_range_sliders(self) -> tuple[QSlider, QSlider]:
-        lo = QSlider(Qt.Orientation.Horizontal)
-        lo.setRange(0, 254)
-        lo.setValue(0)
-        lo.setSingleStep(1)
-        lo.setPageStep(10)
-        hi = QSlider(Qt.Orientation.Horizontal)
-        hi.setRange(1, 255)
-        hi.setValue(255)
-        hi.setSingleStep(1)
-        hi.setPageStep(10)
-        return lo, hi
+    def _make_range_slider(self) -> QRangeSlider:
+        slider = QRangeSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 255)
+        slider.setValue((0, 255))
+        slider.setSingleStep(1)
+        slider.setPageStep(10)
+        return slider
 
     def _on_brightness(self, v: int) -> None:
         self.brightness_label.setText(f"{v}%")
@@ -1034,23 +1028,12 @@ class ImageAdjustmentsPanel(QGroupBox):
     def _on_range(self, name: str) -> None:
         if self._building:
             return
-        sliders, hist, header, prefix = {
-            "r_range": ((self.r_lo, self.r_hi), self.r_hist, self.r_header, "R"),
-            "g_range": ((self.g_lo, self.g_hi), self.g_hist, self.g_header, "G"),
-            "b_range": ((self.b_lo, self.b_hi), self.b_hist, self.b_header, "B"),
+        slider, hist, header, prefix = {
+            "r_range": (self.r_range, self.r_hist, self.r_header, "R"),
+            "g_range": (self.g_range, self.g_hist, self.g_header, "G"),
+            "b_range": (self.b_range, self.b_hist, self.b_header, "B"),
         }[name]
-        lo, hi = sliders[0].value(), sliders[1].value()
-        if lo >= hi:
-            if self.sender() is sliders[0]:
-                hi = min(255, lo + 1)
-                sliders[1].blockSignals(True)
-                sliders[1].setValue(hi)
-                sliders[1].blockSignals(False)
-            else:
-                lo = max(0, hi - 1)
-                sliders[0].blockSignals(True)
-                sliders[0].setValue(lo)
-                sliders[0].blockSignals(False)
+        lo, hi = (int(v) for v in slider.value())
         hist.set_range(lo, hi)
         header.setText(f"{prefix}: {lo} – {hi}")
         self._adj.update(**{name: (lo, hi)})
@@ -1062,13 +1045,12 @@ class ImageAdjustmentsPanel(QGroupBox):
             self.brightness_slider.setValue(snap.brightness)
             self.contrast_slider.setValue(snap.contrast)
             self.saturation_slider.setValue(snap.saturation)
-            for (lo_w, hi_w), hist, header, prefix, rng in (
-                ((self.r_lo, self.r_hi), self.r_hist, self.r_header, "R", snap.r_range),
-                ((self.g_lo, self.g_hi), self.g_hist, self.g_header, "G", snap.g_range),
-                ((self.b_lo, self.b_hi), self.b_hist, self.b_header, "B", snap.b_range),
+            for slider, hist, header, prefix, rng in (
+                (self.r_range, self.r_hist, self.r_header, "R", snap.r_range),
+                (self.g_range, self.g_hist, self.g_header, "G", snap.g_range),
+                (self.b_range, self.b_hist, self.b_header, "B", snap.b_range),
             ):
-                lo_w.setValue(rng[0])
-                hi_w.setValue(rng[1])
+                slider.setValue(rng)
                 hist.set_range(*rng)
                 header.setText(f"{prefix}: {rng[0]} – {rng[1]}")
             self.brightness_label.setText(f"{snap.brightness}%")
