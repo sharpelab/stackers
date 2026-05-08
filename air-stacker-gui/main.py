@@ -536,9 +536,12 @@ class CameraProcessWorker(QObject):
             t3 = time.monotonic()
             # Pre-convert to BGRA so the GUI's QImage matches the raster
             # backing surface (Qt's Format_RGB32 on little-endian = B,G,R,X
-            # bytes). Skips an RGB888→ARGB32 conversion + temp-buffer alloc
-            # inside paintEvent's drawImage.
-            bgra = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGRA)
+            # bytes). Numpy path — cv2.cvtColor on the Windows opencv-python
+            # wheel runs ~15 ms here, defeating the paint savings.
+            h, w, _ = rgb.shape
+            bgra = np.empty((h, w, 4), dtype=np.uint8)
+            bgra[..., :3] = rgb[..., ::-1]
+            bgra[..., 3] = 255
             t3b = time.monotonic()
             with self._lock:
                 self._latest = bgra
