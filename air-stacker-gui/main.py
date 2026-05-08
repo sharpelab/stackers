@@ -582,6 +582,8 @@ class CameraOptionsPanel(QGroupBox):
     lives in the Image Adjustments panel.
     """
 
+    FRAME_RATE_OPTIONS: tuple[int, ...] = (15, 30, 45, 60)
+
     OUR_DEFAULTS: dict = {
         "Gain": 1.61,
         "ExposureTime": 16798.0,
@@ -590,6 +592,7 @@ class CameraOptionsPanel(QGroupBox):
         "BalanceWhiteAuto": "Off",
         "BalanceRatioRed": 0.6,
         "BalanceRatioBlue": 3.3,
+        "AcquisitionFrameRate": 60,  # nominal Hz; clamped to camera max on write
     }
 
     def __init__(self, node_map, defaults: dict) -> None:
@@ -624,19 +627,38 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.setSingleStep(0.05)
         self.wb_auto = QCheckBox("auto")
 
+        self.frame_rate_slider = QSlider(Qt.Orientation.Horizontal)
+        self.frame_rate_slider.setMinimum(0)
+        self.frame_rate_slider.setMaximum(len(self.FRAME_RATE_OPTIONS) - 1)
+        self.frame_rate_slider.setSingleStep(1)
+        self.frame_rate_slider.setPageStep(1)
+        self.frame_rate_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self.frame_rate_slider.setTickInterval(1)
+        self.frame_rate_label = QLabel("— Hz")
+        self.frame_rate_label.setMinimumWidth(48)
+
         self.defaults_btn = QPushButton("Defaults")
 
         outer = QVBoxLayout(self)
         for label, spin, auto in (
             ("Gain:", self.gain_spin, self.gain_auto),
             ("Exposure:", self.exp_spin, self.exp_auto),
-            ("WB Red:", self.wb_red_spin, self.wb_auto),
         ):
             row = QHBoxLayout()
             row.addWidget(QLabel(label))
             row.addWidget(spin, stretch=1)
             row.addWidget(auto)
             outer.addLayout(row)
+        rate_row = QHBoxLayout()
+        rate_row.addWidget(QLabel("Frame rate:"))
+        rate_row.addWidget(self.frame_rate_slider, stretch=1)
+        rate_row.addWidget(self.frame_rate_label)
+        outer.addLayout(rate_row)
+        wb_red_row = QHBoxLayout()
+        wb_red_row.addWidget(QLabel("WB Red:"))
+        wb_red_row.addWidget(self.wb_red_spin, stretch=1)
+        wb_red_row.addWidget(self.wb_auto)
+        outer.addLayout(wb_red_row)
         wb_blue_row = QHBoxLayout()
         wb_blue_row.addWidget(QLabel("WB Blue:"))
         wb_blue_row.addWidget(self.wb_blue_spin, stretch=1)
@@ -677,6 +699,7 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.editingFinished.connect(
             lambda: self._set_balance_ratio("Blue", self.wb_blue_spin.value())
         )
+        self.frame_rate_slider.valueChanged.connect(self._on_frame_rate_changed)
         self.defaults_btn.clicked.connect(self._apply_defaults)
 
     def _setup_range_float(self, name: str, spin: QDoubleSpinBox) -> None:
@@ -734,6 +757,24 @@ class CameraOptionsPanel(QGroupBox):
         except Exception as e:
             log.debug("camera BalanceRatio %s: %s", color, e)
 
+    def _on_frame_rate_changed(self, idx: int) -> None:
+        rate = self.FRAME_RATE_OPTIONS[idx]
+        self.frame_rate_label.setText(f"{rate} Hz")
+        try:
+            node = self.node_map.AcquisitionFrameRate
+            node.value = float(min(rate, node.max))
+        except Exception as e:
+            log.debug("camera AcquisitionFrameRate: %s", e)
+        # FrameRate caps ExposureTime: re-query the range so the spinbox
+        # reflects the new ceiling, and re-read the (possibly clamped) value.
+        try:
+            et = self.node_map.ExposureTime
+            self.exp_spin.setRange(float(et.min), float(et.max))
+            if not self.exp_spin.hasFocus():
+                self.exp_spin.setValue(float(et.value))
+        except Exception as e:
+            log.debug("camera ExposureTime range: %s", e)
+
     def _apply_defaults(self) -> None:
         """Push OUR_DEFAULTS to the camera and sync the widgets. Used at
         startup and by the Defaults button."""
@@ -742,6 +783,19 @@ class CameraOptionsPanel(QGroupBox):
         self._set_enum("ExposureAuto", d["ExposureAuto"])
         self._set_enum("BalanceWhiteAuto", d["BalanceWhiteAuto"])
         self._set_float("Gain", d["Gain"])
+        # AcquisitionFrameRate caps ExposureTime, so write it first; then
+        # refresh the exposure spinbox range to reflect the new ceiling.
+        rate = int(d["AcquisitionFrameRate"])
+        try:
+            node = self.node_map.AcquisitionFrameRate
+            node.value = float(min(rate, node.max))
+        except Exception as e:
+            log.debug("camera AcquisitionFrameRate: %s", e)
+        try:
+            et = self.node_map.ExposureTime
+            self.exp_spin.setRange(float(et.min), float(et.max))
+        except Exception as e:
+            log.debug("camera ExposureTime range: %s", e)
         self._set_float("ExposureTime", d["ExposureTime"])
         # WB ratios are only writable while BalanceWhiteAuto is Off.
         if d["BalanceWhiteAuto"] != "Continuous":
@@ -773,6 +827,14 @@ class CameraOptionsPanel(QGroupBox):
         self.exp_spin.setValue(float(d["ExposureTime"]))
         self.wb_red_spin.setValue(float(d["BalanceRatioRed"]))
         self.wb_blue_spin.setValue(float(d["BalanceRatioBlue"]))
+        try:
+            rate_idx = self.FRAME_RATE_OPTIONS.index(rate)
+        except ValueError:
+            rate_idx = len(self.FRAME_RATE_OPTIONS) - 1
+        self.frame_rate_slider.blockSignals(True)
+        self.frame_rate_slider.setValue(rate_idx)
+        self.frame_rate_slider.blockSignals(False)
+        self.frame_rate_label.setText(f"{rate} Hz")
 
 
 class ChannelHistogram(QWidget):
