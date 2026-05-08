@@ -1429,27 +1429,12 @@ class CameraWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        recording = QGroupBox("Recording")
-        recording_layout = QHBoxLayout(recording)
-        record_btn = QPushButton("Record")
-        record_btn.setEnabled(False)
-        stop_btn = QPushButton("Stop")
-        stop_btn.setEnabled(False)
-        recording_layout.addWidget(record_btn)
-        recording_layout.addWidget(stop_btn)
-
-        presets = QGroupBox("Presets")
-        presets_layout = QVBoxLayout(presets)
-        presets_layout.addWidget(QLabel("TODO"))
-
         self.adjustments_panel = ImageAdjustmentsPanel(self.adjustments)
 
         self.camera_options_panel = CameraOptionsPanel(
             self.acquirer.remote_device.node_map, camera_cfg
         )
 
-        layout.addWidget(recording)
-        layout.addWidget(presets)
         layout.addWidget(self.camera_options_panel)
         layout.addWidget(self.adjustments_panel)
         layout.addStretch(1)
@@ -1460,6 +1445,17 @@ class CameraWindow(QMainWindow):
         panel.setFixedWidth(300)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
+
+        recording = QGroupBox("Recording")
+        recording_layout = QHBoxLayout(recording)
+        record_btn = QPushButton("Record")
+        record_btn.setEnabled(False)
+        stop_btn = QPushButton("Stop")
+        stop_btn.setEnabled(False)
+        recording_layout.addWidget(record_btn)
+        recording_layout.addWidget(stop_btn)
+        layout.addWidget(recording)
+
         for cfg in axes_cfg:
             ap = ConexAxisPanel(cfg)
             self.axis_panels.append(ap)
