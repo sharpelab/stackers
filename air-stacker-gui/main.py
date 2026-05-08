@@ -27,8 +27,7 @@ from PySide6.QtGui import (
     QPen,
     QSurfaceFormat,
 )
-from PySide6.QtOpenGL import QOpenGLTexture, QOpenGLTextureBlitter
-from PySide6.QtOpenGLWidgets import QOpenGLWidget
+from PySide6.QtOpenGL import QOpenGLTexture, QOpenGLTextureBlitter, QOpenGLWindow
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -270,30 +269,21 @@ def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     return out
 
 
-class CameraDisplay(QOpenGLWidget):
-    """Camera frame view rendered via OpenGL.
+class _CameraGLWindow(QOpenGLWindow):
+    """Direct-rendered GL surface for one camera frame at a time.
 
-    Per-frame work in paintGL:
-      * upload RGB888 bytes into a persistent GL texture
-        (glTexSubImage2D, no realloc — storage allocated once
-        in initializeGL)
-      * draw a textured quad via QOpenGLTextureBlitter (Qt-provided
-        shader, vertex buffer, transform math)
-    No QPainter, no Qt-GL paint engine, no per-call QImage→texture
-    upload. Per-frame cost: ~1 ms upload + microseconds quad draw,
-    independent of widget size.
+    QOpenGLWindow renders straight to its native window surface — no
+    FBO indirection, no Qt compositor blit. paintGL ends with a real
+    swapBuffers, controlled by swapInterval(0) on the surface format,
+    so we're not capped at the compositor's present rate. (The
+    QOpenGLWidget version we replaced sat at ~25 Hz cycle even with
+    paint=6 ms because of its FBO→window blit step.)
 
-    The placeholder text ("connecting…", error messages) and FPS
-    overlay are child QLabels — Qt composites them on top of the
-    GL surface without round-tripping through paintGL.
+    Embedded into a regular widget tree via QWidget.createWindowContainer.
     """
-
-    OVERLAY_MARGIN = 8
 
     def __init__(self) -> None:
         super().__init__()
-        # Force vsync off on this widget's surface format too — setting
-        # only the default format isn't always honored by QOpenGLWidget.
         fmt = self.format()
         fmt.setSwapInterval(0)
         self.setFormat(fmt)
@@ -311,32 +301,9 @@ class CameraDisplay(QOpenGLWidget):
         self._paint_cycle_total = 0.0
         self._paint_cycle_max = 0.0
 
-        self.text_label = QLabel("", self)
-        self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.text_label.setStyleSheet(
-            "color: rgb(220, 220, 220); background: transparent;"
-        )
-        self.text_label.hide()
-
-        self.fps_label = QLabel("-- fps", self)
-        self.fps_label.setStyleSheet(
-            "color: white; background-color: rgba(0, 0, 0, 140);"
-            " padding: 2px 6px; border-radius: 3px;"
-        )
-        self.fps_label.adjustSize()
-        # DIAGNOSTIC: hide FPS overlay so the QOpenGLWidget has no
-        # visible child widgets — testing whether child compositing is
-        # what's forcing cycle=41 ms (24 Hz) when paintGL itself is
-        # only ~6 ms. text_label is also a child but already hidden
-        # by default.
-        self.fps_label.hide()
-        self._reposition_overlay()
-
     def set_frame(self, frame_ref: np.ndarray) -> None:
         self._frame_ref = frame_ref
         self._frame_dirty = True
-        if self.text_label.isVisible():
-            self.text_label.hide()
         self.update()
 
     def clear_frame(self) -> None:
@@ -344,31 +311,10 @@ class CameraDisplay(QOpenGLWidget):
         self._frame_dirty = False
         self.update()
 
-    def setText(self, text: str) -> None:
-        """Centered placeholder text — used pre-stream and on errors."""
-        self.text_label.setText(text)
-        self.text_label.setGeometry(self.rect())
-        self.text_label.show()
-        self._frame_ref = None
-        self._frame_dirty = False
-        self.update()
-
-    def set_fps(self, fps: float | None) -> None:
-        self.fps_label.setText("-- fps" if fps is None else f"{fps:.1f} fps")
-        self.fps_label.adjustSize()
-        self._reposition_overlay()
-
-    def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
-        self.text_label.setGeometry(self.rect())
-        self._reposition_overlay()
-
     def initializeGL(self) -> None:
-        # Texture is allocated lazily on the first frame so we get the
-        # actual camera resolution rather than guessing — wrong size
-        # here produces stride-shifted garbage in the display.
         log.info(
-            "CameraDisplay GL ctx swapInterval=%d", self.format().swapInterval()
+            "_CameraGLWindow GL ctx swapInterval=%d",
+            self.format().swapInterval(),
         )
         self._blitter = QOpenGLTextureBlitter()
         self._blitter.create()
@@ -391,17 +337,12 @@ class CameraDisplay(QOpenGLWidget):
         )
         self._tex_w = w
         self._tex_h = h
-        log.info("CameraDisplay GL texture allocated %dx%d", w, h)
+        log.info("_CameraGLWindow texture allocated %dx%d", w, h)
 
     def paintGL(self) -> None:
         if self._blitter is None:
             return
         t0 = time.monotonic()
-        # Cycle time = wall time between paintGL invocations. Includes
-        # swapBuffers, FBO compositing of child widgets, and Qt event
-        # dispatch. If this is much larger than `avg`, the GUI thread
-        # is spending most of its time outside paintGL — usually
-        # waiting on the compositor.
         if self._paint_last_t > 0.0:
             cycle = t0 - self._paint_last_t
             self._paint_cycle_total += cycle
@@ -444,7 +385,7 @@ class CameraDisplay(QOpenGLWidget):
         if self._paint_count >= 60:
             cycles = max(self._paint_count - 1, 1)
             log.info(
-                "paintGL avg=%.1fms max=%.1fms cycle=%.1fms cycle_max=%.1fms widget=%dx%d n=%d",
+                "paintGL avg=%.1fms max=%.1fms cycle=%.1fms cycle_max=%.1fms surf=%dx%d n=%d",
                 self._paint_total / self._paint_count * 1000,
                 self._paint_max * 1000,
                 self._paint_cycle_total / cycles * 1000,
@@ -457,6 +398,72 @@ class CameraDisplay(QOpenGLWidget):
             self._paint_count = 0
             self._paint_cycle_total = 0.0
             self._paint_cycle_max = 0.0
+
+
+class CameraDisplay(QWidget):
+    """Wrapper around _CameraGLWindow + overlay QLabels.
+
+    The GL window is embedded via createWindowContainer (a native
+    child window), with overlay labels stacked on top via WA_NativeWindow
+    + raise_() so they get their own native window handles and proper
+    Win32 z-order above the GL container.
+    """
+
+    OVERLAY_MARGIN = 8
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._gl_window = _CameraGLWindow()
+        self._gl_container = QWidget.createWindowContainer(self._gl_window, self)
+        self._gl_container.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self._gl_container.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+        self.text_label = QLabel("", self)
+        self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text_label.setStyleSheet(
+            "color: rgb(220, 220, 220); background: transparent;"
+        )
+        self.text_label.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.text_label.hide()
+
+        self.fps_label = QLabel("-- fps", self)
+        self.fps_label.setStyleSheet(
+            "color: white; background-color: rgba(0, 0, 0, 140);"
+            " padding: 2px 6px; border-radius: 3px;"
+        )
+        self.fps_label.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
+        self.fps_label.adjustSize()
+        self._reposition_overlay()
+
+    def set_frame(self, frame_ref: np.ndarray) -> None:
+        self._gl_window.set_frame(frame_ref)
+        if self.text_label.isVisible():
+            self.text_label.hide()
+
+    def clear_frame(self) -> None:
+        self._gl_window.clear_frame()
+
+    def setText(self, text: str) -> None:
+        self.text_label.setText(text)
+        self.text_label.setGeometry(self.rect())
+        self.text_label.show()
+        self.text_label.raise_()
+        self._gl_window.clear_frame()
+
+    def set_fps(self, fps: float | None) -> None:
+        self.fps_label.setText("-- fps" if fps is None else f"{fps:.1f} fps")
+        self.fps_label.adjustSize()
+        self._reposition_overlay()
+        self.fps_label.raise_()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._gl_container.setGeometry(self.rect())
+        self.text_label.setGeometry(self.rect())
+        self._reposition_overlay()
+        # Keep overlays above the GL container after every resize.
+        self.text_label.raise_()
+        self.fps_label.raise_()
 
     def _reposition_overlay(self) -> None:
         m = self.OVERLAY_MARGIN
