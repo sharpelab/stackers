@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256">
-  <rect width="256" height="256" rx="48" fill="#F5F5F5"/>
+  <rect width="256" height="256" rx="48" fill="#000000"/>
   <g transform="rotate(10 128 186)">
     <polygon points="198,186 163,125 93,125 58,186 93,247 163,247" fill="#6E2C00"/>
   </g>
