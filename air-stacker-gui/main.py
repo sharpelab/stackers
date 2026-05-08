@@ -18,6 +18,7 @@ import numpy as np
 from harvesters.core import Harvester
 from PySide6.QtCore import QObject, QRect, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QBrush, QColor, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -244,12 +245,13 @@ def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     return out
 
 
-class CameraDisplay(QLabel):
+class CameraDisplay(QOpenGLWidget):
     """Camera frame view with a bottom-left FPS overlay.
 
-    Frames are accepted at full source size via set_frame(); scaling
-    happens in paintEvent via QPainter.drawImage so per-frame CPU
-    cost is bounded by the source, not by the window size.
+    GL-backed: paintGL drives QPainter, whose GL paint engine
+    uploads QImage to a texture and renders a textured quad.
+    Scaling is GPU-side, so per-frame GUI cost is independent of
+    window size.
     """
 
     OVERLAY_MARGIN = 8
@@ -260,6 +262,7 @@ class CameraDisplay(QLabel):
         # Hold the numpy buffer the QImage views into until the next
         # frame arrives — QImage(data, ...) does not own its bytes.
         self._frame_ref = None
+        self._text = ""
         self.fps_label = QLabel("-- fps", self)
         self.fps_label.setStyleSheet(
             "color: white; background-color: rgba(0, 0, 0, 140);"
@@ -271,9 +274,17 @@ class CameraDisplay(QLabel):
     def set_frame(self, image: QImage, frame_ref) -> None:
         self._image = image
         self._frame_ref = frame_ref
+        self._text = ""
         self.update()
 
     def clear_frame(self) -> None:
+        self._image = None
+        self._frame_ref = None
+        self.update()
+
+    def setText(self, text: str) -> None:
+        """Pre-frame placeholder text ("connecting…" / error messages)."""
+        self._text = text
         self._image = None
         self._frame_ref = None
         self.update()
@@ -287,22 +298,24 @@ class CameraDisplay(QLabel):
         super().resizeEvent(event)
         self._reposition_overlay()
 
-    def paintEvent(self, event) -> None:  # noqa: ARG002
-        if self._image is None:
-            # Fall back to QLabel's text rendering ("connecting…", error msg).
-            super().paintEvent(event)
-            return
+    def paintGL(self) -> None:
         painter = QPainter(self)
-        sw, sh = self._image.width(), self._image.height()
-        tw, th = self.width(), self.height()
-        if sw <= 0 or sh <= 0 or tw <= 0 or th <= 0:
-            return
-        scale = min(tw / sw, th / sh)
-        dw = int(sw * scale)
-        dh = int(sh * scale)
-        x = (tw - dw) // 2
-        y = (th - dh) // 2
-        painter.drawImage(QRect(x, y, dw, dh), self._image)
+        painter.fillRect(self.rect(), QColor(0, 0, 0))
+        if self._image is not None:
+            sw, sh = self._image.width(), self._image.height()
+            tw, th = self.width(), self.height()
+            if sw > 0 and sh > 0 and tw > 0 and th > 0:
+                scale = min(tw / sw, th / sh)
+                dw = int(sw * scale)
+                dh = int(sh * scale)
+                x = (tw - dw) // 2
+                y = (th - dh) // 2
+                painter.drawImage(QRect(x, y, dw, dh), self._image)
+        elif self._text:
+            painter.setPen(QColor(220, 220, 220))
+            painter.drawText(
+                self.rect(), Qt.AlignmentFlag.AlignCenter, self._text
+            )
 
     def _reposition_overlay(self) -> None:
         m = self.OVERLAY_MARGIN
@@ -1313,7 +1326,6 @@ class CameraWindow(QMainWindow):
         self.setWindowTitle("Air Stacker — live")
         self.label = CameraDisplay()
         self.label.setText("connecting…")
-        self.label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.label.setMinimumSize(640, 480)
         self._frame_times: deque[float] = deque(maxlen=60)
         self._fps_last_update = 0.0
