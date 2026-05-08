@@ -10,9 +10,23 @@ from __future__ import annotations
 import threading
 
 import minimalmodbus
+from serial import Serial
 
 from . import registers as R
 from .enums import OutputMode, ProcessMode, SetpointMode, SystemState
+
+
+def _require_serial(inst: minimalmodbus.Instrument) -> Serial:
+    """Narrow `inst.serial` to non-None.
+
+    minimalmodbus types Instrument.serial as Optional but always wires
+    it up at construction. Centralizing the narrow stops type checkers
+    from tripping over every per-attribute access.
+    """
+    s = inst.serial
+    if s is None:
+        raise RuntimeError("minimalmodbus instrument has no serial port")
+    return s
 
 
 class OmegaPlatinum:
@@ -36,11 +50,12 @@ class OmegaPlatinum:
         if self._inst is not None:
             return
         inst = minimalmodbus.Instrument(self.port, self.slave_id, mode=minimalmodbus.MODE_RTU)
-        inst.serial.baudrate = self.baud
-        inst.serial.bytesize = 8
-        inst.serial.parity = "N"
-        inst.serial.stopbits = 1
-        inst.serial.timeout = self.timeout
+        serial = _require_serial(inst)
+        serial.baudrate = self.baud
+        serial.bytesize = 8
+        serial.parity = "N"
+        serial.stopbits = 1
+        serial.timeout = self.timeout
         inst.clear_buffers_before_each_transaction = True
         self._inst = inst
 
@@ -48,7 +63,7 @@ class OmegaPlatinum:
         with self._lock:
             if self._inst is not None:
                 try:
-                    self._inst.serial.close()
+                    _require_serial(self._inst).close()
                 finally:
                     self._inst = None
 

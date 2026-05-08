@@ -38,10 +38,7 @@ from superqt import QRangeSlider
 from conex import ConexAxis, error_label, state_label
 from heater import OmegaPlatinum
 
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
+import tomllib
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
 
