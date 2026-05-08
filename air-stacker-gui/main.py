@@ -642,13 +642,22 @@ class CameraAcquireWorker(QObject):
         log_count = 0
         log_start = time.monotonic()
         t_fetch = t_debayer = t_publish = 0.0
+        # Cache stream-invariant component properties on first frame.
+        # Each comp.{width,height,data_format} read goes through
+        # harvesters → genicam → C and holds the GIL; profiling showed
+        # ~150 samples/30 s combined on these per-frame reads.
+        width = height = fmt = None
         while self._running:
             try:
                 t0 = time.monotonic()
                 with self._acquirer.fetch(timeout=0.5) as buffer:
                     comp = buffer.payload.components[0]
+                    if width is None:
+                        width = comp.width
+                        height = comp.height
+                        fmt = comp.data_format
                     t1 = time.monotonic()
-                    rgb = to_rgb(comp.data, comp.width, comp.height, comp.data_format)
+                    rgb = to_rgb(comp.data, width, height, fmt)
                 t2 = time.monotonic()
                 self._mailbox.publish(rgb)
                 t3 = time.monotonic()
