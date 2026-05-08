@@ -14,19 +14,13 @@ exposure_us = 5000.0
 # Auto white balance is "Continuous" by default; gain/exposure auto are "Off".
 
 # CONEX-CC axes. Each entry is one controller on its own COM port (address 1 by convention).
-# Z vs spin assignment is unconfirmed — rename and reorder once we identify the stages.
+# Axis A on COM3 is currently disconnected — re-add a [[axis]] entry when it's wired up:
+#   name = "Axis A", port = "COM3", baud = 921600, units = "mm", step = 0.01
 [[axis]]
-name = "Axis A"
-port = "COM3"
-baud = 921600
-units = "mm"
-step = 0.01
-
-[[axis]]
-name = "Axis B"
+name = "Rotation"
 port = "COM4"
 baud = 921600
-units = "mm"
+units = "°"
 step = 0.01
 
 # Omega Platinum heater controller (Modbus RTU over USB CDC).
