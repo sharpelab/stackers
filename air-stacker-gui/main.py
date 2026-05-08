@@ -1508,11 +1508,13 @@ class CameraWindow(QMainWindow):
         self.proc_thread.started.connect(self.proc_worker.run)
         self.proc_worker.frame_ready.connect(self._on_frame)
         self.proc_worker.finished.connect(self.proc_thread.quit)
-        if self.adjustments_panel is not None:
-            self.proc_worker.histograms_ready.connect(
-                self.adjustments_panel.set_histograms,
-                Qt.ConnectionType.QueuedConnection,
-            )
+        # DIAGNOSTIC: histograms_ready disconnected to test whether 3
+        # widget repaints per emit are saturating the GUI thread.
+        # if self.adjustments_panel is not None:
+        #     self.proc_worker.histograms_ready.connect(
+        #         self.adjustments_panel.set_histograms,
+        #         Qt.ConnectionType.QueuedConnection,
+        #     )
 
         self.acq_thread.start()
         self.proc_thread.start()
