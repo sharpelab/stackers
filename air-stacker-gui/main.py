@@ -483,6 +483,10 @@ class CameraProcessWorker(QObject):
     from the acquire mailbox, runs the heavy per-pixel work, and
     publishes the result for the GUI. Slow adjustments don't back
     up the camera queue — they just reduce the *processed* fps.
+
+    Publishes via overwrite-always: every iteration overwrites
+    `_latest` and emits frame_ready. take_latest returns the
+    freshest frame (or None if a prior call already drained it).
     """
 
     frame_ready = Signal()
@@ -505,6 +509,7 @@ class CameraProcessWorker(QObject):
     def run(self) -> None:
         self._running = True
         log_count = 0
+        log_emits = 0
         log_start = time.monotonic()
         t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
         while self._running:
@@ -531,10 +536,9 @@ class CameraProcessWorker(QObject):
                         log.warning("adjustment err: %s", e)
             t3 = time.monotonic()
             with self._lock:
-                notify = self._latest is None
                 self._latest = rgb
-            if notify:
-                self.frame_ready.emit()
+            self.frame_ready.emit()
+            log_emits += 1
             t4 = time.monotonic()
             t_wait += t1 - t0
             t_compute += t1b - t1
@@ -545,8 +549,9 @@ class CameraProcessWorker(QObject):
             if t4 - log_start > 2.0:
                 span = t4 - log_start
                 log.info(
-                    "proc   %.1f fps  wait=%.1f comp=%.1f emit=%.1f adj=%.1f pub=%.2f ms/frame",
+                    "proc   %.1f fps emit=%.1f/s  wait=%.1f comp=%.1f hist-emit=%.1f adj=%.1f pub=%.2f ms/frame",
                     log_count / span,
+                    log_emits / span,
                     t_wait / log_count * 1000,
                     t_compute / log_count * 1000,
                     t_emit / log_count * 1000,
@@ -554,6 +559,7 @@ class CameraProcessWorker(QObject):
                     t_publish / log_count * 1000,
                 )
                 log_count = 0
+                log_emits = 0
                 log_start = t4
                 t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
         self.finished.emit()
@@ -1443,6 +1449,9 @@ class CameraWindow(QMainWindow):
         self._proc_total = 0.0
         self._proc_max = 0.0
         self._proc_count = 0
+        self._on_frame_calls = 0
+        self._on_frame_noops = 0
+        self._on_frame_log_start = time.monotonic()
 
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
@@ -1592,8 +1601,11 @@ class CameraWindow(QMainWindow):
         return panel
 
     def _on_frame(self) -> None:
+        self._on_frame_calls += 1
         rgb = self.proc_worker.take_latest()
         if rgb is None:
+            self._on_frame_noops += 1
+            self._maybe_log_on_frame_rates()
             return  # drained by a previous slot run
         t0 = time.monotonic()
         h, w, _ = rgb.shape
@@ -1618,6 +1630,23 @@ class CameraWindow(QMainWindow):
             self._proc_total = 0.0
             self._proc_max = 0.0
             self._proc_count = 0
+        self._maybe_log_on_frame_rates()
+
+    def _maybe_log_on_frame_rates(self) -> None:
+        now = time.monotonic()
+        span = now - self._on_frame_log_start
+        if span < 2.0:
+            return
+        delivered = self._on_frame_calls - self._on_frame_noops
+        log.info(
+            "_on_frame calls=%.1f/s delivered=%.1f/s noops=%.1f/s",
+            self._on_frame_calls / span,
+            delivered / span,
+            self._on_frame_noops / span,
+        )
+        self._on_frame_calls = 0
+        self._on_frame_noops = 0
+        self._on_frame_log_start = now
 
     def _on_frame_error(self, msg: str) -> None:
         self.label.clear_frame()
