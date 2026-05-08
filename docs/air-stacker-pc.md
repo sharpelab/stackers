@@ -28,6 +28,17 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
   - LabVIEW custom UI: `~/Desktop/CONEX-CC-GUI/` — git remote `https://github.com/caoyuan96421/CONEX-CC-GUI.git`. Likely the day-to-day tool. `.lvproj`/`.lvlps` LabVIEW project. Uses NI-VISA (NI MAX is installed).
 - **Protocol**: ASCII serial (Newport CONEX-CC documented protocol). Easy to drive directly without LabVIEW.
 
+## Stage — SMC100 (newly added, 2026-05-08)
+
+- **Hardware**: Newport **SMC100 Series Motion Controller / Driver**, single-axis. Daisy-chain capable but the lab uses a single unit currently.
+- **Connectors** (front face, photo: [`img/smc100.jpeg`](img/smc100.jpeg)): KEYPAD, **RS232C** (DB9), RS485 IN, RS485 OUT, CONFIG. Top face: MOTOR, GPIO, DC OUT, +48V power input.
+- **PC link**: RS-232C → USB-RS232 adapter (FTDI VID_0403+PID_6001, unit `FTE75V52A`) → enumerates as **COM5**.
+- **Protocol**: ASCII over 57600 8N1; addressed commands prefixed with controller index (`1` for first/master), terminated CRLF. `1VE?` = firmware version, `1ID?` = stage ID, `1TS` = state, `1TP` = position, `1RS` = reset.
+- **State machine** (printed on the box): `CONFIG` ↔ `AUTO CONFIG` → `NOT REFERENCED` → `HOMING` → `READY` ↔ `MOVING` / `JOGGING` / `DISABLE`. Faults: `ERROR FE`, `MM0/MM1 ERROR FE`, `HARDWARE FAULT`.
+- **DIP switches** on the back select RS-232 master vs. RS-485 slave; first controller in the chain must be in RS-232 master mode for PC comms.
+- **Probe script**: [`air-stacker-gui/probe_smc100.py`](../air-stacker-gui/probe_smc100.py) — sends `1VE?` and reports whether the controller replies. Useful for cabling iteration.
+- **Cabling note**: Newport's stock PC cable is wired DCE-style on the SMC100 end. A generic DB9 + USB-RS232 dongle (both DTE) needs a **null-modem adapter** to swap TX/RX. As of writing, controller is silent on COM5 — null-modem hasn't been tried yet.
+
 ## Heater
 
 - **Hardware**: **Omega Engineering Platinum** series controller. Device ID `062BE937`, firmware `1.4.0.6`, run mode RUNNING (per the Configurator's Device Information panel).
@@ -46,8 +57,9 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 | Port | Device | Purpose |
 |------|--------|---------|
 | COM1 | Communications Port (legacy) | Unused |
-| COM3 | USB Serial Port | CONEX-CC axis A (Z or spin) |
-| COM4 | USB Serial Port | CONEX-CC axis B (Z or spin) |
+| COM3 | USB Serial Port (FTDI) | CONEX-CC axis A — currently disconnected |
+| COM4 | USB Serial Port (FTDI) | CONEX-CC Rotation Stage |
+| COM5 | USB Serial Port (FTDI) | Newport SMC100 motion controller (RS-232C) |
 | COM7 | USB Serial Device (Omega VCP) | Heater (Omega Platinum, Modbus RTU) |
 
 ## Tooling on the box
