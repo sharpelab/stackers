@@ -761,9 +761,15 @@ class HistWorker(QObject):
 
     Decoupled from proc; takes from a side mailbox proc publishes
     to. Each iteration: compute_histograms (~18 ms on Windows
-    opencv), render three small QImages (~2-3 ms total), emit. The
-    GUI's hist widgets just drawImage the result, so per-paint cost
-    on the GUI thread is sub-ms.
+    opencv), render three small QImages (~1 ms total in isolation,
+    much more under GIL contention), emit. The GUI's hist widgets
+    just drawImage the result, so per-paint cost on the GUI thread
+    is sub-ms.
+
+    Throttled to ~TARGET_HZ. Unthrottled, this thread saturated the
+    GIL and starved GUI Python slots — render wall-time inflated
+    from 0.3 ms isolated to 35 ms in production. Histograms don't
+    need to update faster than the eye can perceive change anyway.
     """
 
     images_ready = Signal(QImage, QImage, QImage)
@@ -775,10 +781,13 @@ class HistWorker(QObject):
         (25, 113, 194),  # B
     )
 
+    TARGET_HZ = 15
+
     def __init__(self, source: FrameMailbox) -> None:
         super().__init__()
         self._source = source
         self._running = False
+        self._period = 1.0 / self.TARGET_HZ
 
     @Slot()
     def run(self) -> None:
@@ -786,6 +795,7 @@ class HistWorker(QObject):
         log_count = 0
         log_start = time.monotonic()
         t_compute = t_render = t_emit = 0.0
+        next_iter_t = time.monotonic()
         while self._running:
             rgb = self._source.take(timeout=0.1)
             if rgb is None:
@@ -813,6 +823,17 @@ class HistWorker(QObject):
             t_render += t3 - t2
             t_emit += t4 - t3
             log_count += 1
+            # Throttle: sleep until the next iteration window so we
+            # don't hog the GIL at full speed.
+            next_iter_t += self._period
+            sleep_for = next_iter_t - time.monotonic()
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+            else:
+                # We're behind schedule (compute+render took longer
+                # than the period); reset rather than burning more
+                # cycles trying to catch up.
+                next_iter_t = time.monotonic()
             if t4 - log_start > 2.0:
                 span = t4 - log_start
                 log.info(
