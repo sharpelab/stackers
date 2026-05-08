@@ -518,11 +518,10 @@ class CameraProcessWorker(QObject):
             if rgb is None:
                 continue
             t1 = time.monotonic()
-            try:
-                hist = compute_histograms(rgb)
-            except Exception as e:  # noqa: BLE001
-                log.warning("histogram err: %s", e)
-                hist = None
+            # DIAGNOSTIC: hist compute disabled to expose the proc/GUI
+            # ceiling without Windows opencv variance. Pair with the
+            # disconnected histograms_ready slot.
+            hist = None
             t1b = time.monotonic()
             if hist is not None:
                 self.histograms_ready.emit(hist)
