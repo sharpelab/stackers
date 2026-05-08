@@ -523,6 +523,15 @@ class HeaterPanel(QGroupBox):
         self.setpoint_spin.setDecimals(2)
         self.setpoint_spin.setSingleStep(1.0)
         self.setpoint_spin.setKeyboardTracking(False)
+
+        self.max_output_spin = QDoubleSpinBox()
+        self.max_output_spin.setRange(0.0, 100.0)
+        self.max_output_spin.setDecimals(1)
+        self.max_output_spin.setSingleStep(1.0)
+        self.max_output_spin.setSuffix(" %")
+        self.max_output_spin.setKeyboardTracking(False)
+        self.max_output_spin.setValue(float(cfg.get("max_output_default", 40.0)))
+
         self.run_btn = QPushButton("Run")
         self.stop_btn = QPushButton("Stop")
         self.diag_btn = QPushButton("Diag")
@@ -537,6 +546,10 @@ class HeaterPanel(QGroupBox):
         sp_row.addWidget(QLabel("Setpoint:"))
         sp_row.addWidget(self.setpoint_spin, stretch=1)
         outer.addLayout(sp_row)
+        max_row = QHBoxLayout()
+        max_row.addWidget(QLabel("Max output:"))
+        max_row.addWidget(self.max_output_spin, stretch=1)
+        outer.addLayout(max_row)
         btn_row = QHBoxLayout()
         btn_row.addWidget(self.run_btn)
         btn_row.addWidget(self.stop_btn)
@@ -545,6 +558,7 @@ class HeaterPanel(QGroupBox):
         outer.addStretch(1)
 
         self.setpoint_spin.editingFinished.connect(self._on_set)
+        self.max_output_spin.editingFinished.connect(self._on_set_max_output)
         self.run_btn.clicked.connect(self._on_run)
         self.stop_btn.clicked.connect(self._on_stop)
         self.diag_btn.clicked.connect(self._on_diag)
@@ -558,6 +572,7 @@ class HeaterPanel(QGroupBox):
         except Exception as e:
             self.status_label.setText(f"open failed: {e}")
             self.setpoint_spin.setEnabled(False)
+            self.max_output_spin.setEnabled(False)
             self.run_btn.setEnabled(False)
             self.stop_btn.setEnabled(False)
             self.diag_btn.setEnabled(False)
@@ -581,6 +596,12 @@ class HeaterPanel(QGroupBox):
             self.heater.set_setpoint(self.setpoint_spin.value())
         except Exception as e:
             self.status_label.setText(f"set err: {e}")
+
+    def _on_set_max_output(self) -> None:
+        try:
+            self.heater.set_output_limit_high(self.max_output_spin.value())
+        except Exception as e:
+            self.status_label.setText(f"max-output err: {e}")
 
     def _on_run(self) -> None:
         try:
@@ -619,6 +640,10 @@ class HeaterPanel(QGroupBox):
             payload["out"] = self.heater.output_percent()
         except Exception as e:  # noqa: BLE001
             payload["out_err"] = str(e)
+        try:
+            payload["out_hi"] = self.heater.output_limit_high()
+        except Exception:  # noqa: BLE001 — keep going
+            pass
         return payload
 
     @Slot(object)
@@ -638,6 +663,8 @@ class HeaterPanel(QGroupBox):
             self.output_label.setText(f"output: {payload['out']:.1f} %")
         elif "out_err" in payload:
             self.output_label.setText(f"output err: {payload['out_err']}")
+        if "out_hi" in payload and not self.max_output_spin.hasFocus():
+            self.max_output_spin.setValue(payload["out_hi"])
 
     def shutdown(self) -> None:
         if self._worker is not None and self._worker_thread is not None:

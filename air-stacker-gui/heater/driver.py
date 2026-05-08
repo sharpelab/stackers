@@ -98,6 +98,9 @@ class OmegaPlatinum:
     def output_percent(self) -> float:
         return float(self.read(R.PID_OUTPUT))
 
+    def output_limit_high(self) -> float:
+        return float(self.read(R.PID_PERCENT_HIGH))
+
     def system_state(self) -> SystemState:
         return SystemState(int(self.read(R.RUN_MODE)))
 
@@ -132,6 +135,10 @@ class OmegaPlatinum:
             raise NotImplementedError(
                 f"setpoint write in {mode.name} mode not supported"
             )
+
+    def set_output_limit_high(self, value: float) -> None:
+        """Write PID_PERCENT_HIGH (0x02AC), the upper PID output clamp."""
+        self.write(R.PID_PERCENT_HIGH, value)
 
     def set_run_mode(self, state: SystemState) -> None:
         """Write a SystemState value to RUN_MODE (0x0240).
