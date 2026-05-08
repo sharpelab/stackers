@@ -2,29 +2,11 @@
 
 from __future__ import annotations
 
-# Detach + hide any console allocated at startup, before heavy imports
-# kick off. uv 0.11.8's venv pythonw.exe is built as console subsystem
-# (the launcher trampoline doesn't carry the GUI flag), so launching us
-# from a Desktop .lnk pops a black console window for the lifetime of
-# the process. Hiding the window first avoids the brief flash; then
-# FreeConsole detaches us so any C-side stderr writes from the GenTL
-# producer don't keep it alive. Has to run before importing harvesters /
-# Qt / cv2 because those load DLLs that may write to stderr on import.
-import sys
-
-if sys.platform == "win32":
-    import ctypes
-
-    _hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-    if _hwnd:
-        ctypes.windll.user32.ShowWindow(_hwnd, 0)  # SW_HIDE
-    ctypes.windll.kernel32.FreeConsole()
-    del _hwnd
-
 import argparse
 import contextlib
 import logging
 import os
+import sys
 import threading
 import time
 from collections import deque
