@@ -269,6 +269,60 @@ def compute_histograms(rgb: np.ndarray) -> np.ndarray:
     return out
 
 
+_HIST_RENDER_W = 256
+_HIST_RENDER_H = 48
+_HIST_SMOOTH_RADIUS = 2
+
+
+def render_hist_image(
+    counts: np.ndarray,
+    color: tuple[int, int, int],
+    width: int = _HIST_RENDER_W,
+    height: int = _HIST_RENDER_H,
+) -> QImage:
+    """Render a single-channel histogram curve into an ARGB32 QImage.
+
+    Designed to run on the HistWorker thread — Qt allows QPainter
+    on standalone QImage objects off the GUI thread. Output is sized
+    fixed (256×48 by default); ChannelHistogram.paintEvent scales it
+    to the widget's current size via drawImage.
+    """
+    img = QImage(width, height, QImage.Format.Format_ARGB32_Premultiplied)
+    img.fill(QColor(20, 20, 20))
+
+    r = _HIST_SMOOTH_RADIUS
+    x = counts.astype(np.float64)
+    cs = np.concatenate(([0.0], np.cumsum(x)))
+    idx = np.arange(256)
+    lo_i = np.maximum(0, idx - r)
+    hi_i = np.minimum(255, idx + r)
+    smoothed = (cs[hi_i + 1] - cs[lo_i]) / (hi_i - lo_i + 1)
+    peak = float(smoothed.max())
+    if peak <= 0:
+        return img
+    ys = np.sqrt(smoothed / peak) * height
+
+    painter = QPainter(img)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    path = QPainterPath()
+    path.moveTo(0, height)
+    for i in range(256):
+        path.lineTo(i * (width / 255.0), height - float(ys[i]))
+    path.lineTo(width, height)
+    path.closeSubpath()
+    fill = QColor(*color)
+    fill.setAlpha(80)
+    stroke = QColor(*color)
+    stroke.setAlpha(200)
+    painter.setBrush(QBrush(fill))
+    pen = QPen(stroke)
+    pen.setWidthF(1.0)
+    painter.setPen(pen)
+    painter.drawPath(path)
+    painter.end()
+    return img
+
+
 class _CameraGLWindow(QOpenGLWindow):
     """Direct-rendered GL surface for one camera frame at a time.
 
@@ -603,12 +657,13 @@ class CameraAcquireWorker(QObject):
 
 
 class CameraProcessWorker(QObject):
-    """Thread B: histogram + adjustments + GUI handoff.
+    """Thread B: adjustments + GUI handoff.
 
-    Decoupled from the camera: takes the latest debayered frame
-    from the acquire mailbox, runs the heavy per-pixel work, and
-    publishes the result for the GUI. Slow adjustments don't back
-    up the camera queue — they just reduce the *processed* fps.
+    Takes the latest debayered frame from the acquire mailbox,
+    applies image adjustments, and publishes the result for the
+    GUI. Also forks the (post-adjustment) frame to a side mailbox
+    consumed by HistWorker; histogram compute lives there, not
+    here, so proc isn't gated by Windows opencv variance.
 
     Publishes via overwrite-always: every iteration overwrites
     `_latest` and emits frame_ready. take_latest returns the
@@ -616,17 +671,18 @@ class CameraProcessWorker(QObject):
     """
 
     frame_ready = Signal()
-    histograms_ready = Signal(object)
     finished = Signal()
 
     def __init__(
         self,
         source: FrameMailbox,
         adjustments: ImageAdjustments | None = None,
+        hist_sink: FrameMailbox | None = None,
     ) -> None:
         super().__init__()
         self._source = source
         self._adjustments = adjustments
+        self._hist_sink = hist_sink
         self._running = False
         self._lock = threading.Lock()
         self._latest: np.ndarray | None = None
@@ -637,21 +693,13 @@ class CameraProcessWorker(QObject):
         log_count = 0
         log_emits = 0
         log_start = time.monotonic()
-        t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
+        t_wait = t_adjust = t_publish = 0.0
         while self._running:
             t0 = time.monotonic()
             rgb = self._source.take(timeout=0.1)
             if rgb is None:
                 continue
             t1 = time.monotonic()
-            # DIAGNOSTIC: hist compute disabled to expose the proc/GUI
-            # ceiling without Windows opencv variance. Pair with the
-            # disconnected histograms_ready slot.
-            hist = None
-            t1b = time.monotonic()
-            if hist is not None:
-                self.histograms_ready.emit(hist)
-            t2 = time.monotonic()
             if self._adjustments is not None:
                 snap = self._adjustments.get()
                 if not snap.is_identity:
@@ -663,30 +711,28 @@ class CameraProcessWorker(QObject):
             with self._lock:
                 self._latest = rgb
             self.frame_ready.emit()
+            if self._hist_sink is not None:
+                self._hist_sink.publish(rgb)
             log_emits += 1
             t4 = time.monotonic()
             t_wait += t1 - t0
-            t_compute += t1b - t1
-            t_emit += t2 - t1b
-            t_adjust += t3 - t2
+            t_adjust += t3 - t1
             t_publish += t4 - t3
             log_count += 1
             if t4 - log_start > 2.0:
                 span = t4 - log_start
                 log.info(
-                    "proc   %.1f fps emit=%.1f/s  wait=%.1f comp=%.1f hist-emit=%.1f adj=%.1f pub=%.2f ms/frame",
+                    "proc   %.1f fps emit=%.1f/s  wait=%.1f adj=%.1f pub=%.2f ms/frame",
                     log_count / span,
                     log_emits / span,
                     t_wait / log_count * 1000,
-                    t_compute / log_count * 1000,
-                    t_emit / log_count * 1000,
                     t_adjust / log_count * 1000,
                     t_publish / log_count * 1000,
                 )
                 log_count = 0
                 log_emits = 0
                 log_start = t4
-                t_wait = t_compute = t_emit = t_adjust = t_publish = 0.0
+                t_wait = t_adjust = t_publish = 0.0
         self.finished.emit()
 
     def take_latest(self) -> np.ndarray | None:
@@ -698,6 +744,82 @@ class CameraProcessWorker(QObject):
     def stop(self) -> None:
         self._running = False
         self._source.wake()  # unblock the take(timeout) wait
+
+
+class HistWorker(QObject):
+    """Thread C: histogram compute + curve render.
+
+    Decoupled from proc; takes from a side mailbox proc publishes
+    to. Each iteration: compute_histograms (~18 ms on Windows
+    opencv), render three small QImages (~2-3 ms total), emit. The
+    GUI's hist widgets just drawImage the result, so per-paint cost
+    on the GUI thread is sub-ms.
+    """
+
+    images_ready = Signal(QImage, QImage, QImage)
+    finished = Signal()
+
+    CHANNEL_COLORS = (
+        (224, 49, 49),   # R
+        (47, 158, 68),   # G
+        (25, 113, 194),  # B
+    )
+
+    def __init__(self, source: FrameMailbox) -> None:
+        super().__init__()
+        self._source = source
+        self._running = False
+
+    @Slot()
+    def run(self) -> None:
+        self._running = True
+        log_count = 0
+        log_start = time.monotonic()
+        t_compute = t_render = t_emit = 0.0
+        while self._running:
+            rgb = self._source.take(timeout=0.1)
+            if rgb is None:
+                continue
+            t1 = time.monotonic()
+            try:
+                hist = compute_histograms(rgb)
+            except Exception as e:  # noqa: BLE001
+                log.warning("hist compute err: %s", e)
+                continue
+            t2 = time.monotonic()
+            try:
+                images = (
+                    render_hist_image(hist[0], self.CHANNEL_COLORS[0]),
+                    render_hist_image(hist[1], self.CHANNEL_COLORS[1]),
+                    render_hist_image(hist[2], self.CHANNEL_COLORS[2]),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("hist render err: %s", e)
+                continue
+            t3 = time.monotonic()
+            self.images_ready.emit(*images)
+            t4 = time.monotonic()
+            t_compute += t2 - t1
+            t_render += t3 - t2
+            t_emit += t4 - t3
+            log_count += 1
+            if t4 - log_start > 2.0:
+                span = t4 - log_start
+                log.info(
+                    "hist   %.1f fps  comp=%.1f render=%.1f emit=%.2f ms/iter",
+                    log_count / span,
+                    t_compute / log_count * 1000,
+                    t_render / log_count * 1000,
+                    t_emit / log_count * 1000,
+                )
+                log_count = 0
+                log_start = t4
+                t_compute = t_render = t_emit = 0.0
+        self.finished.emit()
+
+    def stop(self) -> None:
+        self._running = False
+        self._source.wake()
 
 
 class ConexAxisPanel(QGroupBox):
@@ -1133,21 +1255,18 @@ class ChannelHistogram(QWidget):
     spinboxes that drive its remap range.
     """
 
-    SMOOTH_RADIUS = 2
-
     def __init__(self, color: tuple[int, int, int]) -> None:
         super().__init__()
         self._color = QColor(*color)
-        self._data: np.ndarray | None = None
+        self._image: QImage | None = None
         self._lo = 0
         self._hi = 255
         self.setFixedHeight(48)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-    def set_data(self, data: np.ndarray) -> None:
-        if data.shape != (256,):
-            return
-        self._data = data
+    def set_image(self, image: QImage) -> None:
+        """Pre-rendered curve image from HistWorker (256×48 ARGB32)."""
+        self._image = image
         self.update()
 
     def set_range(self, lo: int, hi: int) -> None:
@@ -1159,36 +1278,15 @@ class ChannelHistogram(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: ARG002
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor(20, 20, 20))
-
         w = self.width()
         h = self.height()
         if w <= 0 or h <= 0:
             return
 
-        if self._data is not None:
-            curve = self._smoothed(self._data)
-            peak = float(curve.max())
-            if peak > 0:
-                ys = np.sqrt(curve / peak) * h
-                path = QPainterPath()
-                path.moveTo(0, h)
-                for i in range(256):
-                    x = i * (w / 255.0)
-                    y = h - ys[i]
-                    path.lineTo(x, y)
-                path.lineTo(w, h)
-                path.closeSubpath()
-                fill = QColor(self._color)
-                fill.setAlpha(80)
-                stroke = QColor(self._color)
-                stroke.setAlpha(200)
-                painter.setBrush(QBrush(fill))
-                pen = QPen(stroke)
-                pen.setWidthF(1.0)
-                painter.setPen(pen)
-                painter.drawPath(path)
+        if self._image is not None:
+            painter.drawImage(self.rect(), self._image)
+        else:
+            painter.fillRect(self.rect(), QColor(20, 20, 20))
 
         # Shade [0, lo] and [hi, 255] to show what gets clipped to 0 / 255.
         if self._lo > 0 or self._hi < 255:
@@ -1210,18 +1308,6 @@ class ChannelHistogram(QWidget):
         if self._hi < 255:
             x = self._hi / 255.0 * w
             painter.drawLine(int(x), 0, int(x), h)
-
-    def _smoothed(self, arr: np.ndarray) -> np.ndarray:
-        r = self.SMOOTH_RADIUS
-        if r <= 0:
-            return arr.astype(np.float64)
-        x = arr.astype(np.float64)
-        n = x.size
-        cs = np.concatenate(([0.0], np.cumsum(x)))
-        idx = np.arange(n)
-        lo = np.maximum(0, idx - r)
-        hi = np.minimum(n - 1, idx + r)
-        return (cs[hi + 1] - cs[lo]) / (hi - lo + 1)
 
 
 class ImageAdjustmentsPanel(QGroupBox):
@@ -1309,14 +1395,12 @@ class ImageAdjustmentsPanel(QGroupBox):
         self.defaults_btn.clicked.connect(self._apply_defaults)
         self._building = False
 
-    @Slot(object)
-    def set_histograms(self, hist: np.ndarray) -> None:
-        """Slot for CameraProcessWorker.histograms_ready ((3, 256) int array)."""
-        if hist.shape != (3, 256):
-            return
-        self.r_hist.set_data(hist[0])
-        self.g_hist.set_data(hist[1])
-        self.b_hist.set_data(hist[2])
+    @Slot(QImage, QImage, QImage)
+    def set_hist_images(self, r: QImage, g: QImage, b: QImage) -> None:
+        """Slot for HistWorker.images_ready — pre-rendered curves."""
+        self.r_hist.set_image(r)
+        self.g_hist.set_image(g)
+        self.b_hist.set_image(b)
 
     def _make_slider_row(
         self, span: tuple[int, int], default: int
@@ -1614,11 +1698,15 @@ class CameraWindow(QMainWindow):
         layout.addWidget(right_panel)
         self.setCentralWidget(central)
 
-        # Two-stage pipeline: acq thread fetches+debayers and pushes
-        # into the acq mailbox; proc thread takes the latest, runs
-        # histogram + adjustments, and publishes for the GUI. Slow
-        # adjustments slow the proc rate but never the acq rate.
+        # Three-stage pipeline:
+        #   acq thread → acq_mailbox → proc thread ─┬─→ GUI mailbox → display
+        #                                           └─→ hist_mailbox → hist thread
+        # acq fetches + debayers; proc applies adjustments and forks
+        # the post-adjust frame to both the GUI (via take_latest /
+        # frame_ready) and the hist thread; hist computes + renders
+        # curve QImages off the critical path.
         self.acq_mailbox = FrameMailbox()
+        self.hist_mailbox = FrameMailbox()
 
         self.acq_thread = QThread()
         self.acq_worker = CameraAcquireWorker(self.acquirer, self.acq_mailbox)
@@ -1628,21 +1716,28 @@ class CameraWindow(QMainWindow):
         self.acq_worker.finished.connect(self.acq_thread.quit)
 
         self.proc_thread = QThread()
-        self.proc_worker = CameraProcessWorker(self.acq_mailbox, self.adjustments)
+        self.proc_worker = CameraProcessWorker(
+            self.acq_mailbox, self.adjustments, self.hist_mailbox
+        )
         self.proc_worker.moveToThread(self.proc_thread)
         self.proc_thread.started.connect(self.proc_worker.run)
         self.proc_worker.frame_ready.connect(self._on_frame)
         self.proc_worker.finished.connect(self.proc_thread.quit)
-        # DIAGNOSTIC: histograms_ready disconnected to test whether 3
-        # widget repaints per emit are saturating the GUI thread.
-        # if self.adjustments_panel is not None:
-        #     self.proc_worker.histograms_ready.connect(
-        #         self.adjustments_panel.set_histograms,
-        #         Qt.ConnectionType.QueuedConnection,
-        #     )
+
+        self.hist_thread = QThread()
+        self.hist_worker = HistWorker(self.hist_mailbox)
+        self.hist_worker.moveToThread(self.hist_thread)
+        self.hist_thread.started.connect(self.hist_worker.run)
+        self.hist_worker.finished.connect(self.hist_thread.quit)
+        if self.adjustments_panel is not None:
+            self.hist_worker.images_ready.connect(
+                self.adjustments_panel.set_hist_images,
+                Qt.ConnectionType.QueuedConnection,
+            )
 
         self.acq_thread.start()
         self.proc_thread.start()
+        self.hist_thread.start()
 
     def _apply_camera_startup(self) -> None:
         """Set acquisition mode, balance-white-auto, and unlock the frame rate.
@@ -1792,15 +1887,20 @@ class CameraWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         # Stop acq first so no new frames land in the mailbox; then
-        # proc, which will drain its take(timeout) wait via the wake.
+        # proc and hist, both of which will drain their take(timeout)
+        # waits via the wake.
         self.acq_worker.stop()
         self.proc_worker.stop()
+        self.hist_worker.stop()
         self.acq_thread.quit()
         self.proc_thread.quit()
+        self.hist_thread.quit()
         if not self.acq_thread.wait(2000):
             log.warning("acq thread did not exit cleanly")
         if not self.proc_thread.wait(2000):
             log.warning("proc thread did not exit cleanly")
+        if not self.hist_thread.wait(2000):
+            log.warning("hist thread did not exit cleanly")
         for ap in self.axis_panels:
             ap.shutdown()
         if self.heater_panel is not None:
