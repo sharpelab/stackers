@@ -276,6 +276,9 @@ class CameraDisplay(QLabel):
         # Hold the numpy buffer the QImage views into until the next
         # frame arrives — QImage(data, ...) does not own its bytes.
         self._frame_ref = None
+        self._paint_total = 0.0
+        self._paint_max = 0.0
+        self._paint_count = 0
         self.fps_label = QLabel("-- fps", self)
         self.fps_label.setStyleSheet(
             "color: white; background-color: rgba(0, 0, 0, 140);"
@@ -307,6 +310,7 @@ class CameraDisplay(QLabel):
         if self._image is None:
             super().paintEvent(event)  # QLabel text path
             return
+        t0 = time.monotonic()
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor(0, 0, 0))
         sw, sh = self._image.width(), self._image.height()
@@ -321,6 +325,22 @@ class CameraDisplay(QLabel):
         x = (tw - dw) // 2
         y = (th - dh) // 2
         painter.drawImage(QRect(x, y, dw, dh), self._image)
+        painter.end()
+        elapsed = time.monotonic() - t0
+        self._paint_total += elapsed
+        self._paint_max = max(self._paint_max, elapsed)
+        self._paint_count += 1
+        if self._paint_count >= 60:
+            log.info(
+                "paintEvent avg=%.1fms max=%.1fms widget=%dx%d draw=%dx%d n=%d",
+                self._paint_total / self._paint_count * 1000,
+                self._paint_max * 1000,
+                tw, th, dw, dh,
+                self._paint_count,
+            )
+            self._paint_total = 0.0
+            self._paint_max = 0.0
+            self._paint_count = 0
 
     def _reposition_overlay(self) -> None:
         m = self.OVERLAY_MARGIN
