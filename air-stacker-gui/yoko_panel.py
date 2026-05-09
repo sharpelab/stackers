@@ -223,6 +223,7 @@ class YokoPanel(QGroupBox):
         self.overload_label.setVisible(False)
         self.id_label = QLabel("")
         self.id_label.setStyleSheet("color: #888;")
+        self.id_label.setVisible(False)
 
         self.voltage_label = QLabel("—")
         v_font = QFont(self.voltage_label.font())

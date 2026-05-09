@@ -144,6 +144,7 @@ class SMC100Panel(QGroupBox):
         self.error_label.setStyleSheet("color: #b04040;")
         self.id_label = QLabel("")
         self.id_label.setStyleSheet("color: #888;")
+        self.id_label.setVisible(False)
 
         self.position_label = QLabel("—")
         pos_font = QFont(self.position_label.font())
