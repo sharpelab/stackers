@@ -19,6 +19,7 @@ from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
+    QFontMetrics,
     QIcon,
     QImage,
     QPainter,
@@ -2490,20 +2491,26 @@ class HeaterPanel(QGroupBox):
         self.status_label.setVisible(False)
 
         # --- hero readouts: PV + setpoint side by side ----------------------
-        hero_font = QFont()
-        hero_font.setPointSize(hero_font.pointSize() + 14)
+        # Build the hero font from a real label's font so we inherit the
+        # application's point size — bare QFont() can give pointSize() == -1.
+        self.pv_label = QLabel("—")
+        hero_font = QFont(self.pv_label.font())
+        hero_font.setPointSize(hero_font.pointSize() + 8)
         hero_font.setStyleHint(QFont.StyleHint.Monospace)
         hero_font.setFamily("monospace")
         hero_font.setBold(True)
-
-        self.pv_label = QLabel("—")
+        # Pin a minimum height so QGridLayout can't squeeze the row to 0
+        # when the right column is vertically constrained (e.g. on maximize).
+        hero_min_h = QFontMetrics(hero_font).height() + 4
         self.pv_label.setFont(hero_font)
         self.pv_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pv_label.setMinimumHeight(hero_min_h)
 
         self.setpoint_value_label = QLabel("—")
         self.setpoint_value_label.setFont(hero_font)
         self.setpoint_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.setpoint_value_label.setStyleSheet("color: #888;")
+        self.setpoint_value_label.setMinimumHeight(hero_min_h)
 
         caption_style = "color: #888;"
         pv_caption = QLabel("process")
@@ -2550,7 +2557,9 @@ class HeaterPanel(QGroupBox):
 
         hero_grid = QGridLayout()
         hero_grid.setHorizontalSpacing(16)
-        hero_grid.setVerticalSpacing(0)
+        hero_grid.setVerticalSpacing(2)
+        hero_grid.setRowStretch(0, 0)
+        hero_grid.setRowStretch(1, 0)
         hero_grid.addWidget(self.pv_label, 0, 0)
         hero_grid.addWidget(self.setpoint_value_label, 0, 1)
         hero_grid.addWidget(pv_caption, 1, 0)
