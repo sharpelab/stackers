@@ -44,6 +44,38 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Cabling**: Newport's stock PC cable is wired DCE-style on the SMC100 end; a generic DB9 + USB-RS232 dongle (both DTE) needs a **null-modem adapter** to swap TX/RX. Current setup includes the null-modem and is working.
 - **Manuals**: [User's Manual](../air-stacker-gui/manuals/newport-smc100-user-manual.pdf) (EDH0206En2060, 02/25 — install, wiring, state machine, ESP stage configuration), [Command Interface Manual](../air-stacker-gui/manuals/newport-smc100-command-interface.pdf) (EDH0311En1023, 12/21 — `Newport.SMC100.CommandInterface.dll` reference, but the ASCII command names match what goes over RS-232).
 
+## Z stage — fine (Yokogawa 7651 + piezo, added 2026-05-08)
+
+- **Hardware**: Yokogawa **7651** programmable DC source driving the piezo stack that gives us fine Z. Sole GPIB instrument on the box.
+- **PC link**: GPIB-USB adapter (vendor TBD — surfaces to NI-VISA as `GPIB0`) → NI-VISA → resource string **`GPIB0::29::INSTR`**. GPIB primary address **29** is set on DIP switches on the back of the 7651; if those get bumped, the device disappears from `pyvisa.ResourceManager().list_resources()` until reconfigured.
+- **Currently observed (probe)**: ~+11.40 V DC, status `N` (normal), ~4 mV jitter on the readback. Probe captured on 2026-05-08 with the unit live on the piezo.
+- **Protocol — pre-SCPI Yokogawa command set**:
+  - Commands are terminated with `;` (NOT LF). Configure VISA with `write_termination=""` and put the `;` in every command string.
+  - Replies are terminated with `\r`. Configure VISA with `read_termination='\r'`.
+  - **No `*IDN?`.** Sending `*IDN?` doesn't error, but the reply you read back is just whatever the talker has queued (the live OD-format output) — there is no real identification.
+  - **Set commands are write-only** — programmed voltage / current / mode / output state cannot be queried back. The canonical QCoDeS driver caches them in software.
+  - After any setting change you must send **`E;`** to trigger / apply.
+- **Common commands** (from the canonical driver):
+
+  | Command | Meaning |
+  |---|---|
+  | `F1;` | Set DC voltage source mode |
+  | `F5;` | Set DC current source mode |
+  | `SA<value>;` | Set output level (e.g. `SA1.5;` → 1.5 V or 1.5 A depending on mode) |
+  | `O1;` / `O0;` | Output enable / disable |
+  | `E;` | Trigger — apply pending changes |
+  | `OD;` | Read current output data (non-perturbing) |
+
+- **OD reply format**: `NDCV+0.11402E+02` →
+  - `N` status (`N` normal · `O` overload · `E` error)
+  - `DC` mode (the 7651 is DC-only)
+  - `V` function (`V` voltage / `A` current)
+  - signed mantissa·E·exponent — for the example, +11.402 V
+
+- **Operating range** (per the QCoDeS driver validators): voltage **±30 V**, current **±0.12 A**.
+- **Probe script**: [`air-stacker-gui/probe_yoko.py`](../air-stacker-gui/probe_yoko.py) — sends `OD;`, decodes the reply, reports the live output. Read-only and safe.
+- **Canonical driver to reuse, not re-implement**: [`~/sharpelab/measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py`](../../measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py) — QCoDeS `VisaInstrument` subclass that already handles the cache-on-set / no-IDN / `;`-terminator / `E;`-trigger idiosyncrasies, plus software ramp helpers (`ramp_voltage`, `ramp_current`). When piezo-z grows real code, depend on or port from this; don't re-derive the protocol quirks from scratch.
+
 ## Heater
 
 - **Hardware**: **Omega Engineering Platinum** series controller. Device ID `062BE937`, firmware `1.4.0.6`, run mode RUNNING (per the Configurator's Device Information panel).
