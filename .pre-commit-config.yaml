@@ -1,0 +1,22 @@
+default_install_hook_types: [pre-commit]
+
+repos:
+  - repo: local
+    hooks:
+      - id: ruff-fix
+        name: ruff (auto-fix + check)
+        language: system
+        types_or: [python, pyi]
+        files: ^air-stacker-gui/
+        entry: scripts/precommit-ruff.sh
+        pass_filenames: true
+        require_serial: true
+
+      - id: ty
+        name: ty (staged python only)
+        language: system
+        types_or: [python, pyi]
+        files: ^air-stacker-gui/
+        entry: scripts/precommit-ty.sh
+        pass_filenames: true
+        require_serial: true
