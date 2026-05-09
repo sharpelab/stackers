@@ -736,9 +736,12 @@ class CameraProcessWorker(QObject):
 
     Takes the latest debayered frame from the acquire mailbox,
     applies image adjustments, and publishes the result for the
-    GUI. Also forks the (post-adjustment) frame to a side mailbox
-    consumed by HistWorker; histogram compute lives there, not
-    here, so proc isn't gated by Windows opencv variance.
+    GUI. Forks the *pre-adjustment* (raw post-debayer) frame to a
+    side mailbox consumed by HistWorker — histograms are a sensor-
+    data diagnostic, not a preview of display-only LUTs. Standard
+    convention in scientific imaging tools (ImageJ, μManager).
+    Hist compute also lives off this thread so proc isn't gated by
+    Windows opencv variance.
 
     Publishes via overwrite-always: every iteration overwrites
     `_latest` and emits frame_ready. take_latest returns the
@@ -777,6 +780,9 @@ class CameraProcessWorker(QObject):
             rgb = self._source.take(timeout=0.1)
             if rgb is None:
                 continue
+            # Fork the raw post-debayer frame to hist before adjustments.
+            if self._hist_sink is not None:
+                self._hist_sink.publish(rgb)
             t1 = time.monotonic()
             if self._adjustments is not None:
                 snap = self._adjustments.get()
@@ -795,8 +801,6 @@ class CameraProcessWorker(QObject):
             with self._lock:
                 self._latest = rgb
             self.frame_ready.emit()
-            if self._hist_sink is not None:
-                self._hist_sink.publish(rgb)
             log_emits += 1
             t4 = time.monotonic()
             t_wait += t1 - t0
