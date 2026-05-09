@@ -15,7 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import PySpin
-from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -1225,10 +1225,14 @@ class ConexAxisPanel(QGroupBox):
     """Newport-style control surface for a single CONEX-CC axis."""
 
     POLL_MS = 100
+    # Mouse-down duration past which a jog button switches from step to
+    # continuous mode. Matches the SMC100 panel's threshold.
+    JOG_HOLD_MS = 250
 
     def __init__(self, axis_config: dict) -> None:
         super().__init__(axis_config.get("name", "Axis"))
         self.units = axis_config.get("units", "")
+        self._default_velocity = axis_config.get("default_velocity")
         self.axis = ConexAxis(
             port=axis_config["port"],
             baud=int(axis_config.get("baud", 921600)),
@@ -1290,6 +1294,15 @@ class ConexAxisPanel(QGroupBox):
         self._worker: PollWorker | None = None
         self._worker_thread: QThread | None = None
 
+        # Cached state used by the click-vs-hold continuous jog path.
+        self._effective_limits: tuple[float, float] | None = None
+        self._jog_direction: int = 0
+        self._jog_continuous: bool = False
+        self._jog_timer = QTimer(self)
+        self._jog_timer.setSingleShot(True)
+        self._jog_timer.setInterval(self.JOG_HOLD_MS)
+        self._jog_timer.timeout.connect(self._on_jog_continuous_fire)
+
         try:
             self.axis.open()
         except Exception as e:
@@ -1300,7 +1313,27 @@ class ConexAxisPanel(QGroupBox):
         self.id_label.setText(self.axis.identify())
         self.status_label.setText(f"connected on {self.axis.port}")
 
-        # Pre-populate velocity from the controller (best-effort).
+        # Cache software limits — the continuous-hold path moves toward
+        # whichever limit matches the jog direction. CONEX-CC has no
+        # JOGGING command, so Newport's documented pattern is PA(SL/SR)
+        # then ST on release.
+        try:
+            lo = self.axis.negative_limit()
+            hi = self.axis.positive_limit()
+            self._effective_limits = (lo, hi)
+        except ConexError:
+            pass
+
+        # Apply default velocity if requested. Transient (VA only) — no
+        # flash write, controller reverts on power-cycle.
+        if self._default_velocity is not None:
+            try:
+                self.axis.set_velocity(float(self._default_velocity))
+            except ConexError as e:
+                log.warning("conex set_velocity failed: %s", e)
+
+        # Pre-populate velocity spinner from the controller (best-effort,
+        # picks up whatever the previous step just wrote).
         try:
             v = self.axis.velocity()
             self.velocity_spin.blockSignals(True)
@@ -1366,8 +1399,13 @@ class ConexAxisPanel(QGroupBox):
 
     def _wire_signals(self) -> None:
         self.go_btn.clicked.connect(self._on_go)
-        self.jog_minus_btn.clicked.connect(lambda: self._safe(self.axis.move_relative, -self.step_spin.value()))
-        self.jog_plus_btn.clicked.connect(lambda: self._safe(self.axis.move_relative, self.step_spin.value()))
+        # Click=step, hold>JOG_HOLD_MS=continuous toward limit. Mirrors the
+        # SMC100 panel pattern; CONEX-CC has no JOGGING command, so the
+        # continuous path uses PA(SL/SR) then ST on release.
+        self.jog_minus_btn.pressed.connect(lambda: self._on_jog_pressed(-1))
+        self.jog_minus_btn.released.connect(self._on_jog_released)
+        self.jog_plus_btn.pressed.connect(lambda: self._on_jog_pressed(+1))
+        self.jog_plus_btn.released.connect(self._on_jog_released)
         self.stop_btn.clicked.connect(lambda: self._safe(self.axis.stop))
         self.home_btn.clicked.connect(lambda: self._safe(self.axis.home))
         self.enable_btn.clicked.connect(lambda: self._safe(self.axis.enable))
@@ -1376,6 +1414,64 @@ class ConexAxisPanel(QGroupBox):
 
     def _on_set_velocity(self) -> None:
         self._safe(self.axis.set_velocity, self.velocity_spin.value())
+
+    def _on_jog_pressed(self, direction: int) -> None:
+        """Mouse-down on a jog button — arm the click-vs-hold timer."""
+        log.info("conex: jog pressed dir=%+d (timer armed)", direction)
+        self._jog_direction = direction
+        self._jog_continuous = False
+        self._jog_timer.start()
+
+    def _on_jog_continuous_fire(self) -> None:
+        """Hold threshold elapsed — switch from step to continuous travel.
+
+        CONEX-CC has no jog command. We send PA(limit) toward the SL/SR
+        software cap; on release the matching _on_jog_released sends ST
+        which decelerates per AC and returns the controller to READY.
+        Falls back to a step move if we don't have limits cached.
+        """
+        if self._jog_direction == 0:
+            return  # released before timer fired
+        direction = self._jog_direction
+        log.info(
+            "conex: jog continuous-fire dir=%+d limits=%s",
+            direction,
+            self._effective_limits,
+        )
+        if self._effective_limits is not None:
+            lo, hi = self._effective_limits
+            target = lo if direction < 0 else hi
+            self._safe(self.axis.move_absolute, target)
+        else:
+            # No limits cached — fall back to a step move so we still do
+            # something rather than ignoring the hold.
+            self._safe(
+                self.axis.move_relative,
+                direction * self.step_spin.value(),
+            )
+        self._jog_continuous = True
+
+    def _on_jog_released(self) -> None:
+        """Mouse-up — finish a step or stop a continuous run."""
+        if self._jog_direction == 0:
+            return
+        log.info(
+            "conex: jog released dir=%+d continuous=%s",
+            self._jog_direction,
+            self._jog_continuous,
+        )
+        if self._jog_continuous:
+            self._safe(self.axis.stop)
+        else:
+            # Quick click — cancel the pending continuous switch and fire
+            # a single step move using whatever's in the Step spinbox.
+            self._jog_timer.stop()
+            self._safe(
+                self.axis.move_relative,
+                self._jog_direction * self.step_spin.value(),
+            )
+        self._jog_direction = 0
+        self._jog_continuous = False
 
     def _set_motion_enabled(self, enabled: bool) -> None:
         for btn in (

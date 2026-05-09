@@ -16,6 +16,8 @@ port = "COM4"
 baud = 921600
 units = "°"
 step = 0.01
+# Transient (VA only) — applied on connect, no flash write.
+default_velocity = 1.0
 
 # Omega Platinum heater controller (Modbus RTU over USB CDC).
 [heater]
