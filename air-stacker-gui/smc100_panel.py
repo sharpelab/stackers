@@ -188,15 +188,15 @@ class SMC100Panel(QGroupBox):
         # then JD (leave JOGGING). Both transient — no flash writes.
         self.leave_jog_btn = QPushButton("Leave jog")
 
+        # Stop sits on the top-right of the panel (same line as status)
+        # rather than as a full-width banner. Red styling keeps it visually
+        # distinct as a panic button without taking a row to itself.
         self.stop_btn = QPushButton("STOP")
         self.stop_btn.setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; "
-            "font-weight: bold; padding: 8px; }"
+            "font-weight: bold; padding: 2px 10px; }"
             "QPushButton:pressed { background-color: #962d22; }"
         )
-        stop_font = QFont(self.stop_btn.font())
-        stop_font.setPointSize(stop_font.pointSize() + 2)
-        self.stop_btn.setFont(stop_font)
 
         self._build_layout()
         self._wire_signals()
@@ -278,7 +278,10 @@ class SMC100Panel(QGroupBox):
     def _build_layout(self) -> None:
         outer = QVBoxLayout(self)
 
-        outer.addWidget(self.status_label)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, stretch=1)
+        status_row.addWidget(self.stop_btn)
+        outer.addLayout(status_row)
         outer.addWidget(self.error_label)
         outer.addWidget(self.id_label)
 
@@ -320,7 +323,6 @@ class SMC100Panel(QGroupBox):
         outer.addLayout(action_row)
 
         outer.addWidget(self.leave_jog_btn)
-        outer.addWidget(self.stop_btn)
         outer.addStretch(1)
 
     def _wire_signals(self) -> None:
