@@ -1806,6 +1806,14 @@ class CameraOptionsPanel(QGroupBox):
             self.binning_combo.setEnabled(False)
             self.binning_change_requested.emit(target_bin)
 
+        # Re-capture from the widgets so the loaded snapshot reflects
+        # what the spinboxes actually hold post-rounding. Without this,
+        # values like ExposureTime=16798 µs (= 16.798 ms) get rounded by
+        # exp_spin's 2-decimal display to 16.80 ms and round-trip back as
+        # 16800 µs — leaving the panel permanently "dirty" relative to
+        # the snapshot we just applied.
+        self._loaded_snapshot = self._current_snapshot()
+
     def _current_snapshot(self) -> CameraSettingsSnapshot:
         """Snapshot the current widget state. Manual fields go to None when
         the corresponding auto checkbox is on — matching what gets written
@@ -1870,7 +1878,8 @@ class CameraOptionsPanel(QGroupBox):
                 return
             snap = snap_or_none
         self._loaded_preset_name = name
-        self._loaded_snapshot = snap
+        # _apply_snapshot re-captures _loaded_snapshot from the widgets
+        # post-application so any spinbox-rounding gets absorbed.
         self._apply_snapshot(snap)
         self._refresh_preset_ui()
 
