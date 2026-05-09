@@ -226,6 +226,7 @@ class YokoPanel(QGroupBox):
 
         # --- widgets --------------------------------------------------------
         self.status_label = QLabel("disconnected")
+        self.status_label.setVisible(False)
         self.overload_label = QLabel("")
         self.overload_label.setStyleSheet(
             "color: white; background-color: #b04040; "

@@ -1238,6 +1238,7 @@ class ConexAxisPanel(QGroupBox):
         self.position_label.setFont(font)
         self.id_label = QLabel("")
         self.id_label.setStyleSheet("color: #888;")
+        self.id_label.setVisible(False)
 
         self.target_spin = QDoubleSpinBox()
         self.target_spin.setRange(-1e6, 1e6)
@@ -2481,6 +2482,7 @@ class HeaterPanel(QGroupBox):
         )
 
         self.status_label = QLabel("disconnected")
+        self.status_label.setVisible(False)
         self.pv_label = QLabel("—")
         font = self.pv_label.font()
         font.setPointSize(font.pointSize() + 4)
