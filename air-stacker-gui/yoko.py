@@ -84,8 +84,34 @@ class Yoko7651:
     cannot read back).
     """
 
-    def __init__(self, resource: str) -> None:
+    def __init__(
+        self,
+        resource: str,
+        *,
+        voltage_limits: tuple[float, float] = VOLTAGE_RANGE_V,
+        current_limits: tuple[float, float] = CURRENT_RANGE_A,
+    ) -> None:
+        """Construct a 7651 driver.
+
+        ``voltage_limits`` and ``current_limits`` default to the 7651's full
+        hardware envelope (±30 V, ±0.12 A). Pass tighter bounds when driving
+        a load with a narrower safe range — e.g. the NPM140 piezo wants a
+        floor of −20 V and won't see anything above the Yoko's +30 V ceiling
+        anyway, so a piezo caller passes ``voltage_limits=(-20.0, 30.0)``.
+        """
+        if not voltage_limits[0] >= VOLTAGE_RANGE_V[0]:
+            raise YokoError(
+                f"voltage_limits low {voltage_limits[0]} below 7651 floor "
+                f"{VOLTAGE_RANGE_V[0]}"
+            )
+        if not voltage_limits[1] <= VOLTAGE_RANGE_V[1]:
+            raise YokoError(
+                f"voltage_limits high {voltage_limits[1]} above 7651 ceiling "
+                f"{VOLTAGE_RANGE_V[1]}"
+            )
         self.resource = resource
+        self._voltage_limits = voltage_limits
+        self._current_limits = current_limits
         self._inst = None  # pyvisa MessageBasedResource once open()'d
         self._lock = threading.Lock()
         # Software caches — protocol does not allow reading these back.
@@ -171,9 +197,9 @@ class Yoko7651:
 
     def set_voltage(self, value: float) -> None:
         """Program output voltage (auto-range via ``SAm``)."""
-        lo, hi = VOLTAGE_RANGE_V
+        lo, hi = self._voltage_limits
         if not lo <= value <= hi:
-            raise YokoError(f"voltage {value} V out of range {VOLTAGE_RANGE_V}")
+            raise YokoError(f"voltage {value} V out of range {self._voltage_limits}")
         if self._mode_cache != "V":
             self.set_mode("V")
         self._write(f"SA{value:+.6f}")
@@ -181,9 +207,9 @@ class Yoko7651:
         self._voltage_cache = value
 
     def set_current(self, value: float) -> None:
-        lo, hi = CURRENT_RANGE_A
+        lo, hi = self._current_limits
         if not lo <= value <= hi:
-            raise YokoError(f"current {value} A out of range {CURRENT_RANGE_A}")
+            raise YokoError(f"current {value} A out of range {self._current_limits}")
         if self._mode_cache != "A":
             self.set_mode("A")
         self._write(f"SA{value:+.6f}")

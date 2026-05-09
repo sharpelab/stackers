@@ -34,7 +34,9 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 
 - **Hardware**: Newport **SMC100CC** (DC servo variant of the SMC100 Series Motion Controller / Driver), single-axis. Daisy-chain capable but the lab uses a single unit currently. Variant identified from `1VE?` reply (`SMC_CC`); the PP variant would identify as `SMC_PP`.
 - **Firmware**: Controller-driver version **3.1.2**.
-- **Stage**: Newport **LTA-HS** "high-speed" linear translation actuator (DC servo + rotary encoder, ESP-compatible — the SMC100 reads `ZX=3` and pulls config straight from the stage's smart-memory chip on connect). Reported via `1ID?` as `LTA-HS_PN:B0601246985103_UD:062509`. Configured travel: software limits **−0.1 mm to +50.1 mm** (`1SL`/`1SR`), encoder unit **3.539 × 10⁻⁵ mm ≈ 35.4 nm/count** (`1SU`). Default velocity 5 mm/s (`1VA`), acceleration 20 mm/s² (`1AC`), homing velocity 2.5 mm/s (`1OH`), home-search type 4 (`1HT`).
+- **Stage**: Newport **LTA-HS** "high-speed" linear translation actuator (DC servo + rotary encoder, ESP-compatible — the SMC100 reads `ZX=3` and pulls config straight from the stage's smart-memory chip on connect). Reported via `1ID?` as `LTA-HS_PN:B0601246985103_UD:062509`. ESP-loaded soft limits **−0.1 mm to +50.1 mm** (`1SL`/`1SR`); encoder unit **3.539 × 10⁻⁵ mm ≈ 35.4 nm/count** (`1SU`). Default velocity 5 mm/s (`1VA`), acceleration 20 mm/s² (`1AC`), homing velocity 2.5 mm/s (`1OH`), home-search type 4 (`1HT`).
+- **Safe operating envelope**:
+  - **Positive cap: 30 mm (operational limit)** — must not exceed on this rig regardless of what the ESP-loaded `SR` says. The upcoming SMC100 driver/panel will take a `position_limits=` kwarg (parallel to `Yoko7651`'s `voltage_limits=`) and the air-stacker caller passes an upper bound of **30.0 mm**. The on-controller `SR` can also be tightened persistently (CONFIG mode → `1SR30` → `PW0` to save) for hardware-level enforcement; not done yet — flag for a future maintenance window since it requires resetting the controller.
 - **Connectors** (front face, photo: [`img/smc100.jpeg`](img/smc100.jpeg)): KEYPAD, **RS232C** (DB9), RS485 IN, RS485 OUT, CONFIG. Top face: MOTOR, GPIO, DC OUT, +48V power input.
 - **PC link**: RS-232C → USB-RS232 adapter (FTDI VID_0403+PID_6001, unit `FTE75V52A`) → enumerates as **COM5**. Confirmed reachable on 2026-05-08; `1VE?` returns `1VE SMC_CC - Controller-driver version  3. 1. 2`.
 - **Protocol**: ASCII over 57600 8N1; addressed commands prefixed with controller index (`1` for first/master), terminated CRLF. `1VE?` = firmware version, `1ID?` = stage ID, `1TS` = state, `1TP` = position, `1RS` = reset. Full command set in the [Command Interface Manual](../air-stacker-gui/manuals/newport-smc100-command-interface.pdf).
@@ -44,9 +46,26 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Cabling**: Newport's stock PC cable is wired DCE-style on the SMC100 end; a generic DB9 + USB-RS232 dongle (both DTE) needs a **null-modem adapter** to swap TX/RX. Current setup includes the null-modem and is working.
 - **Manuals**: [User's Manual](../air-stacker-gui/manuals/newport-smc100-user-manual.pdf) (EDH0206En2060, 02/25 — install, wiring, state machine, ESP stage configuration), [Command Interface Manual](../air-stacker-gui/manuals/newport-smc100-command-interface.pdf) (EDH0311En1023, 12/21 — `Newport.SMC100.CommandInterface.dll` reference, but the ASCII command names match what goes over RS-232).
 
-## Z stage — fine (Yokogawa 7651 + piezo, added 2026-05-08)
+## Z stage — fine (Yokogawa 7651 + NPM140, added 2026-05-08)
 
-- **Hardware**: Yokogawa **7651** programmable DC source driving the piezo stack that gives us fine Z. Sole GPIB instrument on the box.
+- **Topology**: Yokogawa 7651 → Newport **NPM140** piezoelectric micrometer adapter, **direct drive — no amplifier in the loop**. Confirmed with Albert (who installed it).
+- **Safe operating envelope**:
+  - **Negative floor: −20 V (HARD limit)** — anything below damages the piezo. The 7651 can swing to −30 V on its own, so software *must* clamp at ≥ −20 V.
+  - **Positive ceiling: +30 V** — set by the Yoko's own hardware ceiling. The NPM140 itself tolerates up to +130 V, but the Yoko can't reach it, so no overvoltage risk on the high side.
+  - Useful Yoko swing on this load: **−20 V to +30 V (50 V)**, giving roughly **47 µm of fine-Z travel** (50 V × 140 µm / 150 V per the datasheet's full −20 → +130 V → 140 µm map).
+  - `yoko.py`'s `Yoko7651` constructor takes a `voltage_limits=` kwarg; **piezo callers must pass `(-20.0, 30.0)`** so any `set_voltage` outside that range raises before hitting the bus.
+- **Piezo — Newport NPM140** ([`newport-npm140-datasheet.pdf`](../air-stacker-gui/manuals/newport-npm140-datasheet.pdf)):
+  - Travel: **140 µm ± 10 %** open-loop over the full −20 → +130 V range (we only see ~47 µm of it via the Yoko).
+  - Resolution: 0.1 nm open-loop, rms-noise-limited.
+  - Capacitance: **1.7 µF ± 20 %** — sets max dV/dt (current = C·dV/dt).
+  - Resonant frequency: 670 Hz unloaded — keep ramps well below this period to avoid mechanical ringing.
+  - Max axial load: 100 N. Stiffness: 0.4 N/µm.
+  - Variants: NPM140 (open-loop, what we have), NPM140-D (XPS-driver bundle), NPM140SG (with strain-gauge), NPM140SG-D. No strain-gauge feedback in our setup.
+  - Mounting: 0.375" (9.5 mm) shank, 22 mm setback from manual-actuator normal position.
+
+### Source — Yokogawa 7651
+
+- **Hardware**: Yokogawa **7651** programmable DC source. Sole GPIB instrument on the box.
 - **PC link**: GPIB-USB adapter (vendor TBD — surfaces to NI-VISA as `GPIB0`) → NI-VISA → resource string **`GPIB0::29::INSTR`**. GPIB primary address **29** is set on DIP switches on the back of the 7651; if those get bumped, the device disappears from `pyvisa.ResourceManager().list_resources()` until reconfigured.
 - **Currently observed (probe)**: ~+11.40 V DC, status `N` (normal), ~4 mV jitter on the readback. Probe captured on 2026-05-08 with the unit live on the piezo.
 - **Protocol — pre-SCPI Yokogawa command set** (full reference: [`yokogawa-7651-user-manual.pdf`](../air-stacker-gui/manuals/yokogawa-7651-user-manual.pdf), IM 7651-01E §6 Communication Functions):
