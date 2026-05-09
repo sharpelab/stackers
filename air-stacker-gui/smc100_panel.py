@@ -35,7 +35,7 @@ import logging
 import threading
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
@@ -43,13 +43,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
-    QWidget,
 )
 
 from smc100 import (
     DISABLE_STATES,
+    JOGGING_STATES,
     MOVING_STATES,
     NOT_REFERENCED_STATES,
     READY_STATES,
@@ -98,103 +97,6 @@ class _PollWorker(QObject):
 
     def stop(self) -> None:
         self._stop_event.set()
-
-
-class TravelBar(QWidget):
-    """Vertical travel bar with min/max ticks and a current-position marker.
-
-    Convention: low values at the top, high values at the bottom (+Y down,
-    matching the stage frame and our project-wide convention). Limits are
-    drawn as horizontal ticks; the position marker is a wider line at the
-    interpolated y.
-    """
-
-    BAR_WIDTH_PX = 6
-    TICK_LEN_PX = 8
-    MARKER_LEN_PX = 16
-
-    def __init__(self, lo: float, hi: float, units: str = "mm") -> None:
-        super().__init__()
-        if lo >= hi:
-            raise ValueError(f"lo must be < hi (got {lo}, {hi})")
-        self._lo = lo
-        self._hi = hi
-        self._units = units
-        self._position: float | None = None
-        self.setMinimumHeight(160)
-        self.setMinimumWidth(96)
-        self.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding
-        )
-
-    def set_position(self, pos: float | None) -> None:
-        self._position = pos
-        self.update()
-
-    def set_range(self, lo: float, hi: float) -> None:
-        if lo >= hi or (lo, hi) == (self._lo, self._hi):
-            return
-        self._lo = lo
-        self._hi = hi
-        self.update()
-
-    def _y_for(self, value: float, top: int, bottom: int) -> int:
-        # +Y down: lo at top, hi at bottom.
-        frac = (value - self._lo) / (self._hi - self._lo)
-        frac = max(0.0, min(1.0, frac))
-        return int(top + frac * (bottom - top))
-
-    def paintEvent(self, event) -> None:  # noqa: ARG002
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        w = self.width()
-        h = self.height()
-        if w <= 0 or h <= 0:
-            return
-
-        margin = 16
-        top = margin
-        bottom = h - margin
-        bar_x = w // 3
-        bar_w = self.BAR_WIDTH_PX
-
-        # Travel bar background.
-        painter.fillRect(bar_x, top, bar_w, bottom - top, QColor(60, 60, 60))
-
-        # Min/max ticks + labels.
-        tick_pen = QPen(QColor(180, 180, 180))
-        tick_pen.setWidthF(1.0)
-        painter.setPen(tick_pen)
-        painter.drawLine(
-            bar_x - self.TICK_LEN_PX,
-            top,
-            bar_x + bar_w + self.TICK_LEN_PX,
-            top,
-        )
-        painter.drawLine(
-            bar_x - self.TICK_LEN_PX,
-            bottom,
-            bar_x + bar_w + self.TICK_LEN_PX,
-            bottom,
-        )
-        label_x = bar_x + bar_w + self.TICK_LEN_PX + 4
-        painter.drawText(label_x, top + 4, f"{self._lo:.1f} {self._units}")
-        painter.drawText(label_x, bottom + 4, f"{self._hi:.1f} {self._units}")
-
-        # Position marker.
-        if self._position is not None:
-            pos_y = self._y_for(self._position, top, bottom)
-            in_range = self._lo <= self._position <= self._hi
-            color = QColor(80, 200, 120) if in_range else QColor(220, 100, 100)
-            marker_pen = QPen(color)
-            marker_pen.setWidthF(2.5)
-            painter.setPen(marker_pen)
-            painter.drawLine(
-                bar_x - self.MARKER_LEN_PX,
-                pos_y,
-                bar_x + bar_w + self.MARKER_LEN_PX,
-                pos_y,
-            )
 
 
 class SMC100Panel(QGroupBox):
@@ -246,10 +148,6 @@ class SMC100Panel(QGroupBox):
         pos_font.setFamily("monospace")
         self.position_label.setFont(pos_font)
 
-        # Travel bar — placeholder range until open() succeeds.
-        bar_lo, bar_hi = position_limits if position_limits else (0.0, 1.0)
-        self.travel_bar = TravelBar(bar_lo, bar_hi, units=self.units)
-
         self.target_spin = QDoubleSpinBox()
         self.target_spin.setKeyboardTracking(False)
         self.target_spin.setDecimals(3)
@@ -281,6 +179,9 @@ class SMC100Panel(QGroupBox):
         self.enable_btn = QPushButton("Enable")
         self.disable_btn = QPushButton("Disable")
         self.reset_btn = QPushButton("Reset")
+        # Escape hatch out of JOGGING state. Sends JM0 (silence keypad)
+        # then JD (leave JOGGING). Both transient — no flash writes.
+        self.leave_jog_btn = QPushButton("Leave jog")
 
         self.stop_btn = QPushButton("STOP")
         self.stop_btn.setStyleSheet(
@@ -366,14 +267,7 @@ class SMC100Panel(QGroupBox):
         sep1.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep1)
 
-        # Position + travel bar side-by-side.
-        pos_row = QHBoxLayout()
-        pos_col = QVBoxLayout()
-        pos_col.addWidget(self.position_label)
-        pos_col.addStretch(1)
-        pos_row.addLayout(pos_col, stretch=1)
-        pos_row.addWidget(self.travel_bar)
-        outer.addLayout(pos_row)
+        outer.addWidget(self.position_label)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -405,6 +299,7 @@ class SMC100Panel(QGroupBox):
         action_row.addWidget(self.reset_btn)
         outer.addLayout(action_row)
 
+        outer.addWidget(self.leave_jog_btn)
         outer.addWidget(self.stop_btn)
         outer.addStretch(1)
 
@@ -424,14 +319,14 @@ class SMC100Panel(QGroupBox):
         self.enable_btn.clicked.connect(lambda: self._safe(self.axis.enable))
         self.disable_btn.clicked.connect(lambda: self._safe(self.axis.disable))
         self.reset_btn.clicked.connect(lambda: self._safe(self.axis.reset))
+        self.leave_jog_btn.clicked.connect(self._on_leave_jog)
 
         self.stop_btn.clicked.connect(lambda: self._safe(self.axis.stop))
 
     def _apply_limits(self, limits: tuple[float, float]) -> None:
-        """Tighten the spin ranges and travel bar to the effective limits."""
+        """Tighten the target spinner range to the effective software clamp."""
         lo, hi = limits
         self.target_spin.setRange(lo, hi)
-        self.travel_bar.set_range(lo, hi)
 
     # --- click handlers (GUI thread) ----------------------------------------
 
@@ -478,10 +373,25 @@ class SMC100Panel(QGroupBox):
     def _on_set_velocity(self) -> None:
         self._safe(self.axis.set_velocity, self.velocity_spin.value())
 
+    def _on_leave_jog(self) -> None:
+        # JM0 first to silence the keypad (transient — reverts to JM1 on
+        # next boot), then JD to leave JOGGING. Done as a single try-block
+        # so we surface whichever step failed and keep the order semantic.
+        log.info("smc100: leave-jog — sending JM0 then JD")
+        try:
+            self.axis.disable_keypad()
+            self.axis.leave_jog()
+        except Exception as e:  # noqa: BLE001
+            log.exception("smc100: leave-jog failed")
+            self.status_label.setText(f"leave jog err: {e}")
+
     def _safe(self, fn, *args) -> None:
+        name = getattr(fn, "__name__", repr(fn))
+        log.info("smc100: %s(%s)", name, args if args else "")
         try:
             fn(*args)
         except Exception as e:  # noqa: BLE001
+            log.exception("smc100: %s failed", name)
             self.status_label.setText(f"err: {e}")
 
     # --- worker / state plumbing --------------------------------------------
@@ -513,17 +423,15 @@ class SMC100Panel(QGroupBox):
             self.status_label.setText(f"poll err: {payload['_worker_err']}")
             return
 
-        # Position readout + travel bar.
+        # Position readout.
         if "pos" in payload:
             pos = payload["pos"]
             text = f"{pos:.3f} {self.units}"
             if "setpoint" in payload:
                 text += f"  →  {payload['setpoint']:.3f}"
             self.position_label.setText(text)
-            self.travel_bar.set_position(pos)
         elif "pos_err" in payload:
             self.position_label.setText(f"pos err: {payload['pos_err']}")
-            self.travel_bar.set_position(None)
 
         # State + error.
         if "state_code" in payload:
@@ -551,14 +459,15 @@ class SMC100Panel(QGroupBox):
     def _refresh_button_enables(self, state_code: str) -> None:
         """Grey out commands the controller would reject in the current state.
 
-        Stop is always live. Reset works from anywhere except CONFIG; we
-        leave it always-enabled. Home only works from NOT REFERENCED. Move
-        commands and velocity edits only in READY. Enable from DISABLE,
-        Disable from READY.
+        Stop and Reset stay live whenever the controller is responding.
+        Leave-jog only when in JOGGING. Home only from NOT REFERENCED.
+        Move commands and velocity edits only in READY. Enable from
+        DISABLE, Disable from READY.
         """
         in_ready = state_code in READY_STATES
         in_disable = state_code in DISABLE_STATES
         in_not_ref = state_code in NOT_REFERENCED_STATES
+        in_jogging = state_code in JOGGING_STATES
 
         self.go_btn.setEnabled(in_ready)
         self.jog_minus_btn.setEnabled(in_ready)
@@ -569,6 +478,7 @@ class SMC100Panel(QGroupBox):
         self.home_btn.setEnabled(in_not_ref)
         self.enable_btn.setEnabled(in_disable)
         self.disable_btn.setEnabled(in_ready)
+        self.leave_jog_btn.setEnabled(in_jogging)
         # Stop and Reset are always live as long as the controller is
         # responding — Stop is the panic button, Reset works from any
         # state except CONFIGURATION (and we don't expose CONFIG-mode here).
@@ -590,6 +500,7 @@ class SMC100Panel(QGroupBox):
             self.enable_btn,
             self.disable_btn,
             self.reset_btn,
+            self.leave_jog_btn,
             self.stop_btn,
         ):
             btn.setEnabled(enabled)

@@ -37,7 +37,7 @@ import logging
 import threading
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
     QDoubleSpinBox,
@@ -46,9 +46,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QSizePolicy,
     QVBoxLayout,
-    QWidget,
 )
 
 from yoko import VOLTAGE_RANGE_V, Yoko7651, YokoError
@@ -169,101 +167,6 @@ class _RampWorker(QObject):
             self.finished.emit({"err": str(e)})
 
 
-class TravelBar(QWidget):
-    """Vertical travel bar with min/max ticks and a current-position marker.
-
-    Same shape as the bar in ``smc100_panel.py`` — duplicated here rather
-    than extracted to a shared module. If a third caller appears we should
-    refactor; for two callers a 50-line dup is fine.
-
-    Convention: low values at the top, high values at the bottom (+Y down,
-    matches the project-wide stage-frame convention).
-    """
-
-    BAR_WIDTH_PX = 6
-    TICK_LEN_PX = 8
-    MARKER_LEN_PX = 16
-
-    def __init__(self, lo: float, hi: float, units: str = "V") -> None:
-        super().__init__()
-        if lo >= hi:
-            raise ValueError(f"lo must be < hi (got {lo}, {hi})")
-        self._lo = lo
-        self._hi = hi
-        self._units = units
-        self._position: float | None = None
-        self.setMinimumHeight(160)
-        self.setMinimumWidth(96)
-        self.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.MinimumExpanding
-        )
-
-    def set_position(self, pos: float | None) -> None:
-        self._position = pos
-        self.update()
-
-    def set_range(self, lo: float, hi: float) -> None:
-        if lo >= hi or (lo, hi) == (self._lo, self._hi):
-            return
-        self._lo = lo
-        self._hi = hi
-        self.update()
-
-    def _y_for(self, value: float, top: int, bottom: int) -> int:
-        frac = (value - self._lo) / (self._hi - self._lo)
-        frac = max(0.0, min(1.0, frac))
-        return int(top + frac * (bottom - top))
-
-    def paintEvent(self, event) -> None:  # noqa: ARG002
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-        w = self.width()
-        h = self.height()
-        if w <= 0 or h <= 0:
-            return
-
-        margin = 16
-        top = margin
-        bottom = h - margin
-        bar_x = w // 3
-        bar_w = self.BAR_WIDTH_PX
-
-        painter.fillRect(bar_x, top, bar_w, bottom - top, QColor(60, 60, 60))
-
-        tick_pen = QPen(QColor(180, 180, 180))
-        tick_pen.setWidthF(1.0)
-        painter.setPen(tick_pen)
-        painter.drawLine(
-            bar_x - self.TICK_LEN_PX,
-            top,
-            bar_x + bar_w + self.TICK_LEN_PX,
-            top,
-        )
-        painter.drawLine(
-            bar_x - self.TICK_LEN_PX,
-            bottom,
-            bar_x + bar_w + self.TICK_LEN_PX,
-            bottom,
-        )
-        label_x = bar_x + bar_w + self.TICK_LEN_PX + 4
-        painter.drawText(label_x, top + 4, f"{self._lo:.1f} {self._units}")
-        painter.drawText(label_x, bottom + 4, f"{self._hi:.1f} {self._units}")
-
-        if self._position is not None:
-            pos_y = self._y_for(self._position, top, bottom)
-            in_range = self._lo <= self._position <= self._hi
-            color = QColor(80, 200, 120) if in_range else QColor(220, 100, 100)
-            marker_pen = QPen(color)
-            marker_pen.setWidthF(2.5)
-            painter.setPen(marker_pen)
-            painter.drawLine(
-                bar_x - self.MARKER_LEN_PX,
-                pos_y,
-                bar_x + bar_w + self.MARKER_LEN_PX,
-                pos_y,
-            )
-
-
 class YokoPanel(QGroupBox):
     """Live readout + control surface for a Yokogawa 7651 driving a piezo."""
 
@@ -329,8 +232,6 @@ class YokoPanel(QGroupBox):
         self.voltage_label.setFont(v_font)
         self.travel_label = QLabel("")
         self.travel_label.setStyleSheet("color: #888;")
-
-        self.travel_bar = TravelBar(voltage_limits[0], voltage_limits[1], "V")
 
         # Set (single shot, no ramp) — for fine adjustments only. Ramp is
         # the path for any non-trivial change.
@@ -414,15 +315,8 @@ class YokoPanel(QGroupBox):
         sep1.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep1)
 
-        # Voltage readout + travel bar side-by-side.
-        readout_row = QHBoxLayout()
-        readout_col = QVBoxLayout()
-        readout_col.addWidget(self.voltage_label)
-        readout_col.addWidget(self.travel_label)
-        readout_col.addStretch(1)
-        readout_row.addLayout(readout_col, stretch=1)
-        readout_row.addWidget(self.travel_bar)
-        outer.addLayout(readout_row)
+        outer.addWidget(self.voltage_label)
+        outer.addWidget(self.travel_label)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -544,7 +438,6 @@ class YokoPanel(QGroupBox):
             return
         if "od_err" in payload:
             self.voltage_label.setText(f"od err: {payload['od_err']}")
-            self.travel_bar.set_position(None)
             return
 
         value = payload["value"]
@@ -561,12 +454,10 @@ class YokoPanel(QGroupBox):
             self.voltage_label.setText(f"{value:+.3f} V")
             travel_um = value * self._nm_per_volt / 1000.0
             self.travel_label.setText(f"≈ {travel_um:+.2f} µm extension")
-            self.travel_bar.set_position(value)
         else:
             # Current mode — surface it but don't try to map to µm.
             self.voltage_label.setText(f"{value:+.6f} A (current mode)")
             self.travel_label.setText("")
-            self.travel_bar.set_position(None)
 
         if status == "E":
             self.overload_label.setText("OVERLOAD")

@@ -345,6 +345,30 @@ class SMC100Axis:
         """``RS`` — reset controller. Returns to NOT REFERENCED (reset)."""
         self.send("RS")
 
+    def disable_keypad(self) -> None:
+        """``JM0`` — disable the external keypad input (transient).
+
+        Outside of CONFIGURATION state this only applies for the current
+        session — the controller reverts to the JM1 default on next boot.
+        Useful for silencing a stuck/floating KEYPAD-connector signal so
+        :meth:`leave_jog` can succeed.
+        """
+        self.send("JM0")
+
+    def enable_keypad(self) -> None:
+        """``JM1`` — re-enable the external keypad input (transient)."""
+        self.send("JM1")
+
+    def leave_jog(self) -> None:
+        """``JD`` — leave JOGGING state (back to READY).
+
+        Per the manual, JD only succeeds when no jog button is currently
+        pressed and stage velocity is zero. Pair with :meth:`disable_keypad`
+        first if a stuck/floating keypad signal is keeping the controller
+        in JOGGING.
+        """
+        self.send("JD")
+
     def set_velocity(self, value: float) -> None:
         """``VA<value>`` — set max velocity (transient; not saved to flash)."""
         if value <= 0:
