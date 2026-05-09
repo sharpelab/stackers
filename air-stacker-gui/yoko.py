@@ -48,6 +48,11 @@ _OD_RE = re.compile(
     r"^(?P<status>[NE])DC(?P<func>[VA])(?P<value>[+-]?\d+\.?\d*E[+-]?\d+)\s*$"
 )
 
+# OC; reply parser — per IM 7651-01E §6.3(18). "STS1=<n>" where n in 0..255
+# is a bitfield (bits numbered 1..8 in the manual; we expose them as named
+# booleans on StatusByte).
+_OC_RE = re.compile(r"^STS1=(?P<value>\d+)\s*$")
+
 
 class YokoError(RuntimeError):
     pass
@@ -72,6 +77,51 @@ class OutputReading:
     @property
     def status_label(self) -> str:
         return STATUS_LABEL.get(self.status, self.status)
+
+
+@dataclass(frozen=True)
+class StatusByte:
+    """Decoded OC; reply — per IM 7651-01E §6.3(18) Table.
+
+    The unit returns ``STS1=<n>`` with ``<n>`` in 0..255. Bits are numbered
+    1..8 in the manual (LSB-first); we expose each as a named boolean.
+    The most useful one for debugging is ``last_cmd_err``: query OC; right
+    after a write to verify the unit accepted it.
+    """
+
+    raw: int
+
+    @property
+    def program_setting(self) -> bool:
+        return bool(self.raw & (1 << 0))  # bit 1
+
+    @property
+    def program_running(self) -> bool:
+        return bool(self.raw & (1 << 1))  # bit 2
+
+    @property
+    def last_cmd_err(self) -> bool:
+        return bool(self.raw & (1 << 2))  # bit 3
+
+    @property
+    def output_unstable(self) -> bool:
+        return bool(self.raw & (1 << 3))  # bit 4
+
+    @property
+    def output_on(self) -> bool:
+        return bool(self.raw & (1 << 4))  # bit 5
+
+    @property
+    def cal_mode(self) -> bool:
+        return bool(self.raw & (1 << 5))  # bit 6
+
+    @property
+    def ic_card_in(self) -> bool:
+        return bool(self.raw & (1 << 6))  # bit 7
+
+    @property
+    def cal_switch(self) -> bool:
+        return bool(self.raw & (1 << 7))  # bit 8
 
 
 class Yoko7651:
@@ -188,11 +238,36 @@ class Yoko7651:
             value=float(m["value"]),
         )
 
+    def read_status_code(self) -> StatusByte:
+        """Read the ``OC;`` status byte. Non-perturbing.
+
+        ``StatusByte.last_cmd_err`` is the most useful field — query OC;
+        right after a write to verify the unit parsed and accepted the
+        previous command.
+        """
+        resp = self._query("OC")
+        m = _OC_RE.match(resp)
+        if not m:
+            raise YokoError(f"unexpected OC reply: {resp!r}")
+        return StatusByte(raw=int(m["value"]))
+
+    def read_panel_settings(self) -> str:
+        """Read the ``OS;`` panel-setting summary. Returns the raw reply.
+
+        Per IM 7651-01E §6.3(15). Format isn't fully documented here —
+        callers print/log it for visual inspection.
+        """
+        return self._query("OS")
+
     # --- set commands (write-only on bus; cached in software) ---------------
+    #
+    # Setting commands (function/range/output-data/output-on-off) buffer at
+    # the unit and need an ``E;`` trigger to apply. We coalesce ``cmd;E`` into
+    # a single bus write so a parallel ``OD;`` query from the poll thread
+    # can't slip in between the queued setting and its trigger.
 
     def set_mode(self, mode: Literal["V", "A"]) -> None:
-        self._write(FUNC_VOLTAGE if mode == "V" else FUNC_CURRENT)
-        self.trigger()
+        self._write((FUNC_VOLTAGE if mode == "V" else FUNC_CURRENT) + ";E")
         self._mode_cache = mode
 
     def set_voltage(self, value: float) -> None:
@@ -202,8 +277,7 @@ class Yoko7651:
             raise YokoError(f"voltage {value} V out of range {self._voltage_limits}")
         if self._mode_cache != "V":
             self.set_mode("V")
-        self._write(f"SA{value:+.6f}")
-        self.trigger()
+        self._write(f"SA{value:+.6f};E")
         self._voltage_cache = value
 
     def set_current(self, value: float) -> None:
@@ -212,13 +286,11 @@ class Yoko7651:
             raise YokoError(f"current {value} A out of range {self._current_limits}")
         if self._mode_cache != "A":
             self.set_mode("A")
-        self._write(f"SA{value:+.6f}")
-        self.trigger()
+        self._write(f"SA{value:+.6f};E")
         self._current_cache = value
 
     def set_output(self, on: bool) -> None:
-        self._write("O1" if on else "O0")
-        self.trigger()
+        self._write(("O1" if on else "O0") + ";E")
         self._output_cache = on
 
     def reset(self) -> None:
