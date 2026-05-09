@@ -49,7 +49,7 @@ from superqt import QRangeSlider
 from conex import ConexAxis, error_label, state_label
 from heater import OmegaPlatinum
 
-import tomllib
+import tomlkit
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "icons" / "air_stacker.ico"
@@ -75,8 +75,7 @@ def configure_logging(verbose: int) -> None:
 def load_config() -> dict:
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"missing config: {CONFIG_PATH}")
-    with CONFIG_PATH.open("rb") as f:
-        return tomllib.load(f)
+    return tomlkit.parse(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
 @contextlib.contextmanager
