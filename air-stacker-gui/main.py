@@ -267,6 +267,66 @@ class ImageAdjustments:
 DEFAULT_ADJUSTMENTS = AdjustmentSnapshot()
 
 
+@dataclass(frozen=True)
+class CameraSettingsSnapshot:
+    """Immutable snapshot of CameraOptionsPanel state for a preset.
+
+    Manual fields (gain, exposure_us, balance_ratio_red, balance_ratio_blue)
+    are None when the corresponding auto enum is "Continuous" at capture
+    time. Applying a snapshot writes the auto enum and leaves the
+    camera's auto-controlled value alone — the live poll keeps the
+    spinbox in sync with whatever auto picks.
+
+    auto enums use the camera's symbolic strings ("Off" | "Continuous").
+    binning_vertical is always populated.
+    """
+
+    gain_auto: str
+    exposure_auto: str
+    balance_white_auto: str
+    binning_vertical: int
+    gain: float | None = None
+    exposure_us: float | None = None
+    balance_ratio_red: float | None = None
+    balance_ratio_blue: float | None = None
+
+
+def default_camera_snapshot(merged: dict) -> CameraSettingsSnapshot:
+    """Snapshot derived from CameraOptionsPanel.OUR_DEFAULTS (merged with
+    any [camera] gain / exposure_us overrides from config.toml).
+
+    Manual fields are populated only when their auto enum is not
+    "Continuous", matching the Continuous→None invariant other snapshots
+    obey.
+    """
+    return CameraSettingsSnapshot(
+        gain_auto=str(merged["GainAuto"]),
+        exposure_auto=str(merged["ExposureAuto"]),
+        balance_white_auto=str(merged["BalanceWhiteAuto"]),
+        binning_vertical=int(merged["BinningVertical"]),
+        gain=(
+            float(merged["Gain"])
+            if merged["GainAuto"] != "Continuous"
+            else None
+        ),
+        exposure_us=(
+            float(merged["ExposureTime"])
+            if merged["ExposureAuto"] != "Continuous"
+            else None
+        ),
+        balance_ratio_red=(
+            float(merged["BalanceRatioRed"])
+            if merged["BalanceWhiteAuto"] != "Continuous"
+            else None
+        ),
+        balance_ratio_blue=(
+            float(merged["BalanceRatioBlue"])
+            if merged["BalanceWhiteAuto"] != "Continuous"
+            else None
+        ),
+    )
+
+
 def _coerce_pair(v) -> tuple[int, int]:
     lo, hi = v
     return (int(lo), int(hi))
@@ -332,6 +392,98 @@ class ImagePresetStore:
                 t["b_range"] = list(snap.b_range)
                 new_aot.append(t)
             doc["image_preset"] = new_aot
+
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        tmp.replace(self._path)
+
+
+class CameraPresetStore:
+    """Round-trips user-created [[camera_preset]] entries to/from config.toml.
+
+    "Default" is hardcoded (derived from OUR_DEFAULTS + [camera] overrides)
+    and never stored — only user presets live in the file. Saves rewrite
+    the camera_preset array-of-tables wholesale via tomlkit, leaving every
+    other section (and its comments) untouched.
+
+    Manual-value fields (gain, exposure_us, balance_ratio_*) are written
+    as TOML keys when present and omitted when None — i.e. when the
+    corresponding auto enum is "Continuous" at save-time.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def load(self) -> dict[str, CameraSettingsSnapshot]:
+        if not self._path.exists():
+            return {}
+        doc = tomlkit.parse(self._path.read_text(encoding="utf-8"))
+        out: dict[str, CameraSettingsSnapshot] = {}
+        for entry in doc.get("camera_preset", []):
+            try:
+                name = str(entry["name"])
+                if not name.strip() or name == "Default":
+                    log.warning("skipping invalid camera preset name: %r", name)
+                    continue
+                if name in out:
+                    log.warning("skipping duplicate camera preset name: %r", name)
+                    continue
+                out[name] = CameraSettingsSnapshot(
+                    gain_auto=str(entry["gain_auto"]),
+                    exposure_auto=str(entry["exposure_auto"]),
+                    balance_white_auto=str(entry["balance_white_auto"]),
+                    binning_vertical=int(entry["binning_vertical"]),
+                    gain=(
+                        float(entry["gain"]) if "gain" in entry else None
+                    ),
+                    exposure_us=(
+                        float(entry["exposure_us"])
+                        if "exposure_us" in entry
+                        else None
+                    ),
+                    balance_ratio_red=(
+                        float(entry["balance_ratio_red"])
+                        if "balance_ratio_red" in entry
+                        else None
+                    ),
+                    balance_ratio_blue=(
+                        float(entry["balance_ratio_blue"])
+                        if "balance_ratio_blue" in entry
+                        else None
+                    ),
+                )
+            except (KeyError, TypeError, ValueError) as e:
+                log.warning("skipping malformed camera_preset entry: %s", e)
+        return out
+
+    def save_all(self, presets: dict[str, CameraSettingsSnapshot]) -> None:
+        if self._path.exists():
+            doc = tomlkit.parse(self._path.read_text(encoding="utf-8"))
+        else:
+            doc = tomlkit.document()
+
+        if "camera_preset" in doc:
+            del doc["camera_preset"]
+
+        if presets:
+            new_aot = tomlkit.aot()
+            for name, snap in presets.items():
+                t = tomlkit.table()
+                t["name"] = name
+                t["gain_auto"] = snap.gain_auto
+                t["exposure_auto"] = snap.exposure_auto
+                t["balance_white_auto"] = snap.balance_white_auto
+                t["binning_vertical"] = snap.binning_vertical
+                if snap.gain is not None:
+                    t["gain"] = snap.gain
+                if snap.exposure_us is not None:
+                    t["exposure_us"] = snap.exposure_us
+                if snap.balance_ratio_red is not None:
+                    t["balance_ratio_red"] = snap.balance_ratio_red
+                if snap.balance_ratio_blue is not None:
+                    t["balance_ratio_blue"] = snap.balance_ratio_blue
+                new_aot.append(t)
+            doc["camera_preset"] = new_aot
 
         tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         tmp.write_text(tomlkit.dumps(doc), encoding="utf-8")
@@ -1303,7 +1455,9 @@ class CameraOptionsPanel(QGroupBox):
         (2, "2× (800×600)"),
     )
 
-    def __init__(self, cam, defaults: dict) -> None:
+    def __init__(
+        self, cam, defaults: dict, store: CameraPresetStore
+    ) -> None:
         super().__init__("Camera Options")
         self._cam = cam
         self._nm = cam.GetNodeMap()
@@ -1320,6 +1474,13 @@ class CameraOptionsPanel(QGroupBox):
             self._defaults["Gain"] = float(defaults["gain"])
         if defaults.get("exposure_us") is not None:
             self._defaults["ExposureTime"] = float(defaults["exposure_us"])
+
+        self._store = store
+        self._presets: dict[str, CameraSettingsSnapshot] = store.load()
+        self._loaded_preset_name: str = "Default"
+        self._loaded_snapshot: CameraSettingsSnapshot = default_camera_snapshot(
+            self._defaults
+        )
 
         self.gain_spin = QDoubleSpinBox()
         self.gain_spin.setKeyboardTracking(False)
@@ -1347,9 +1508,30 @@ class CameraOptionsPanel(QGroupBox):
         self.binning_combo = QComboBox()
         self._populate_binning_combo()
 
-        self.defaults_btn = QPushButton("Defaults")
+        self.preset_combo = _PresetCombo(self._refresh_preset_ui)
+        self.preset_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.preset_combo.setMinimumContentsLength(14)
+        self.preset_combo.setMaximumWidth(160)
+        self.preset_combo.addItem("Default", "Default")
+        for name in self._presets:
+            self.preset_combo.addItem(name, name)
+
+        self.preset_new_btn = QPushButton("+")
+        self.preset_save_btn = QPushButton("💾")
+        self.preset_delete_btn = QPushButton("🗑")
+        for b in (self.preset_new_btn, self.preset_save_btn, self.preset_delete_btn):
+            b.setFixedSize(28, 28)
 
         outer = QVBoxLayout(self)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(self.preset_combo, stretch=1)
+        preset_row.addWidget(self.preset_new_btn)
+        preset_row.addWidget(self.preset_save_btn)
+        preset_row.addWidget(self.preset_delete_btn)
+        outer.addLayout(preset_row)
+
         for label, spin, auto in (
             ("Gain:", self.gain_spin, self.gain_auto),
             ("Exposure:", self.exp_spin, self.exp_auto),
@@ -1374,8 +1556,6 @@ class CameraOptionsPanel(QGroupBox):
         binning_row.addWidget(self.binning_combo, stretch=1)
         outer.addLayout(binning_row)
 
-        outer.addWidget(self.defaults_btn)
-
         self._setup_range_float("Gain", self.gain_spin)
         # Exposure spinbox is in ms; the camera reports ExposureTime in µs.
         # Set a fixed range up to MAX_EXPOSURE_MS — writes are clamped to
@@ -1390,25 +1570,21 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_red_spin.setRange(lo, hi)
         self.wb_blue_spin.setRange(lo, hi)
 
-        self._apply_defaults()
+        self._apply_snapshot(self._loaded_snapshot)
 
-        self.gain_spin.editingFinished.connect(
-            lambda: self._set_float("Gain", self.gain_spin.value())
-        )
-        self.exp_spin.editingFinished.connect(
-            lambda: self._set_exposure_us(self.exp_spin.value() * 1000.0)
-        )
+        self.gain_spin.editingFinished.connect(self._on_gain_edited)
+        self.exp_spin.editingFinished.connect(self._on_exp_edited)
         self.gain_auto.toggled.connect(self._on_gain_auto_toggled)
         self.exp_auto.toggled.connect(self._on_exp_auto_toggled)
         self.wb_auto.toggled.connect(self._on_wb_auto_toggled)
-        self.wb_red_spin.editingFinished.connect(
-            lambda: self._set_balance_ratio("Red", self.wb_red_spin.value())
-        )
-        self.wb_blue_spin.editingFinished.connect(
-            lambda: self._set_balance_ratio("Blue", self.wb_blue_spin.value())
-        )
+        self.wb_red_spin.editingFinished.connect(self._on_wb_red_edited)
+        self.wb_blue_spin.editingFinished.connect(self._on_wb_blue_edited)
         self.binning_combo.activated.connect(self._on_binning_activated)
-        self.defaults_btn.clicked.connect(self._apply_defaults)
+        self.preset_combo.activated.connect(self._on_preset_activated)
+        self.preset_new_btn.clicked.connect(self._on_preset_new)
+        self.preset_save_btn.clicked.connect(self._on_preset_save)
+        self.preset_delete_btn.clicked.connect(self._on_preset_delete)
+        self._refresh_preset_ui()
 
         # Worker-thread poll so the spinboxes track camera-driven values
         # (auto gain / auto exposure / auto WB) live. The slot ignores
@@ -1451,6 +1627,7 @@ class CameraOptionsPanel(QGroupBox):
         # via binning_change_complete() once workers are back up.
         self.binning_combo.setEnabled(False)
         self.binning_change_requested.emit(int(value))
+        self._refresh_preset_ui()
 
     def binning_change_complete(self, applied_value: int) -> None:
         """Re-enable the combo and sync its index to whatever actually got
@@ -1463,6 +1640,7 @@ class CameraOptionsPanel(QGroupBox):
             self.binning_combo.setCurrentIndex(idx)
             self.binning_combo.blockSignals(False)
         self.binning_combo.setEnabled(self.binning_combo.count() > 1)
+        self._refresh_preset_ui()
 
     def _setup_range_float(self, name: str, spin: QDoubleSpinBox) -> None:
         rng = _node_float_range(self._nm, name)
@@ -1484,6 +1662,7 @@ class CameraOptionsPanel(QGroupBox):
             v = _node_float_get(self._nm, "Gain")
             if v is not None:
                 self.gain_spin.setValue(v)
+        self._refresh_preset_ui()
 
     def _on_exp_auto_toggled(self, on: bool) -> None:
         self._set_enum("ExposureAuto", "Continuous" if on else "Off")
@@ -1493,6 +1672,7 @@ class CameraOptionsPanel(QGroupBox):
             v = _node_float_get(self._nm, "ExposureTime")
             if v is not None:
                 self.exp_spin.setValue(v / 1000.0)
+        self._refresh_preset_ui()
 
     def _on_wb_auto_toggled(self, on: bool) -> None:
         self._set_enum("BalanceWhiteAuto", "Continuous" if on else "Off")
@@ -1506,6 +1686,23 @@ class CameraOptionsPanel(QGroupBox):
                     v = _node_float_get(self._nm, "BalanceRatio")
                 if v is not None:
                     spin.setValue(v)
+        self._refresh_preset_ui()
+
+    def _on_gain_edited(self) -> None:
+        self._set_float("Gain", self.gain_spin.value())
+        self._refresh_preset_ui()
+
+    def _on_exp_edited(self) -> None:
+        self._set_exposure_us(self.exp_spin.value() * 1000.0)
+        self._refresh_preset_ui()
+
+    def _on_wb_red_edited(self) -> None:
+        self._set_balance_ratio("Red", self.wb_red_spin.value())
+        self._refresh_preset_ui()
+
+    def _on_wb_blue_edited(self) -> None:
+        self._set_balance_ratio("Blue", self.wb_blue_spin.value())
+        self._refresh_preset_ui()
 
     def _set_balance_ratio(self, color: str, value: float) -> None:
         if self.wb_auto.isChecked():
@@ -1533,24 +1730,44 @@ class CameraOptionsPanel(QGroupBox):
         if rng is not None:
             _node_float_set(self._nm, "AcquisitionFrameRate", rng[1])
 
-    def _apply_defaults(self) -> None:
-        """Push OUR_DEFAULTS to the camera and sync the widgets. Used at
-        startup and by the Defaults button."""
-        d = self._defaults
-        self._set_enum("GainAuto", d["GainAuto"])
-        self._set_enum("ExposureAuto", d["ExposureAuto"])
-        self._set_enum("BalanceWhiteAuto", d["BalanceWhiteAuto"])
-        self._set_float("Gain", d["Gain"])
-        self._set_exposure_us(float(d["ExposureTime"]))
+    def _apply_snapshot(self, snap: CameraSettingsSnapshot) -> None:
+        """Push a snapshot to the camera and sync the widgets.
+
+        Manual fields (gain, exposure_us, balance_ratio_*) that are None
+        are skipped — only the matching auto enum is written, and the
+        spinbox is left where it is. The live poll catches the spinbox
+        up to whatever auto picks within ~200 ms.
+
+        Order: auto enums first, then manual values (inline), then widget
+        sync, then the binning swap (which routes through
+        binning_change_requested → CameraWindow's worker-chain restart).
+        Inline-then-bin matches what _apply_defaults did before.
+        """
+        # Auto enums first so a "manual → continuous" transition writes
+        # the new mode before any inline manual write becomes inactive.
+        self._set_enum("GainAuto", snap.gain_auto)
+        self._set_enum("ExposureAuto", snap.exposure_auto)
+        self._set_enum("BalanceWhiteAuto", snap.balance_white_auto)
+
+        if snap.gain is not None:
+            self._set_float("Gain", float(snap.gain))
+        if snap.exposure_us is not None:
+            self._set_exposure_us(float(snap.exposure_us))
         # WB ratios are only writable while BalanceWhiteAuto is Off.
-        if d["BalanceWhiteAuto"] != "Continuous":
-            for color, key in (("Red", "BalanceRatioRed"), ("Blue", "BalanceRatioBlue")):
+        if snap.balance_white_auto != "Continuous":
+            for color, value in (
+                ("Red", snap.balance_ratio_red),
+                ("Blue", snap.balance_ratio_blue),
+            ):
+                if value is None:
+                    continue
                 with self._wb_lock:
                     if _node_enum_set(self._nm, "BalanceRatioSelector", color):
-                        _node_float_set(self._nm, "BalanceRatio", float(d[key]))
-        gain_auto_on = d["GainAuto"] == "Continuous"
-        exp_auto_on = d["ExposureAuto"] == "Continuous"
-        wb_auto_on = d["BalanceWhiteAuto"] == "Continuous"
+                        _node_float_set(self._nm, "BalanceRatio", float(value))
+
+        gain_auto_on = snap.gain_auto == "Continuous"
+        exp_auto_on = snap.exposure_auto == "Continuous"
+        wb_auto_on = snap.balance_white_auto == "Continuous"
         # blockSignals so toggling these from code doesn't re-trigger the
         # auto-toggled handlers (which would do redundant writes).
         for cb, on in (
@@ -1565,17 +1782,21 @@ class CameraOptionsPanel(QGroupBox):
         self.exp_spin.setEnabled(not exp_auto_on)
         self.wb_red_spin.setEnabled(not wb_auto_on)
         self.wb_blue_spin.setEnabled(not wb_auto_on)
-        self.gain_spin.setValue(float(d["Gain"]))
-        # Spinbox is ms; OUR_DEFAULTS stores µs.
-        self.exp_spin.setValue(float(d["ExposureTime"]) / 1000.0)
-        self.wb_red_spin.setValue(float(d["BalanceRatioRed"]))
-        self.wb_blue_spin.setValue(float(d["BalanceRatioBlue"]))
+        if snap.gain is not None:
+            self.gain_spin.setValue(float(snap.gain))
+        if snap.exposure_us is not None:
+            # Spinbox is ms; snapshot stores µs.
+            self.exp_spin.setValue(float(snap.exposure_us) / 1000.0)
+        if snap.balance_ratio_red is not None:
+            self.wb_red_spin.setValue(float(snap.balance_ratio_red))
+        if snap.balance_ratio_blue is not None:
+            self.wb_blue_spin.setValue(float(snap.balance_ratio_blue))
 
         # Binning is a separate flow because the swap requires
         # EndAcquisition / BeginAcquisition. Only kick the restart if
         # we'd actually change the value — and only if the dropdown is
         # enabled (i.e. the camera supports more than one binning level).
-        target_bin = int(d["BinningVertical"])
+        target_bin = snap.binning_vertical
         current_bin = _node_int_get(self._nm, "BinningVertical")
         if (
             self.binning_combo.isEnabled()
@@ -1584,6 +1805,168 @@ class CameraOptionsPanel(QGroupBox):
         ):
             self.binning_combo.setEnabled(False)
             self.binning_change_requested.emit(target_bin)
+
+    def _current_snapshot(self) -> CameraSettingsSnapshot:
+        """Snapshot the current widget state. Manual fields go to None when
+        the corresponding auto checkbox is on — matching what gets written
+        to TOML on save and what _apply_snapshot leaves alone on load."""
+        gain_auto = "Continuous" if self.gain_auto.isChecked() else "Off"
+        exposure_auto = "Continuous" if self.exp_auto.isChecked() else "Off"
+        wb_auto = "Continuous" if self.wb_auto.isChecked() else "Off"
+        return CameraSettingsSnapshot(
+            gain_auto=gain_auto,
+            exposure_auto=exposure_auto,
+            balance_white_auto=wb_auto,
+            binning_vertical=int(self.binning_combo.currentData() or 1),
+            gain=(
+                float(self.gain_spin.value()) if gain_auto != "Continuous" else None
+            ),
+            exposure_us=(
+                float(self.exp_spin.value()) * 1000.0
+                if exposure_auto != "Continuous"
+                else None
+            ),
+            balance_ratio_red=(
+                float(self.wb_red_spin.value()) if wb_auto != "Continuous" else None
+            ),
+            balance_ratio_blue=(
+                float(self.wb_blue_spin.value()) if wb_auto != "Continuous" else None
+            ),
+        )
+
+    def _refresh_preset_ui(self) -> None:
+        """Re-decorate the preset combo's display name (dirty marker) and
+        gate the save / delete buttons."""
+        dirty = self._current_snapshot() != self._loaded_snapshot
+
+        if self._loaded_preset_name == "Default":
+            display = "Unsaved preset" if dirty else "Default"
+        else:
+            display = (
+                f"{self._loaded_preset_name} (dirty)"
+                if dirty
+                else self._loaded_preset_name
+            )
+
+        idx = self.preset_combo.findData(self._loaded_preset_name)
+        if idx >= 0:
+            self.preset_combo.setItemText(idx, display)
+            self.preset_combo.setCurrentIndex(idx)
+
+        is_default = self._loaded_preset_name == "Default"
+        self.preset_save_btn.setEnabled(not is_default and dirty)
+        self.preset_delete_btn.setEnabled(not is_default)
+
+    def _on_preset_activated(self, idx: int) -> None:
+        raw = self.preset_combo.itemData(idx)
+        if raw is None:
+            return
+        name = str(raw)
+        if name == "Default":
+            snap = default_camera_snapshot(self._defaults)
+        else:
+            snap_or_none = self._presets.get(name)
+            if snap_or_none is None:
+                return
+            snap = snap_or_none
+        self._loaded_preset_name = name
+        self._loaded_snapshot = snap
+        self._apply_snapshot(snap)
+        self._refresh_preset_ui()
+
+    def _on_preset_new(self) -> None:
+        name, ok = QInputDialog.getText(self, "New camera preset", "Name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid name", "Preset name cannot be empty.")
+            return
+        if name == "Default":
+            QMessageBox.warning(self, "Invalid name", "'Default' is reserved.")
+            return
+        if name in self._presets:
+            QMessageBox.warning(
+                self,
+                "Invalid name",
+                f"A preset named {name!r} already exists.",
+            )
+            return
+
+        snap = self._current_snapshot()
+        self._presets[name] = snap
+        try:
+            self._store.save_all(self._presets)
+        except OSError as e:
+            del self._presets[name]
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                f"Could not write preset to config.toml:\n\n{e}",
+            )
+            return
+
+        self.preset_combo.addItem(name, name)
+        self._loaded_preset_name = name
+        self._loaded_snapshot = snap
+        self._refresh_preset_ui()
+
+    def _on_preset_save(self) -> None:
+        name = self._loaded_preset_name
+        if name == "Default":
+            return
+        snap = self._current_snapshot()
+        prev = self._presets.get(name)
+        self._presets[name] = snap
+        try:
+            self._store.save_all(self._presets)
+        except OSError as e:
+            if prev is not None:
+                self._presets[name] = prev
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                f"Could not write preset to config.toml:\n\n{e}",
+            )
+            return
+        self._loaded_snapshot = snap
+        self._refresh_preset_ui()
+
+    def _on_preset_delete(self) -> None:
+        name = self._loaded_preset_name
+        if name == "Default":
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete preset",
+            f"Delete preset {name!r}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        prev = self._presets.pop(name, None)
+        try:
+            self._store.save_all(self._presets)
+        except OSError as e:
+            if prev is not None:
+                self._presets[name] = prev
+            QMessageBox.critical(
+                self,
+                "Delete failed",
+                f"Could not write config.toml:\n\n{e}",
+            )
+            return
+
+        idx = self.preset_combo.findData(name)
+        if idx >= 0:
+            self.preset_combo.removeItem(idx)
+
+        # Drop back to Default. Note: this does NOT re-apply Default to the
+        # camera — only the preset-name pointer changes. The user can
+        # explicitly select Default in the combo to re-apply.
+        self._loaded_preset_name = "Default"
+        self._loaded_snapshot = default_camera_snapshot(self._defaults)
+        self._refresh_preset_ui()
 
     def _poll_camera_state(self) -> dict:
         """Worker-thread: read live camera values. Must not touch Qt widgets.
@@ -1789,8 +2172,6 @@ class ImageAdjustmentsPanel(QGroupBox):
         self.g_header = QLabel("G: 0 – 255")
         self.b_header = QLabel("B: 0 – 255")
 
-        self.defaults_btn = QPushButton("Defaults")
-
         self.preset_combo = _PresetCombo(self._refresh_preset_ui)
         self.preset_combo.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -1837,8 +2218,6 @@ class ImageAdjustmentsPanel(QGroupBox):
             outer.addWidget(hist)
             outer.addWidget(slider)
 
-        outer.addWidget(self.defaults_btn)
-
         self.brightness_slider.valueChanged.connect(self._on_brightness)
         self.contrast_slider.valueChanged.connect(self._on_contrast)
         self.saturation_slider.valueChanged.connect(self._on_saturation)
@@ -1849,7 +2228,6 @@ class ImageAdjustmentsPanel(QGroupBox):
         ):
             slider.valueChanged.connect(lambda _v, n=name: self._on_range(n))
 
-        self.defaults_btn.clicked.connect(self._apply_defaults)
         self.preset_combo.activated.connect(self._on_preset_activated)
         self.preset_new_btn.clicked.connect(self._on_preset_new)
         self.preset_save_btn.clicked.connect(self._on_preset_save)
@@ -1951,10 +2329,6 @@ class ImageAdjustmentsPanel(QGroupBox):
             self.saturation_label.setText(f"{snap.saturation}%")
         finally:
             self._building = False
-
-    def _apply_defaults(self) -> None:
-        self._apply_snapshot(DEFAULT_ADJUSTMENTS)
-        self._refresh_preset_ui()
 
     def _current_snapshot(self) -> AdjustmentSnapshot:
         return AdjustmentSnapshot(
@@ -2512,7 +2886,9 @@ class CameraWindow(QMainWindow):
             self.adjustments, ImagePresetStore(CONFIG_PATH)
         )
 
-        self.camera_options_panel = CameraOptionsPanel(self.cam, camera_cfg)
+        self.camera_options_panel = CameraOptionsPanel(
+            self.cam, camera_cfg, CameraPresetStore(CONFIG_PATH)
+        )
 
         layout.addWidget(self.camera_options_panel)
         layout.addWidget(self.adjustments_panel)
