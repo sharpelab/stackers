@@ -2500,14 +2500,16 @@ class HeaterPanel(QGroupBox):
         hero_font.setBold(True)
         # Pin a minimum height so QGridLayout can't squeeze the row to 0
         # when the right column is vertically constrained (e.g. on maximize).
-        hero_min_h = QFontMetrics(hero_font).height() + 4
+        hero_min_h = QFontMetrics(hero_font).height() + 2
+        # Align to bottom so the digits sit close to the caption below.
+        hero_align = Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom
         self.pv_label.setFont(hero_font)
-        self.pv_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pv_label.setAlignment(hero_align)
         self.pv_label.setMinimumHeight(hero_min_h)
 
         self.setpoint_value_label = QLabel("—")
         self.setpoint_value_label.setFont(hero_font)
-        self.setpoint_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setpoint_value_label.setAlignment(hero_align)
         self.setpoint_value_label.setStyleSheet("color: #888;")
         self.setpoint_value_label.setMinimumHeight(hero_min_h)
 
@@ -2548,7 +2550,7 @@ class HeaterPanel(QGroupBox):
 
         hero_grid = QGridLayout()
         hero_grid.setHorizontalSpacing(16)
-        hero_grid.setVerticalSpacing(2)
+        hero_grid.setVerticalSpacing(0)
         hero_grid.setRowStretch(0, 0)
         hero_grid.setRowStretch(1, 0)
         hero_grid.addWidget(self.pv_label, 0, 0)
@@ -2701,6 +2703,10 @@ class HeaterPanel(QGroupBox):
                 f"status: <span style='color: {color}; font-weight: bold;'>"
                 f"{state.name}</span>"
             )
+            # Run is a no-op while already running (and worse, can re-arm
+            # the controller mid-cycle in some firmwares). Disable to
+            # signal that. Stop stays always-on so it's the panic button.
+            self.run_btn.setEnabled(state != SystemState.RUN)
 
         if "out" in payload:
             self.output_pct_label.setText(f"output  {payload['out']:.1f} %")
