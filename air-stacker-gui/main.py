@@ -40,7 +40,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMessageBox,
-    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -2520,20 +2519,11 @@ class HeaterPanel(QGroupBox):
         sp_caption.setStyleSheet(caption_style)
         sp_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        # --- status line (text, lives directly under the temps) -------------
+        # --- status line: status (left) + output (right) --------------------
         self.status_text_label = QLabel("status: —")
-
-        # --- output bar ------------------------------------------------------
         self.output_pct_label = QLabel("output  —")
-        self.output_bar = QProgressBar()
-        self.output_bar.setRange(0, 100)
-        self.output_bar.setTextVisible(False)
-        self.output_bar.setFixedHeight(12)
         self.output_cap_label = QLabel("")
         self.output_cap_label.setStyleSheet(caption_style)
-        self.output_cap_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
 
         # --- editable controls ----------------------------------------------
         self.setpoint_spin = QDoubleSpinBox()
@@ -2567,22 +2557,18 @@ class HeaterPanel(QGroupBox):
         hero_grid.addWidget(sp_caption, 1, 1)
         outer.addLayout(hero_grid)
 
-        outer.addWidget(self.status_text_label)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_text_label)
+        status_row.addStretch(1)
+        status_row.addWidget(self.output_pct_label)
+        status_row.addWidget(self.output_cap_label)
+        outer.addLayout(status_row)
 
         outer.addSpacing(8)
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep)
-
-        out_row = QHBoxLayout()
-        out_row.addWidget(self.output_pct_label)
-        out_row.addStretch(1)
-        out_row.addWidget(self.output_cap_label)
-        outer.addLayout(out_row)
-        outer.addWidget(self.output_bar)
-
-        outer.addSpacing(6)
 
         sp_row = QHBoxLayout()
         sp_row.addWidget(QLabel("Setpoint:"))
@@ -2717,15 +2703,13 @@ class HeaterPanel(QGroupBox):
             )
 
         if "out" in payload:
-            out = payload["out"]
-            self.output_pct_label.setText(f"output  {out:.1f} %")
-            self.output_bar.setValue(int(round(max(0.0, min(100.0, out)))))
+            self.output_pct_label.setText(f"output  {payload['out']:.1f} %")
         elif "out_err" in payload:
             self.output_pct_label.setText(f"output err: {payload['out_err']}")
 
         if "out_hi" in payload:
             cap = payload["out_hi"]
-            self.output_cap_label.setText(f"cap {cap:.0f} %")
+            self.output_cap_label.setText(f"(cap {cap:.0f} %)")
             if not self.max_output_spin.hasFocus():
                 self.max_output_spin.setValue(cap)
 
