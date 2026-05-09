@@ -42,7 +42,7 @@ def state_label(code: str) -> str:
 
 
 # 16-bit positioner error register from the TS response, decoded per the
-# CONEX-CC Controller Documentation (docs/newport-conex-cc-controller.pdf §TS).
+# CONEX-CC Controller Documentation (manuals/newport-conex-cc-controller.pdf §TS).
 # Bits A-F are documented as "Not used"; if any are set we surface as reserved.
 ERROR_BITS: list[tuple[int, str]] = [
     (0x0001, "negative end of run"),

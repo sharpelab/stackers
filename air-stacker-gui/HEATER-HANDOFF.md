@@ -5,9 +5,9 @@ the Omega Platinum Configurator on 2026-05-06 resolved the prior "stuck
 at 0%" mystery and **overturned several assumptions baked into this doc**;
 see "What the capture proved" below before changing the driver.
 
-References (in `docs/`):
-- [M5458 Modbus interface](../../docs/omega-platinum-m5458-modbus.pdf) — register map + enums
-- [M5451 controller user guide](../../docs/omega-platinum-m5451-user-manual.pdf) — front-panel menus, OPER modes (M5451 §6.4 documents M.CNt / M.INP)
+References (in `manuals/`):
+- [M5458 Modbus interface](manuals/omega-platinum-m5458-modbus.pdf) — register map + enums
+- [M5451 controller user guide](manuals/omega-platinum-m5451-user-manual.pdf) — front-panel menus, OPER modes (M5451 §6.4 documents M.CNt / M.INP)
 
 Capture file: `~/Desktop/heater_usb_capture.pcapng` on the air-stacker PC.
 USBPcap, link type 249, slave ID 1, device VID 0x2a72 PID 0x0400.

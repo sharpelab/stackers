@@ -6,7 +6,7 @@ Python projects use uv.
 
 ## Reference docs
 
-- [docs/air-stacker-pc.md](docs/air-stacker-pc.md) — Air Stacker PC machine reference (camera, stage, heater, connectivity).
+- [air-stacker-gui/docs/air-stacker-pc.md](air-stacker-gui/docs/air-stacker-pc.md) — Air Stacker PC machine reference (camera, stage, heater, connectivity). Vendor manuals live alongside it under [air-stacker-gui/manuals/](air-stacker-gui/manuals/).
 
 ## Subdirectories
 
