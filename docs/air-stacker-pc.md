@@ -45,6 +45,8 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Probe script**: [`air-stacker-gui/probe_smc100.py`](../air-stacker-gui/probe_smc100.py) — sends `1VE?` and reports whether the controller replies. Useful for cabling iteration.
 - **Cabling**: Newport's stock PC cable is wired DCE-style on the SMC100 end; a generic DB9 + USB-RS232 dongle (both DTE) needs a **null-modem adapter** to swap TX/RX. Current setup includes the null-modem and is working.
 - **Manuals**: [User's Manual](../air-stacker-gui/manuals/newport-smc100-user-manual.pdf) (EDH0206En2060, 02/25 — install, wiring, state machine, ESP stage configuration), [Command Interface Manual](../air-stacker-gui/manuals/newport-smc100-command-interface.pdf) (EDH0311En1023, 12/21 — `Newport.SMC100.CommandInterface.dll` reference, but the ASCII command names match what goes over RS-232).
+- **Known good positions**:
+  - **Focus: ~27.691 mm** — recorded 2026-05-09 with the current sample stack. Use as a fall-back if focus is lost; expect ~µm-level corrections from the fine-Z piezo from there.
 
 ## Z stage — fine (Yokogawa 7651 + NPM140, added 2026-05-08)
 
