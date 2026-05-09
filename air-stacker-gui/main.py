@@ -17,12 +17,10 @@ import numpy as np
 import PySpin
 from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
-    QBrush,
     QColor,
     QIcon,
     QImage,
     QPainter,
-    QPainterPath,
     QPen,
     QSurfaceFormat,
 )
@@ -629,11 +627,13 @@ class _CameraGLWindow(QOpenGLWindow):
             if self._frame_dirty:
                 # Pass the numpy buffer directly via the buffer protocol —
                 # avoids the ~5 MB tobytes() copy that occasionally spikes
-                # paint past the 16.7 ms vsync boundary.
+                # paint past the 16.7 ms vsync boundary. The PySide6 stub
+                # only types `data` as `int` (the void* address overload),
+                # not the buffer-protocol form Qt also accepts at runtime.
                 self._tex.setData(
                     QOpenGLTexture.PixelFormat.RGB,
                     QOpenGLTexture.PixelType.UInt8,
-                    self._frame_ref.data,
+                    self._frame_ref.data,  # ty: ignore[invalid-argument-type]
                 )
                 self._frame_dirty = False
             tw, th = self.width(), self.height()
@@ -843,7 +843,7 @@ class CameraAcquireWorker(QObject):
         log_start = time.perf_counter()
         t_fetch = t_debayer = t_publish = 0.0
         # Cache stream-invariant image properties on first frame.
-        width = height = fmt = None
+        props: tuple[int, int, str] | None = None
         while self._running:
             try:
                 t0 = time.perf_counter()
@@ -855,10 +855,13 @@ class CameraAcquireWorker(QObject):
                             image.GetImageStatus(),
                         )
                         continue
-                    if width is None:
-                        width = image.GetWidth()
-                        height = image.GetHeight()
-                        fmt = image.GetPixelFormatName()
+                    if props is None:
+                        props = (
+                            image.GetWidth(),
+                            image.GetHeight(),
+                            image.GetPixelFormatName(),
+                        )
+                    width, height, fmt = props
                     t1 = time.perf_counter()
                     rgb = to_rgb(image.GetNDArray(), width, height, fmt)
                 finally:
