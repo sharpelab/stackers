@@ -3,12 +3,10 @@ name = "air-stacker-gui"
 version = "0.1.0"
 description = "Custom microscope viewer + recorder for the Air Stacker"
 requires-python = ">=3.10,<3.11"
-# PySpin (FLIR Spinnaker SDK Python bindings) is NOT on PyPI and must be
-# installed manually from the wheel that ships with the Spinnaker SDK
-# download:
-#
-#   uv pip install <SpinnakerSDK_Python_extract>/spinnaker_python-*-cp310-*.whl
-#
+# PySpin (FLIR Spinnaker SDK Python bindings) is NOT on PyPI; FLIR ships
+# it as a wheel that must be downloaded from the Spinnaker SDK page. We
+# vendor the Windows cp310 wheel under vendor/ and reference it via
+# [tool.uv.sources] below — uv sync installs it automatically on win32.
 # numpy is pinned <2 because PySpin 4.3 is built against NumPy 1.x.
 dependencies = [
     "pyside6>=6.3",
@@ -18,12 +16,16 @@ dependencies = [
     "minimalmodbus>=2.1",
     "superqt>=0.8.1",
     "tomlkit>=0.13",
+    "spinnaker-python; sys_platform == 'win32'",
 ]
 
 [project.gui-scripts]
 # On Windows, gui-scripts entry points generate a pythonw-based .exe
 # wrapper, so launching from a shortcut doesn't flash a console window.
 air-stacker-gui = "main:main"
+
+[tool.uv.sources]
+spinnaker-python = { path = "vendor/spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl" }
 
 [build-system]
 requires = ["hatchling"]

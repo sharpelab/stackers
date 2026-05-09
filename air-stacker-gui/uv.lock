@@ -17,6 +17,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pyserial" },
     { name = "pyside6" },
+    { name = "spinnaker-python", marker = "sys_platform == 'win32'" },
     { name = "superqt" },
     { name = "tomlkit" },
 ]
@@ -34,6 +35,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.5" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "pyside6", specifier = ">=6.3" },
+    { name = "spinnaker-python", marker = "sys_platform == 'win32'", path = "vendor/spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl" },
     { name = "superqt", specifier = ">=0.8.1" },
     { name = "tomlkit", specifier = ">=0.13" },
 ]
@@ -212,6 +214,20 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/72/f7/44c0c42c3f5f29dec457fd46ea0552174bcb8aa75becf03bbd90308ba07b/shiboken6-6.11.0-cp310-abi3-win_amd64.whl", hash = "sha256:483ff78a73c7b3189ca924abc694318084f078bcfeaffa68e32024ff2d025ee1", size = 1222132, upload-time = "2026-03-23T12:47:10.143Z" },
     { url = "https://files.pythonhosted.org/packages/fb/99/6e5ee21db2d6af84bbbd7d871d441dafeb069c6de5667b1aa49891a77c66/shiboken6-6.11.0-cp310-abi3-win_arm64.whl", hash = "sha256:3bd76cf56105ab2d62ecaff630366f11264f69b88d488f10f048da9a065781f4", size = 1783186, upload-time = "2026-03-23T12:47:11.832Z" },
 ]
+
+[[package]]
+name = "spinnaker-python"
+version = "4.3.0.190"
+source = { path = "vendor/spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl" }
+dependencies = [
+    { name = "numpy", marker = "(platform_machine != 'aarch64' and sys_platform == 'linux') or (sys_platform != 'darwin' and sys_platform != 'linux')" },
+]
+wheels = [
+    { filename = "spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl", hash = "sha256:476a9d22aab10178b2dd929c0c72b6e3de392842c574ff96a5104ddb18859293" },
+]
+
+[package.metadata]
+requires-dist = [{ name = "numpy", specifier = ">=1.15" }]
 
 [[package]]
 name = "superqt"
