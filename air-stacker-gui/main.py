@@ -48,7 +48,9 @@ from superqt import QRangeSlider
 from conex import ConexAxis, error_label, state_label
 from focus_metric import sharpness as compute_sharpness
 from heater import OmegaPlatinum
+from smc100_panel import SMC100Panel
 from status_bar import StatusBar
+from yoko_panel import YokoPanel
 
 import tomlkit
 
@@ -2653,6 +2655,8 @@ class CameraWindow(QMainWindow):
 
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
+        self.smc100_panel: SMC100Panel | None = None
+        self.yoko_panel: YokoPanel | None = None
         self.camera_options_panel: CameraOptionsPanel | None = None
         self.adjustments_panel: ImageAdjustmentsPanel | None = None
         self.adjustments = ImageAdjustments()
@@ -2674,7 +2678,12 @@ class CameraWindow(QMainWindow):
         self.cam.BeginAcquisition()
 
         settings_panel = self._build_settings_panel(camera_cfg)
-        right_panel = self._build_right_panel(config.get("axis", []), config.get("heater"))
+        right_panel = self._build_right_panel(
+            axes_cfg=config.get("axis", []),
+            heater_cfg=config.get("heater"),
+            smc100_cfg=config.get("smc100"),
+            yoko_cfg=config.get("yoko"),
+        )
 
         central = QWidget()
         layout = QHBoxLayout(central)
@@ -2903,12 +2912,27 @@ class CameraWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
-    def _build_right_panel(self, axes_cfg: list[dict], heater_cfg: dict | None) -> QWidget:
+    def _build_right_panel(
+        self,
+        axes_cfg: list[dict],
+        heater_cfg: dict | None,
+        smc100_cfg: dict | None = None,
+        yoko_cfg: dict | None = None,
+    ) -> QWidget:
         panel = QWidget()
         panel.setFixedWidth(300)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        # Z-axis controls go up top — most-touched controls on this rig.
+        # SMC100 is coarse Z (mm scale), Yoko drives the NPM140 piezo for
+        # fine Z (µm scale). Followed by rotation stage(s), then heater.
+        if smc100_cfg:
+            self.smc100_panel = SMC100Panel(smc100_cfg)
+            layout.addWidget(self.smc100_panel)
+        if yoko_cfg:
+            self.yoko_panel = YokoPanel(yoko_cfg)
+            layout.addWidget(self.yoko_panel)
         for cfg in axes_cfg:
             ap = ConexAxisPanel(cfg)
             self.axis_panels.append(ap)
@@ -2991,6 +3015,10 @@ class CameraWindow(QMainWindow):
             self.camera_options_panel.shutdown()
         for ap in self.axis_panels:
             ap.shutdown()
+        if self.smc100_panel is not None:
+            self.smc100_panel.shutdown()
+        if self.yoko_panel is not None:
+            self.yoko_panel.shutdown()
         if self.heater_panel is not None:
             self.heater_panel.shutdown()
         # PySpin shutdown: end stream, deinit, drop the Camera reference
