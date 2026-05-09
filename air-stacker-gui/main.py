@@ -861,9 +861,12 @@ class HistWorker(QObject):
     @Slot()
     def run(self) -> None:
         self._running = True
-        log_count = 0
         log_start = time.monotonic()
-        t_compute = t_render = t_emit = 0.0
+        # Per-iteration ms samples — distribution shape distinguishes
+        # GIL-contention starvation (heavy-tailed) from genuine slow work
+        # (tight cluster near the mean).
+        comp_ms: list[float] = []
+        rend_ms: list[float] = []
         while self._running:
             rgb = self._source.take(timeout=0.1)
             if rgb is None:
@@ -886,23 +889,24 @@ class HistWorker(QObject):
                 continue
             t3 = time.monotonic()
             self.images_ready.emit(*images)
-            t4 = time.monotonic()
-            t_compute += t2 - t1
-            t_render += t3 - t2
-            t_emit += t4 - t3
-            log_count += 1
-            if t4 - log_start > 2.0:
-                span = t4 - log_start
+            comp_ms.append((t2 - t1) * 1000)
+            rend_ms.append((t3 - t2) * 1000)
+            if t3 - log_start > 2.0:
+                span = t3 - log_start
+                n = len(comp_ms)
+                ca = np.asarray(comp_ms)
+                ra = np.asarray(rend_ms)
                 log.info(
-                    "hist   %.1f fps  comp=%.1f render=%.1f emit=%.2f ms/iter",
-                    log_count / span,
-                    t_compute / log_count * 1000,
-                    t_render / log_count * 1000,
-                    t_emit / log_count * 1000,
+                    "hist   %.1f fps  comp min/med/p90/max=%.1f/%.1f/%.1f/%.1f  "
+                    "rend min/med/p90/max=%.1f/%.1f/%.1f/%.1f  ms/iter (n=%d)",
+                    n / span,
+                    ca.min(), np.median(ca), np.percentile(ca, 90), ca.max(),
+                    ra.min(), np.median(ra), np.percentile(ra, 90), ra.max(),
+                    n,
                 )
-                log_count = 0
-                log_start = t4
-                t_compute = t_render = t_emit = 0.0
+                comp_ms.clear()
+                rend_ms.clear()
+                log_start = t3
         self.finished.emit()
 
     def stop(self) -> None:
