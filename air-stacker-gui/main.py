@@ -30,12 +30,15 @@ from PySide6.QtOpenGL import QOpenGLTexture, QOpenGLTextureBlitter, QOpenGLWindo
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDoubleSpinBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -229,6 +232,80 @@ class ImageAdjustments:
         with self._lock:
             self._snap = AdjustmentSnapshot()
             return self._snap
+
+
+DEFAULT_ADJUSTMENTS = AdjustmentSnapshot()
+
+
+def _coerce_pair(v) -> tuple[int, int]:
+    lo, hi = v
+    return (int(lo), int(hi))
+
+
+class ImagePresetStore:
+    """Round-trips user-created [[image_preset]] entries to/from config.toml.
+
+    "Default" is hardcoded in the panel and never stored — only user
+    presets live in the file. Saves rewrite the image_preset array-of-tables
+    wholesale via tomlkit, leaving every other section (and its comments)
+    untouched.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+
+    def load(self) -> dict[str, AdjustmentSnapshot]:
+        if not self._path.exists():
+            return {}
+        doc = tomlkit.parse(self._path.read_text(encoding="utf-8"))
+        out: dict[str, AdjustmentSnapshot] = {}
+        for entry in doc.get("image_preset", []):
+            try:
+                name = str(entry["name"])
+                if not name.strip() or name == "Default":
+                    log.warning("skipping invalid preset name: %r", name)
+                    continue
+                if name in out:
+                    log.warning("skipping duplicate preset name: %r", name)
+                    continue
+                out[name] = AdjustmentSnapshot(
+                    brightness=int(entry["brightness"]),
+                    contrast=int(entry["contrast"]),
+                    saturation=int(entry["saturation"]),
+                    r_range=_coerce_pair(entry["r_range"]),
+                    g_range=_coerce_pair(entry["g_range"]),
+                    b_range=_coerce_pair(entry["b_range"]),
+                )
+            except (KeyError, TypeError, ValueError) as e:
+                log.warning("skipping malformed image_preset entry: %s", e)
+        return out
+
+    def save_all(self, presets: dict[str, AdjustmentSnapshot]) -> None:
+        if self._path.exists():
+            doc = tomlkit.parse(self._path.read_text(encoding="utf-8"))
+        else:
+            doc = tomlkit.document()
+
+        if "image_preset" in doc:
+            del doc["image_preset"]
+
+        if presets:
+            new_aot = tomlkit.aot()
+            for name, snap in presets.items():
+                t = tomlkit.table()
+                t["name"] = name
+                t["brightness"] = snap.brightness
+                t["contrast"] = snap.contrast
+                t["saturation"] = snap.saturation
+                t["r_range"] = list(snap.r_range)
+                t["g_range"] = list(snap.g_range)
+                t["b_range"] = list(snap.b_range)
+                new_aot.append(t)
+            doc["image_preset"] = new_aot
+
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+        tmp.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        tmp.replace(self._path)
 
 
 # LUT/matrix builders are cached: callers feed them slider values
@@ -1425,6 +1502,32 @@ class ChannelHistogram(QWidget):
             painter.drawLine(int(x), 0, int(x), h)
 
 
+class _PresetCombo(QComboBox):
+    """QComboBox whose dropdown menu always shows canonical names.
+
+    The closed display can carry decoration (e.g. "preset1 (dirty)") via
+    setItemText on the active row. Before the popup opens we
+    re-canonicalize every item; after it closes we ask the panel to
+    redecorate, so a click-outside dismissal doesn't strand the items in
+    canonical form.
+    """
+
+    def __init__(self, on_popup_hidden, parent=None) -> None:
+        super().__init__(parent)
+        self._on_popup_hidden = on_popup_hidden
+
+    def showPopup(self) -> None:
+        for i in range(self.count()):
+            name = self.itemData(i)
+            if name is not None:
+                self.setItemText(i, str(name))
+        super().showPopup()
+
+    def hidePopup(self) -> None:
+        super().hidePopup()
+        self._on_popup_hidden()
+
+
 class ImageAdjustmentsPanel(QGroupBox):
     """Software-side image adjustments applied per-frame on the camera worker.
 
@@ -1443,9 +1546,15 @@ class ImageAdjustmentsPanel(QGroupBox):
         (25, 113, 194),  # B
     )
 
-    def __init__(self, adjustments: ImageAdjustments) -> None:
+    def __init__(
+        self, adjustments: ImageAdjustments, store: ImagePresetStore
+    ) -> None:
         super().__init__("Image Adjustments")
         self._adj = adjustments
+        self._store = store
+        self._presets: dict[str, AdjustmentSnapshot] = store.load()
+        self._loaded_preset_name: str = "Default"
+        self._loaded_snapshot: AdjustmentSnapshot = DEFAULT_ADJUSTMENTS
         self._building = True
 
         self.brightness_slider, self.brightness_label = self._make_slider_row(
@@ -1472,7 +1581,30 @@ class ImageAdjustmentsPanel(QGroupBox):
 
         self.defaults_btn = QPushButton("Defaults")
 
+        self.preset_combo = _PresetCombo(self._refresh_preset_ui)
+        self.preset_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.preset_combo.setMinimumContentsLength(14)
+        self.preset_combo.setMaximumWidth(160)
+        self.preset_combo.addItem("Default", "Default")
+        for name in self._presets:
+            self.preset_combo.addItem(name, name)
+
+        self.preset_new_btn = QPushButton("+")
+        self.preset_save_btn = QPushButton("💾")
+        self.preset_delete_btn = QPushButton("🗑")
+        for b in (self.preset_new_btn, self.preset_save_btn, self.preset_delete_btn):
+            b.setFixedSize(28, 28)
+
         outer = QVBoxLayout(self)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(self.preset_combo, stretch=1)
+        preset_row.addWidget(self.preset_new_btn)
+        preset_row.addWidget(self.preset_save_btn)
+        preset_row.addWidget(self.preset_delete_btn)
+        outer.addLayout(preset_row)
+
         for name, slider, value_label in (
             ("Brightness", self.brightness_slider, self.brightness_label),
             ("Contrast", self.contrast_slider, self.contrast_label),
@@ -1508,7 +1640,13 @@ class ImageAdjustmentsPanel(QGroupBox):
             slider.valueChanged.connect(lambda _v, n=name: self._on_range(n))
 
         self.defaults_btn.clicked.connect(self._apply_defaults)
+        self.preset_combo.activated.connect(self._on_preset_activated)
+        self.preset_new_btn.clicked.connect(self._on_preset_new)
+        self.preset_save_btn.clicked.connect(self._on_preset_save)
+        self.preset_delete_btn.clicked.connect(self._on_preset_delete)
+
         self._building = False
+        self._refresh_preset_ui()
 
     @Slot(QImage, QImage, QImage)
     def set_hist_images(self, r: QImage, g: QImage, b: QImage) -> None:
@@ -1545,18 +1683,21 @@ class ImageAdjustmentsPanel(QGroupBox):
         if self._building:
             return
         self._adj.update(brightness=v)
+        self._refresh_preset_ui()
 
     def _on_contrast(self, v: int) -> None:
         self.contrast_label.setText(f"{v}%")
         if self._building:
             return
         self._adj.update(contrast=v)
+        self._refresh_preset_ui()
 
     def _on_saturation(self, v: int) -> None:
         self.saturation_label.setText(f"{v}%")
         if self._building:
             return
         self._adj.update(saturation=v)
+        self._refresh_preset_ui()
 
     def _on_range(self, name: str) -> None:
         if self._building:
@@ -1570,9 +1711,18 @@ class ImageAdjustmentsPanel(QGroupBox):
         hist.set_range(lo, hi)
         header.setText(f"{prefix}: {lo} – {hi}")
         self._adj.update(**{name: (lo, hi)})
+        self._refresh_preset_ui()
 
-    def _apply_defaults(self) -> None:
-        snap = self._adj.reset()
+    def _apply_snapshot(self, snap: AdjustmentSnapshot) -> None:
+        """Push snap to sliders + adjustments backend without firing handlers."""
+        self._adj.update(
+            brightness=snap.brightness,
+            contrast=snap.contrast,
+            saturation=snap.saturation,
+            r_range=snap.r_range,
+            g_range=snap.g_range,
+            b_range=snap.b_range,
+        )
         self._building = True
         try:
             self.brightness_slider.setValue(snap.brightness)
@@ -1591,6 +1741,152 @@ class ImageAdjustmentsPanel(QGroupBox):
             self.saturation_label.setText(f"{snap.saturation}%")
         finally:
             self._building = False
+
+    def _apply_defaults(self) -> None:
+        self._apply_snapshot(DEFAULT_ADJUSTMENTS)
+        self._refresh_preset_ui()
+
+    def _current_snapshot(self) -> AdjustmentSnapshot:
+        return AdjustmentSnapshot(
+            brightness=int(self.brightness_slider.value()),
+            contrast=int(self.contrast_slider.value()),
+            saturation=int(self.saturation_slider.value()),
+            r_range=_coerce_pair(self.r_range.value()),
+            g_range=_coerce_pair(self.g_range.value()),
+            b_range=_coerce_pair(self.b_range.value()),
+        )
+
+    def _refresh_preset_ui(self) -> None:
+        if self._building:
+            return
+        dirty = self._current_snapshot() != self._loaded_snapshot
+
+        if self._loaded_preset_name == "Default":
+            display = "Unsaved preset" if dirty else "Default"
+        else:
+            display = (
+                f"{self._loaded_preset_name} (dirty)"
+                if dirty
+                else self._loaded_preset_name
+            )
+
+        idx = self.preset_combo.findData(self._loaded_preset_name)
+        if idx >= 0:
+            self.preset_combo.setItemText(idx, display)
+            self.preset_combo.setCurrentIndex(idx)
+
+        is_default = self._loaded_preset_name == "Default"
+        self.preset_save_btn.setEnabled(not is_default and dirty)
+        self.preset_delete_btn.setEnabled(not is_default)
+
+    def _on_preset_activated(self, idx: int) -> None:
+        raw = self.preset_combo.itemData(idx)
+        if raw is None:
+            return
+        name = str(raw)
+        if name == "Default":
+            snap = DEFAULT_ADJUSTMENTS
+        else:
+            snap_or_none = self._presets.get(name)
+            if snap_or_none is None:
+                return
+            snap = snap_or_none
+        self._loaded_preset_name = name
+        self._loaded_snapshot = snap
+        self._apply_snapshot(snap)
+        self._refresh_preset_ui()
+
+    def _on_preset_new(self) -> None:
+        name, ok = QInputDialog.getText(self, "New preset", "Name:")
+        if not ok:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.warning(self, "Invalid name", "Preset name cannot be empty.")
+            return
+        if name == "Default":
+            QMessageBox.warning(self, "Invalid name", "'Default' is reserved.")
+            return
+        if name in self._presets:
+            QMessageBox.warning(
+                self,
+                "Invalid name",
+                f"A preset named {name!r} already exists.",
+            )
+            return
+
+        snap = self._current_snapshot()
+        self._presets[name] = snap
+        try:
+            self._store.save_all(self._presets)
+        except OSError as e:
+            del self._presets[name]
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                f"Could not write preset to config.toml:\n\n{e}",
+            )
+            return
+
+        self.preset_combo.addItem(name, name)
+        self._loaded_preset_name = name
+        self._loaded_snapshot = snap
+        self._refresh_preset_ui()
+
+    def _on_preset_save(self) -> None:
+        name = self._loaded_preset_name
+        if name == "Default":
+            return
+        snap = self._current_snapshot()
+        prev = self._presets.get(name)
+        self._presets[name] = snap
+        try:
+            self._store.save_all(self._presets)
+        except OSError as e:
+            if prev is not None:
+                self._presets[name] = prev
+            QMessageBox.critical(
+                self,
+                "Save failed",
+                f"Could not write preset to config.toml:\n\n{e}",
+            )
+            return
+        self._loaded_snapshot = snap
+        self._refresh_preset_ui()
+
+    def _on_preset_delete(self) -> None:
+        name = self._loaded_preset_name
+        if name == "Default":
+            return
+        reply = QMessageBox.question(
+            self,
+            "Delete preset",
+            f"Delete preset {name!r}?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        prev = self._presets.pop(name, None)
+        try:
+            self._store.save_all(self._presets)
+        except OSError as e:
+            if prev is not None:
+                self._presets[name] = prev
+            QMessageBox.critical(
+                self,
+                "Delete failed",
+                f"Could not write config.toml:\n\n{e}",
+            )
+            return
+
+        idx = self.preset_combo.findData(name)
+        if idx >= 0:
+            self.preset_combo.removeItem(idx)
+
+        self._loaded_preset_name = "Default"
+        self._loaded_snapshot = DEFAULT_ADJUSTMENTS
+        self._apply_snapshot(DEFAULT_ADJUSTMENTS)
+        self._refresh_preset_ui()
 
 
 class HeaterPanel(QGroupBox):
@@ -1891,7 +2187,9 @@ class CameraWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        self.adjustments_panel = ImageAdjustmentsPanel(self.adjustments)
+        self.adjustments_panel = ImageAdjustmentsPanel(
+            self.adjustments, ImagePresetStore(CONFIG_PATH)
+        )
 
         self.camera_options_panel = CameraOptionsPanel(self.cam, camera_cfg)
 
