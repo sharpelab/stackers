@@ -42,7 +42,13 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Protocol**: ASCII over 57600 8N1; addressed commands prefixed with controller index (`1` for first/master), terminated CRLF. `1VE?` = firmware version, `1ID?` = stage ID, `1TS` = state, `1TP` = position, `1RS` = reset. Full command set in the [Command Interface Manual](../air-stacker-gui/manuals/newport-smc100-command-interface.pdf).
 - **State machine** (printed on the box): `CONFIG` ↔ `AUTO CONFIG` → `NOT REFERENCED` → `HOMING` → `READY` ↔ `MOVING` / `JOGGING` / `DISABLE`. Faults: `ERROR FE`, `MM0/MM1 ERROR FE`, `HARDWARE FAULT`. Detailed in §5 (Programming) of the [User's Manual](../air-stacker-gui/manuals/newport-smc100-user-manual.pdf).
 - **DIP switches** on the back select RS-232 master vs. RS-485 slave; first controller in the chain must be in RS-232 master mode for PC comms.
-- **Probe script**: [`air-stacker-gui/probe_smc100.py`](../air-stacker-gui/probe_smc100.py) — sends `1VE?` and reports whether the controller replies. Useful for cabling iteration.
+- **Compensation** (probed 2026-05-09, see [`probe_smc100_config.py`](../air-stacker-gui/probe_smc100_config.py)):
+  - **`BA` (backlash) = 0 mm** — disabled.
+  - **`BH` (hysteresis) = 0 mm** — disabled.
+  - Both configurable via the `BA` / `BH` ASCII commands, but only in CONFIGURATION state (`PW1` to enter) and only persisted with `PW0` (flash write, ~10 s). Per the global rule against persistent controller writes, changing these requires explicit per-action authorization.
+- **Probe scripts**:
+  - [`air-stacker-gui/probe_smc100.py`](../air-stacker-gui/probe_smc100.py) — sends `1VE?` and reports whether the controller replies. Useful for cabling iteration.
+  - [`air-stacker-gui/probe_smc100_config.py`](../air-stacker-gui/probe_smc100_config.py) — read-only dump of firmware, stage ID, state, position, soft limits, encoder unit, motion params, BA/BH compensation, FE limit, and JM (keypad enable).
 - **Cabling**: Newport's stock PC cable is wired DCE-style on the SMC100 end; a generic DB9 + USB-RS232 dongle (both DTE) needs a **null-modem adapter** to swap TX/RX. Current setup includes the null-modem and is working.
 - **Manuals**: [User's Manual](../air-stacker-gui/manuals/newport-smc100-user-manual.pdf) (EDH0206En2060, 02/25 — install, wiring, state machine, ESP stage configuration), [Command Interface Manual](../air-stacker-gui/manuals/newport-smc100-command-interface.pdf) (EDH0311En1023, 12/21 — `Newport.SMC100.CommandInterface.dll` reference, but the ASCII command names match what goes over RS-232).
 - **Known good positions**:
