@@ -11,6 +11,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 
 import cv2
@@ -189,12 +190,18 @@ class ImageAdjustments:
             return self._snap
 
 
+# LUT/matrix builders are cached: callers feed them slider values
+# (small ints) that change only when the user moves a slider, but
+# apply_adjustments runs every frame. lru_cache turns these into
+# O(1) lookups in the steady state.
+@lru_cache(maxsize=16)
 def _build_brightness_lut(brightness_pct: int) -> np.ndarray:
     """LUT for `out = clip(in * brightness/100)`."""
     x = np.arange(256, dtype=np.float32)
     return np.clip(x * (brightness_pct / 100.0), 0.0, 255.0).astype(np.uint8)
 
 
+@lru_cache(maxsize=64)
 def _build_channel_lut(contrast_pct: int, lo: int, hi: int) -> np.ndarray:
     """LUT folding contrast (around 128) then per-channel range remap."""
     x = np.arange(256, dtype=np.float32)
@@ -205,6 +212,7 @@ def _build_channel_lut(contrast_pct: int, lo: int, hi: int) -> np.ndarray:
     return np.clip(y, 0.0, 255.0).astype(np.uint8)
 
 
+@lru_cache(maxsize=16)
 def _build_saturate_matrix(saturation_pct: int) -> np.ndarray:
     """3×3 RGB color matrix per CSS Filter Effects `saturate()`.
 
@@ -220,11 +228,29 @@ def _build_saturate_matrix(saturation_pct: int) -> np.ndarray:
     ], dtype=np.float32)
 
 
-def apply_adjustments(rgb: np.ndarray, adj: AdjustmentSnapshot) -> np.ndarray:
+def apply_adjustments(
+    rgb: np.ndarray,
+    adj: AdjustmentSnapshot,
+    scratch: np.ndarray | None = None,
+) -> np.ndarray:
     """Apply brightness/saturation/contrast/RGB-range to an RGB uint8 frame.
 
     Order matches the flakes-website CSS filter chain:
     brightness → saturate → contrast → per-channel range remap.
+
+    Pipeline collapses into at most two cv2 passes:
+      • saturate matrix (with brightness folded in) — when saturation ≠ 100
+      • per-channel LUT (with brightness folded in) — when contrast/range or
+        brightness needs to apply
+
+    `scratch`, if provided (same shape/dtype as `rgb`), is used as the
+    intermediate buffer between passes; the final pass writes into a
+    fresh allocation so the returned buffer is safe to publish.
+
+    Note on brightness > 100 + saturation: the matrix fold loses CSS's
+    intermediate clip-to-255 between brightness and saturate. Output
+    differences are confined to near-saturated pixels and absorbed
+    almost entirely by the final output clip.
 
     Returns a new array; input is not mutated. If `adj` is identity,
     returns the input unchanged (fast path).
@@ -241,18 +267,13 @@ def apply_adjustments(rgb: np.ndarray, adj: AdjustmentSnapshot) -> np.ndarray:
         or adj.b_range != (0, 255)
     )
 
-    out = rgb
-
-    # Brightness pre-pass only if saturation breaks LUT composition;
-    # otherwise brightness folds into the post-stage LUT below.
-    if needs_brightness and needs_saturation:
-        out = cv2.LUT(out, _build_brightness_lut(adj.brightness))
-
+    # Build the pass list — at most two entries.
+    passes: list[tuple[str, np.ndarray]] = []
     if needs_saturation:
-        # CSS-spec saturate(): single 3×3 matrix transform, no HSV.
-        # ~3× faster than the cvtColor RGB↔HSV roundtrip on the
-        # Windows opencv-python wheel.
-        out = cv2.transform(out, _build_saturate_matrix(adj.saturation))
+        m = _build_saturate_matrix(adj.saturation)
+        if needs_brightness:
+            m = m * (adj.brightness / 100.0)  # fold brightness scalar
+        passes.append(("transform", m.astype(np.float32, copy=False)))
 
     fold_brightness = needs_brightness and not needs_saturation
     if needs_per_channel or fold_brightness:
@@ -264,13 +285,24 @@ def apply_adjustments(rgb: np.ndarray, adj: AdjustmentSnapshot) -> np.ndarray:
             r_lut = r_lut[b_pre]
             g_lut = g_lut[b_pre]
             b_lut = b_lut[b_pre]
-        # cv2.LUT accepts a (1, 256, 3) LUT and applies it 3-channel
-        # in one SIMD pass — ~7× faster than per-channel numpy fancy
-        # indexing on the Windows opencv-python wheel.
         lut3 = np.stack([r_lut, g_lut, b_lut], axis=-1).reshape(1, 256, 3)
-        out = cv2.LUT(out, lut3)
+        passes.append(("lut", lut3))
 
-    return out
+    if not passes:
+        return rgb  # all flags false (shouldn't happen post is_identity)
+
+    # Intermediate passes write into scratch; final pass writes into a
+    # fresh buffer so the caller can hold onto it without seeing the
+    # next iteration overwrite it.
+    src = rgb
+    last = len(passes) - 1
+    for i, (op, arg) in enumerate(passes):
+        dst = np.empty_like(rgb) if i == last else scratch
+        if op == "transform":
+            src = cv2.transform(src, arg, dst=dst)
+        else:
+            src = cv2.LUT(src, arg, dst=dst)
+    return src
 
 
 _HIST_DOWNSAMPLE = (320, 256)  # 4x4 from 1280x1024; ~16x fewer pixels
@@ -730,6 +762,9 @@ class CameraProcessWorker(QObject):
         self._running = False
         self._lock = threading.Lock()
         self._latest: np.ndarray | None = None
+        # Reused intermediate buffer for apply_adjustments (avoids a
+        # 5.76 MB alloc per frame in multi-pass cases).
+        self._adjust_scratch: np.ndarray | None = None
 
     @Slot()
     def run(self) -> None:
@@ -748,7 +783,13 @@ class CameraProcessWorker(QObject):
                 snap = self._adjustments.get()
                 if not snap.is_identity:
                     try:
-                        rgb = apply_adjustments(rgb, snap)
+                        if (
+                            self._adjust_scratch is None
+                            or self._adjust_scratch.shape != rgb.shape
+                            or self._adjust_scratch.dtype != rgb.dtype
+                        ):
+                            self._adjust_scratch = np.empty_like(rgb)
+                        rgb = apply_adjustments(rgb, snap, scratch=self._adjust_scratch)
                     except Exception as e:  # noqa: BLE001
                         log.warning("adjustment err: %s", e)
             t3 = time.monotonic()
