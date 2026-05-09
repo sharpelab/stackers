@@ -1,11 +1,5 @@
 # Air Stacker GUI configuration.
 
-[gentl]
-# Path to a GenTL producer .cti file, or a directory containing one.
-# The Air Stacker PC has Spinnaker installed; its producers live under cti64/vs2015.
-# Spinnaker 4.x rebranded under Teledyne; older 3.x lived under FLIR Systems.
-producer = 'C:\Program Files\Teledyne\Spinnaker\cti64\vs2015'
-
 [camera]
 # Zero-based index into the producer's enumerated device list.
 device_index = 0

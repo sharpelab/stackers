@@ -3,10 +3,16 @@ name = "air-stacker-gui"
 version = "0.1.0"
 description = "Custom microscope viewer + recorder for the Air Stacker"
 requires-python = ">=3.10,<3.11"
+# PySpin (FLIR Spinnaker SDK Python bindings) is NOT on PyPI and must be
+# installed manually from the wheel that ships with the Spinnaker SDK
+# download:
+#
+#   uv pip install <SpinnakerSDK_Python_extract>/spinnaker_python-*-cp310-*.whl
+#
+# numpy is pinned <2 because PySpin 4.3 is built against NumPy 1.x.
 dependencies = [
-    "harvesters>=1.4",
     "pyside6>=6.3",
-    "numpy>=1.22",
+    "numpy>=1.22,<2",
     "opencv-python>=4.5",
     "pyserial>=3.5",
     "minimalmodbus>=2.1",

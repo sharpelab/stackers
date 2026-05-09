@@ -1,11 +1,9 @@
-"""Live frame viewer for the Air Stacker camera (Flea3 via harvesters/GenTL)."""
+"""Live frame viewer for the Air Stacker camera (Flea3 via FLIR Spinnaker / PySpin)."""
 
 from __future__ import annotations
 
 import argparse
-import contextlib
 import logging
-import os
 import sys
 import threading
 import time
@@ -16,7 +14,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from harvesters.core import Harvester
+import PySpin
 from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
     QBrush,
@@ -78,44 +76,85 @@ def load_config() -> dict:
     return tomlkit.parse(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
-@contextlib.contextmanager
-def silenced_stderr():
-    """Mute OS-level stderr (fd 2) so C-side prints from genicam don't leak."""
-    sys.stderr.flush()
-    old_fd = os.dup(2)
-    devnull = os.open(os.devnull, os.O_WRONLY)
+def _node_float_get(nm, name: str) -> float | None:
     try:
-        os.dup2(devnull, 2)
-        yield
-    finally:
-        sys.stderr.flush()
-        os.dup2(old_fd, 2)
-        os.close(devnull)
-        os.close(old_fd)
+        node = PySpin.CFloatPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+            return float(node.GetValue())
+    except Exception as e:
+        log.debug("camera %s read: %s", name, e)
+    return None
 
 
-def resolve_cti(producer: str) -> str:
-    p = Path(producer)
-    if p.is_file():
-        return str(p)
-    if p.is_dir():
-        for entry in sorted(p.iterdir()):
-            if entry.suffix.lower() == ".cti":
-                return str(entry)
-        raise FileNotFoundError(f"no .cti file in {p}")
-    raise FileNotFoundError(f"GenTL producer path not found: {p}")
+def _node_float_range(nm, name: str) -> tuple[float, float] | None:
+    try:
+        node = PySpin.CFloatPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+            return float(node.GetMin()), float(node.GetMax())
+    except Exception as e:
+        log.debug("camera %s range: %s", name, e)
+    return None
+
+
+def _node_float_set(nm, name: str, value: float) -> bool:
+    try:
+        node = PySpin.CFloatPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+            v = max(node.GetMin(), min(node.GetMax(), float(value)))
+            node.SetValue(v)
+            return True
+    except Exception as e:
+        log.debug("camera %s set: %s", name, e)
+    return False
+
+
+def _node_enum_get(nm, name: str) -> str | None:
+    try:
+        node = PySpin.CEnumerationPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+            return node.GetCurrentEntry().GetSymbolic()
+    except Exception as e:
+        log.debug("camera %s read: %s", name, e)
+    return None
+
+
+def _node_enum_set(nm, name: str, value: str) -> bool:
+    try:
+        node = PySpin.CEnumerationPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+            entry = node.GetEntryByName(value)
+            if entry and PySpin.IsAvailable(entry) and PySpin.IsReadable(entry):
+                node.SetIntValue(entry.GetValue())
+                return True
+    except Exception as e:
+        log.debug("camera %s set: %s", name, e)
+    return False
+
+
+def _node_bool_set(nm, name: str, value: bool) -> bool:
+    try:
+        node = PySpin.CBooleanPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+            node.SetValue(bool(value))
+            return True
+    except Exception as e:
+        log.debug("camera %s set: %s", name, e)
+    return False
 
 
 def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
-    """Convert a harvesters component buffer into an owned RGB888 ndarray.
+    """Convert a Spinnaker image buffer into an owned RGB888 ndarray.
 
     All paths return a fresh, owned, C-contiguous array — safe to use
-    after the harvesters buffer is requeued. cv2.cvtColor already
-    allocates fresh output; the RGB pass-through is the only path that
-    would otherwise return a view, so we copy it explicitly there.
+    after the source image is released. cv2.cvtColor already allocates
+    fresh output; the RGB pass-through is the only path that would
+    otherwise return a view, so we copy it explicitly there.
+
+    Accepts either flat (1D) or already-shaped input — PySpin's
+    GetNDArray() returns shaped arrays for most formats.
     """
     if "Bayer" in fmt:
-        bayer = data.reshape(height, width)
+        bayer = data if data.ndim == 2 else data.reshape(height, width)
         bayer_code = {
             "BayerRG": cv2.COLOR_BayerRG2RGB,
             "BayerGR": cv2.COLOR_BayerGR2RGB,
@@ -127,11 +166,14 @@ def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
                 return cv2.cvtColor(bayer, code)
         return cv2.cvtColor(bayer, cv2.COLOR_BayerRG2RGB)
     if "Mono" in fmt:
-        return cv2.cvtColor(data.reshape(height, width), cv2.COLOR_GRAY2RGB)
+        mono = data if data.ndim == 2 else data.reshape(height, width)
+        return cv2.cvtColor(mono, cv2.COLOR_GRAY2RGB)
     if fmt.startswith("RGB"):
-        return data.reshape(height, width, 3).copy()
+        rgb = data if data.ndim == 3 else data.reshape(height, width, 3)
+        return rgb.copy()
     if fmt.startswith("BGR"):
-        return cv2.cvtColor(data.reshape(height, width, 3), cv2.COLOR_BGR2RGB)
+        bgr = data if data.ndim == 3 else data.reshape(height, width, 3)
+        return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     raise ValueError(f"unsupported pixel format: {fmt}")
 
 
@@ -664,7 +706,7 @@ class FrameMailbox:
 
 
 class CameraAcquireWorker(QObject):
-    """Thread A: pull from harvesters, debayer, hand off to processing.
+    """Thread A: pull from PySpin, debayer, hand off to processing.
 
     Stays pinned to the camera frame rate. Pushes debayered RGB
     frames into a FrameMailbox; if processing is slower than the
@@ -675,9 +717,13 @@ class CameraAcquireWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, acquirer, mailbox: FrameMailbox) -> None:
+    # GetNextImage timeout in ms — long enough to cover the slowest
+    # exposure we expose (1 s) plus headroom.
+    FETCH_TIMEOUT_MS = 1500
+
+    def __init__(self, cam, mailbox: FrameMailbox) -> None:
         super().__init__()
-        self._acquirer = acquirer
+        self._cam = cam
         self._mailbox = mailbox
         self._running = False
 
@@ -687,22 +733,27 @@ class CameraAcquireWorker(QObject):
         log_count = 0
         log_start = time.perf_counter()
         t_fetch = t_debayer = t_publish = 0.0
-        # Cache stream-invariant component properties on first frame.
-        # Each comp.{width,height,data_format} read goes through
-        # harvesters → genicam → C and holds the GIL; profiling showed
-        # ~150 samples/30 s combined on these per-frame reads.
+        # Cache stream-invariant image properties on first frame.
         width = height = fmt = None
         while self._running:
             try:
                 t0 = time.perf_counter()
-                with self._acquirer.fetch(timeout=0.5) as buffer:
-                    comp = buffer.payload.components[0]
+                image = self._cam.GetNextImage(self.FETCH_TIMEOUT_MS)
+                try:
+                    if image.IsIncomplete():
+                        log.debug(
+                            "incomplete image: status=%s",
+                            image.GetImageStatus(),
+                        )
+                        continue
                     if width is None:
-                        width = comp.width
-                        height = comp.height
-                        fmt = comp.data_format
+                        width = image.GetWidth()
+                        height = image.GetHeight()
+                        fmt = image.GetPixelFormatName()
                     t1 = time.perf_counter()
-                    rgb = to_rgb(comp.data, width, height, fmt)
+                    rgb = to_rgb(image.GetNDArray(), width, height, fmt)
+                finally:
+                    image.Release()
                 t2 = time.perf_counter()
                 self._mailbox.publish(rgb)
                 t3 = time.perf_counter()
@@ -722,7 +773,7 @@ class CameraAcquireWorker(QObject):
                     log_count = 0
                     log_start = t3
                     t_fetch = t_debayer = t_publish = 0.0
-            except Exception as e:  # noqa: BLE001 — surface errors then keep trying
+            except PySpin.SpinnakerException as e:
                 self.error.emit(str(e))
                 time.sleep(0.1)
         self.finished.emit()
@@ -1118,9 +1169,10 @@ class CameraOptionsPanel(QGroupBox):
         "BalanceRatioBlue": 3.3,
     }
 
-    def __init__(self, node_map, defaults: dict) -> None:
+    def __init__(self, cam, defaults: dict) -> None:
         super().__init__("Camera Options")
-        self.node_map = node_map
+        self._cam = cam
+        self._nm = cam.GetNodeMap()
         self._defaults = dict(self.OUR_DEFAULTS)
         if defaults.get("gain") is not None:
             self._defaults["Gain"] = float(defaults["gain"])
@@ -1181,11 +1233,9 @@ class CameraOptionsPanel(QGroupBox):
         # BalanceRatio is locked while WB auto is on. Try to read the
         # node's bounds anyway; fall back to Flea3-observed [0.25, 4.0].
         lo, hi = 0.25, 4.0
-        try:
-            br = self.node_map.BalanceRatio
-            lo, hi = float(br.min), float(br.max)
-        except Exception:
-            pass
+        rng = _node_float_range(self._nm, "BalanceRatio")
+        if rng is not None:
+            lo, hi = rng
         self.wb_red_spin.setRange(lo, hi)
         self.wb_blue_spin.setRange(lo, hi)
 
@@ -1209,44 +1259,34 @@ class CameraOptionsPanel(QGroupBox):
         self.defaults_btn.clicked.connect(self._apply_defaults)
 
     def _setup_range_float(self, name: str, spin: QDoubleSpinBox) -> None:
-        try:
-            node = getattr(self.node_map, name)
-            spin.setRange(float(node.min), float(node.max))
-        except Exception as e:
+        rng = _node_float_range(self._nm, name)
+        if rng is None:
             spin.setEnabled(False)
-            log.debug("camera %s range: %s", name, e)
+            return
+        spin.setRange(*rng)
 
     def _set_float(self, name: str, value: float) -> None:
-        try:
-            node = getattr(self.node_map, name)
-            node.value = max(node.min, min(node.max, float(value)))
-        except Exception as e:
-            log.debug("camera %s: %s", name, e)
+        _node_float_set(self._nm, name, value)
 
     def _set_enum(self, name: str, value: str) -> None:
-        try:
-            getattr(self.node_map, name).value = value
-        except Exception as e:
-            log.debug("camera %s: %s", name, e)
+        _node_enum_set(self._nm, name, value)
 
     def _on_gain_auto_toggled(self, on: bool) -> None:
         self._set_enum("GainAuto", "Continuous" if on else "Off")
         self.gain_spin.setEnabled(not on)
         if not on:
-            try:
-                self.gain_spin.setValue(float(self.node_map.Gain.value))
-            except Exception:
-                pass
+            v = _node_float_get(self._nm, "Gain")
+            if v is not None:
+                self.gain_spin.setValue(v)
 
     def _on_exp_auto_toggled(self, on: bool) -> None:
         self._set_enum("ExposureAuto", "Continuous" if on else "Off")
         self.exp_spin.setEnabled(not on)
         if not on:
             # Camera reports ExposureTime in µs; spinbox is in ms.
-            try:
-                self.exp_spin.setValue(float(self.node_map.ExposureTime.value) / 1000.0)
-            except Exception:
-                pass
+            v = _node_float_get(self._nm, "ExposureTime")
+            if v is not None:
+                self.exp_spin.setValue(v / 1000.0)
 
     def _on_wb_auto_toggled(self, on: bool) -> None:
         self._set_enum("BalanceWhiteAuto", "Continuous" if on else "Off")
@@ -1254,21 +1294,16 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.setEnabled(not on)
         if not on:
             for color, spin in (("Red", self.wb_red_spin), ("Blue", self.wb_blue_spin)):
-                try:
-                    self.node_map.BalanceRatioSelector.value = color
-                    spin.setValue(float(self.node_map.BalanceRatio.value))
-                except Exception as e:
-                    log.debug("camera BalanceRatio %s: %s", color, e)
+                if _node_enum_set(self._nm, "BalanceRatioSelector", color):
+                    v = _node_float_get(self._nm, "BalanceRatio")
+                    if v is not None:
+                        spin.setValue(v)
 
     def _set_balance_ratio(self, color: str, value: float) -> None:
         if self.wb_auto.isChecked():
             return
-        try:
-            self.node_map.BalanceRatioSelector.value = color
-            node = self.node_map.BalanceRatio
-            node.value = max(node.min, min(node.max, float(value)))
-        except Exception as e:
-            log.debug("camera BalanceRatio %s: %s", color, e)
+        if _node_enum_set(self._nm, "BalanceRatioSelector", color):
+            _node_float_set(self._nm, "BalanceRatio", value)
 
     def _set_exposure_us(self, value_us: float) -> None:
         """Write ExposureTime (µs) and pin AcquisitionFrameRate to the
@@ -1281,21 +1316,13 @@ class CameraOptionsPanel(QGroupBox):
           2. ExposureTime → desired
           3. AcquisitionFrameRate → its (now-recomputed) max
         """
-        try:
-            afr = self.node_map.AcquisitionFrameRate
-            afr.value = float(afr.min)
-        except Exception as e:
-            log.debug("camera AcquisitionFrameRate (drop): %s", e)
-        try:
-            et = self.node_map.ExposureTime
-            et.value = max(float(et.min), min(float(et.max), float(value_us)))
-        except Exception as e:
-            log.debug("camera ExposureTime: %s", e)
-        try:
-            afr = self.node_map.AcquisitionFrameRate
-            afr.value = float(afr.max)
-        except Exception as e:
-            log.debug("camera AcquisitionFrameRate (raise): %s", e)
+        rng = _node_float_range(self._nm, "AcquisitionFrameRate")
+        if rng is not None:
+            _node_float_set(self._nm, "AcquisitionFrameRate", rng[0])
+        _node_float_set(self._nm, "ExposureTime", value_us)
+        rng = _node_float_range(self._nm, "AcquisitionFrameRate")
+        if rng is not None:
+            _node_float_set(self._nm, "AcquisitionFrameRate", rng[1])
 
     def _apply_defaults(self) -> None:
         """Push OUR_DEFAULTS to the camera and sync the widgets. Used at
@@ -1309,12 +1336,8 @@ class CameraOptionsPanel(QGroupBox):
         # WB ratios are only writable while BalanceWhiteAuto is Off.
         if d["BalanceWhiteAuto"] != "Continuous":
             for color, key in (("Red", "BalanceRatioRed"), ("Blue", "BalanceRatioBlue")):
-                try:
-                    self.node_map.BalanceRatioSelector.value = color
-                    node = self.node_map.BalanceRatio
-                    node.value = max(node.min, min(node.max, float(d[key])))
-                except Exception as e:
-                    log.debug("camera BalanceRatio %s: %s", color, e)
+                if _node_enum_set(self._nm, "BalanceRatioSelector", color):
+                    _node_float_set(self._nm, "BalanceRatio", float(d[key]))
         gain_auto_on = d["GainAuto"] == "Continuous"
         exp_auto_on = d["ExposureAuto"] == "Continuous"
         wb_auto_on = d["BalanceWhiteAuto"] == "Continuous"
@@ -1762,23 +1785,19 @@ class CameraWindow(QMainWindow):
 
         config = load_config()
         camera_cfg = config.get("camera", {})
-
-        cti = resolve_cti(config["gentl"]["producer"])
         device_index = int(camera_cfg.get("device_index", 0))
 
-        with silenced_stderr():
-            self.harvester = Harvester()
-            self.harvester.add_file(cti)
-            self.harvester.update()
-            if not self.harvester.device_info_list:
-                raise RuntimeError("no cameras enumerated by GenTL producer")
-            self.acquirer = self.harvester.create(device_index)
+        self._spin_system = PySpin.System.GetInstance()
+        self._cam_list = self._spin_system.GetCameras()
+        if self._cam_list.GetSize() == 0:
+            self._cam_list.Clear()
+            self._spin_system.ReleaseInstance()
+            raise RuntimeError("no cameras enumerated by Spinnaker")
+        self.cam = self._cam_list.GetByIndex(device_index)
+        self.cam.Init()
 
-        # Camera config + start: outside silenced_stderr so any errors and
-        # our diagnostic prints are visible. silenced_stderr was originally
-        # only there to mute the GenTL producer's enumeration noise.
         self._apply_camera_startup()
-        self.acquirer.start()
+        self.cam.BeginAcquisition()
 
         settings_panel = self._build_settings_panel(camera_cfg)
         right_panel = self._build_right_panel(config.get("axis", []), config.get("heater"))
@@ -1801,7 +1820,7 @@ class CameraWindow(QMainWindow):
         self.hist_mailbox = FrameMailbox()
 
         self.acq_thread = QThread()
-        self.acq_worker = CameraAcquireWorker(self.acquirer, self.acq_mailbox)
+        self.acq_worker = CameraAcquireWorker(self.cam, self.acq_mailbox)
         self.acq_worker.moveToThread(self.acq_thread)
         self.acq_thread.started.connect(self.acq_worker.run)
         self.acq_worker.error.connect(self._on_frame_error)
@@ -1842,34 +1861,29 @@ class CameraWindow(QMainWindow):
         Gain / exposure / their auto modes are applied later by
         CameraOptionsPanel from the camera section of config.toml.
         """
-        nm = self.acquirer.remote_device.node_map
+        nm = self.cam.GetNodeMap()
         for name, value in (
             ("AcquisitionMode", "Continuous"),
             ("BalanceWhiteAuto", "Continuous"),
             ("AcquisitionFrameRateAuto", "Off"),
         ):
-            try:
-                getattr(nm, name).value = value
-            except Exception as e:
-                log.warning("camera %s: %s", name, e)
+            if not _node_enum_set(nm, name, value):
+                log.warning("camera %s: not writable or missing", name)
         # The "enabled" node is named differently across FLIR generations.
         for name in ("AcquisitionFrameRateEnabled", "AcquisitionFrameRateEnable"):
-            try:
-                getattr(nm, name).value = True
+            if _node_bool_set(nm, name, True):
                 break
-            except Exception:
-                continue
-        try:
-            rate = nm.AcquisitionFrameRate
-            rate.value = float(rate.max)
+        rng = _node_float_range(nm, "AcquisitionFrameRate")
+        if rng is not None:
+            _node_float_set(nm, "AcquisitionFrameRate", rng[1])
+            v = _node_float_get(nm, "AcquisitionFrameRate")
             log.info(
                 "camera AcquisitionFrameRate = %.2f Hz (range %.2f..%.2f)",
-                rate.value,
-                rate.min,
-                rate.max,
+                v if v is not None else float("nan"),
+                rng[0], rng[1],
             )
-        except Exception as e:
-            log.warning("camera AcquisitionFrameRate: %s", e)
+        else:
+            log.warning("camera AcquisitionFrameRate: not available")
 
     def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
         panel = QWidget()
@@ -1879,9 +1893,7 @@ class CameraWindow(QMainWindow):
 
         self.adjustments_panel = ImageAdjustmentsPanel(self.adjustments)
 
-        self.camera_options_panel = CameraOptionsPanel(
-            self.acquirer.remote_device.node_map, camera_cfg
-        )
+        self.camera_options_panel = CameraOptionsPanel(self.cam, camera_cfg)
 
         layout.addWidget(self.camera_options_panel)
         layout.addWidget(self.adjustments_panel)
@@ -1997,9 +2009,20 @@ class CameraWindow(QMainWindow):
             ap.shutdown()
         if self.heater_panel is not None:
             self.heater_panel.shutdown()
-        self.acquirer.stop()
-        self.acquirer.destroy()
-        self.harvester.reset()
+        # PySpin shutdown: end stream, deinit, drop the Camera reference
+        # before clearing the list and releasing the system instance.
+        # ReleaseInstance asserts that all Camera handles are gone.
+        try:
+            self.cam.EndAcquisition()
+        except Exception as e:
+            log.debug("EndAcquisition: %s", e)
+        try:
+            self.cam.DeInit()
+        except Exception as e:
+            log.debug("DeInit: %s", e)
+        del self.cam
+        self._cam_list.Clear()
+        self._spin_system.ReleaseInstance()
         super().closeEvent(event)
 
 
