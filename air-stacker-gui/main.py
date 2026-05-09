@@ -1307,6 +1307,14 @@ class CameraOptionsPanel(QGroupBox):
         super().__init__("Camera Options")
         self._cam = cam
         self._nm = cam.GetNodeMap()
+        # Serializes BalanceRatioSelector swap-and-access sequences. The
+        # poll worker reads Red then Blue (each = swap selector + read
+        # ratio); GUI-thread WB writes also swap selector + write ratio.
+        # Without the lock those two pairs could interleave and one side
+        # would see/write the wrong color.
+        self._wb_lock = threading.Lock()
+        self._poll_thread: QThread | None = None
+        self._poll_worker: PollWorker | None = None
         self._defaults = dict(self.OUR_DEFAULTS)
         if defaults.get("gain") is not None:
             self._defaults["Gain"] = float(defaults["gain"])
@@ -1402,6 +1410,18 @@ class CameraOptionsPanel(QGroupBox):
         self.binning_combo.activated.connect(self._on_binning_activated)
         self.defaults_btn.clicked.connect(self._apply_defaults)
 
+        # Worker-thread poll so the spinboxes track camera-driven values
+        # (auto gain / auto exposure / auto WB) live. The slot ignores
+        # readings for any channel whose auto checkbox is off — manual
+        # values stay pinned to the user's last edit.
+        self._poll_thread = QThread()
+        self._poll_worker = PollWorker(self._poll_camera_state, 0.2)
+        self._poll_worker.moveToThread(self._poll_thread)
+        self._poll_thread.started.connect(self._poll_worker.run)
+        self._poll_worker.state_ready.connect(self._apply_polled_state)
+        self._poll_worker.finished.connect(self._poll_thread.quit)
+        self._poll_thread.start()
+
     def _populate_binning_combo(self) -> None:
         """Build entries from BINNING_OPTIONS, filtered to the camera's
         actual BinningVertical range. Selects the current value. If only
@@ -1480,16 +1500,19 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.setEnabled(not on)
         if not on:
             for color, spin in (("Red", self.wb_red_spin), ("Blue", self.wb_blue_spin)):
-                if _node_enum_set(self._nm, "BalanceRatioSelector", color):
+                with self._wb_lock:
+                    if not _node_enum_set(self._nm, "BalanceRatioSelector", color):
+                        continue
                     v = _node_float_get(self._nm, "BalanceRatio")
-                    if v is not None:
-                        spin.setValue(v)
+                if v is not None:
+                    spin.setValue(v)
 
     def _set_balance_ratio(self, color: str, value: float) -> None:
         if self.wb_auto.isChecked():
             return
-        if _node_enum_set(self._nm, "BalanceRatioSelector", color):
-            _node_float_set(self._nm, "BalanceRatio", value)
+        with self._wb_lock:
+            if _node_enum_set(self._nm, "BalanceRatioSelector", color):
+                _node_float_set(self._nm, "BalanceRatio", value)
 
     def _set_exposure_us(self, value_us: float) -> None:
         """Write ExposureTime (µs) and pin AcquisitionFrameRate to the
@@ -1522,8 +1545,9 @@ class CameraOptionsPanel(QGroupBox):
         # WB ratios are only writable while BalanceWhiteAuto is Off.
         if d["BalanceWhiteAuto"] != "Continuous":
             for color, key in (("Red", "BalanceRatioRed"), ("Blue", "BalanceRatioBlue")):
-                if _node_enum_set(self._nm, "BalanceRatioSelector", color):
-                    _node_float_set(self._nm, "BalanceRatio", float(d[key]))
+                with self._wb_lock:
+                    if _node_enum_set(self._nm, "BalanceRatioSelector", color):
+                        _node_float_set(self._nm, "BalanceRatio", float(d[key]))
         gain_auto_on = d["GainAuto"] == "Continuous"
         exp_auto_on = d["ExposureAuto"] == "Continuous"
         wb_auto_on = d["BalanceWhiteAuto"] == "Continuous"
@@ -1560,6 +1584,69 @@ class CameraOptionsPanel(QGroupBox):
         ):
             self.binning_combo.setEnabled(False)
             self.binning_change_requested.emit(target_bin)
+
+    def _poll_camera_state(self) -> dict:
+        """Worker-thread: read live camera values. Must not touch Qt widgets.
+
+        Always reads everything; the GUI-thread slot decides which spinboxes
+        to update based on each channel's auto checkbox. Returns None for
+        any field whose read fails so the slot can skip it.
+        """
+        payload: dict = {
+            "gain": _node_float_get(self._nm, "Gain"),
+            "exposure_us": _node_float_get(self._nm, "ExposureTime"),
+        }
+        # BalanceRatio is multiplexed via BalanceRatioSelector; the lock
+        # protects the swap+read pair against concurrent GUI-thread writes
+        # (which also swap+write under the same lock).
+        for color, key in (("Red", "wb_red"), ("Blue", "wb_blue")):
+            with self._wb_lock:
+                if _node_enum_set(self._nm, "BalanceRatioSelector", color):
+                    payload[key] = _node_float_get(self._nm, "BalanceRatio")
+                else:
+                    payload[key] = None
+        return payload
+
+    @Slot(object)
+    def _apply_polled_state(self, payload: dict) -> None:
+        """Main-thread: push live camera values to spinboxes for any channel
+        whose auto is on and whose spinbox isn't currently being edited.
+
+        Skipping focused spinboxes preserves in-progress user typing —
+        without that, a poll landing mid-edit would replace the user's
+        digits before editingFinished fires.
+        """
+        if (
+            self.gain_auto.isChecked()
+            and not self.gain_spin.hasFocus()
+            and (v := payload.get("gain")) is not None
+        ):
+            self.gain_spin.setValue(float(v))
+        if (
+            self.exp_auto.isChecked()
+            and not self.exp_spin.hasFocus()
+            and (v := payload.get("exposure_us")) is not None
+        ):
+            # Camera reports µs; spinbox is ms.
+            self.exp_spin.setValue(float(v) / 1000.0)
+        if self.wb_auto.isChecked():
+            if (
+                not self.wb_red_spin.hasFocus()
+                and (v := payload.get("wb_red")) is not None
+            ):
+                self.wb_red_spin.setValue(float(v))
+            if (
+                not self.wb_blue_spin.hasFocus()
+                and (v := payload.get("wb_blue")) is not None
+            ):
+                self.wb_blue_spin.setValue(float(v))
+
+    def shutdown(self) -> None:
+        if self._poll_worker is not None and self._poll_thread is not None:
+            self._poll_worker.stop()
+            self._poll_thread.quit()
+            if not self._poll_thread.wait(2000):
+                log.warning("camera options poll thread did not exit cleanly")
 
 
 class ChannelHistogram(QWidget):
@@ -2515,6 +2602,8 @@ class CameraWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self._stop_workers()
+        if self.camera_options_panel is not None:
+            self.camera_options_panel.shutdown()
         for ap in self.axis_panels:
             ap.shutdown()
         if self.heater_panel is not None:
