@@ -48,7 +48,7 @@ from PySide6.QtWidgets import (
 )
 from superqt import QRangeSlider
 
-from conex import ConexAxis, error_label, state_label
+from conex import ConexAxis, ConexError, error_label, state_label
 from focus_metric import sharpness as compute_sharpness
 from heater import OmegaPlatinum, SystemState
 from smc100_panel import SMC100Panel
@@ -1236,30 +1236,53 @@ class ConexAxisPanel(QGroupBox):
 
         self.status_label = QLabel("disconnected")
         self.position_label = QLabel("—")
-        font = self.position_label.font()
-        font.setPointSize(font.pointSize() + 4)
-        self.position_label.setFont(font)
+        pos_font = QFont(self.position_label.font())
+        pos_font.setPointSize(pos_font.pointSize() + 6)
+        pos_font.setStyleHint(QFont.StyleHint.Monospace)
+        pos_font.setFamily("monospace")
+        self.position_label.setFont(pos_font)
         self.id_label = QLabel("")
         self.id_label.setStyleSheet("color: #888;")
         self.id_label.setVisible(False)
 
         self.target_spin = QDoubleSpinBox()
+        self.target_spin.setKeyboardTracking(False)
         self.target_spin.setRange(-1e6, 1e6)
         self.target_spin.setDecimals(6)
         self.target_spin.setSingleStep(0.01)
+        if self.units:
+            self.target_spin.setSuffix(f" {self.units}")
         self.go_btn = QPushButton("Go")
 
         self.step_spin = QDoubleSpinBox()
+        self.step_spin.setKeyboardTracking(False)
         self.step_spin.setRange(0.0, 1e6)
         self.step_spin.setDecimals(6)
+        self.step_spin.setSingleStep(0.01)
+        if self.units:
+            self.step_spin.setSuffix(f" {self.units}")
         self.step_spin.setValue(float(axis_config.get("step", 0.01)))
+
+        self.velocity_spin = QDoubleSpinBox()
+        self.velocity_spin.setKeyboardTracking(False)
+        self.velocity_spin.setDecimals(3)
+        self.velocity_spin.setSingleStep(0.5)
+        self.velocity_spin.setRange(0.001, 1000.0)
+        self.velocity_spin.setSuffix(f" {self.units}/s" if self.units else "/s")
 
         self.jog_minus_btn = QPushButton("−")
         self.jog_plus_btn = QPushButton("+")
-        self.stop_btn = QPushButton("Stop")
         self.home_btn = QPushButton("Home")
         self.enable_btn = QPushButton("Enable")
         self.disable_btn = QPushButton("Disable")
+
+        # Stop sits on the top-right of the status row (matches SMC100).
+        self.stop_btn = QPushButton("STOP")
+        self.stop_btn.setStyleSheet(
+            "QPushButton { background-color: #c0392b; color: white; "
+            "font-weight: bold; padding: 2px 10px; }"
+            "QPushButton:pressed { background-color: #962d22; }"
+        )
 
         self._build_layout()
         self._wire_signals()
@@ -1277,6 +1300,15 @@ class ConexAxisPanel(QGroupBox):
         self.id_label.setText(self.axis.identify())
         self.status_label.setText(f"connected on {self.axis.port}")
 
+        # Pre-populate velocity from the controller (best-effort).
+        try:
+            v = self.axis.velocity()
+            self.velocity_spin.blockSignals(True)
+            self.velocity_spin.setValue(v)
+            self.velocity_spin.blockSignals(False)
+        except ConexError:
+            pass
+
         self._worker_thread = QThread()
         self._worker = PollWorker(self._read_state, self.POLL_MS / 1000.0)
         self._worker.moveToThread(self._worker_thread)
@@ -1288,40 +1320,47 @@ class ConexAxisPanel(QGroupBox):
     def _build_layout(self) -> None:
         outer = QVBoxLayout(self)
 
-        outer.addWidget(self.status_label)
-        outer.addWidget(self.position_label)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, stretch=1)
+        status_row.addWidget(self.stop_btn)
+        outer.addLayout(status_row)
         outer.addWidget(self.id_label)
 
-        sep = QFrame()
-        sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setFrameShadow(QFrame.Shadow.Sunken)
-        outer.addWidget(sep)
+        sep1 = QFrame()
+        sep1.setFrameShape(QFrame.Shape.HLine)
+        sep1.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(sep1)
 
-        abs_row = QHBoxLayout()
-        abs_row.addWidget(QLabel("Target:"))
-        abs_row.addWidget(self.target_spin, stretch=1)
-        abs_row.addWidget(self.go_btn)
-        outer.addLayout(abs_row)
+        outer.addWidget(self.position_label)
 
-        step_row = QHBoxLayout()
-        step_row.addWidget(QLabel("Step:"))
-        step_row.addWidget(self.step_spin, stretch=1)
-        outer.addLayout(step_row)
+        sep2 = QFrame()
+        sep2.setFrameShape(QFrame.Shape.HLine)
+        sep2.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(sep2)
+
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Go to:"))
+        target_row.addWidget(self.target_spin, stretch=1)
+        target_row.addWidget(self.go_btn)
+        outer.addLayout(target_row)
+
+        step_speed_row = QHBoxLayout()
+        step_speed_row.addWidget(QLabel("Step:"))
+        step_speed_row.addWidget(self.step_spin, stretch=1)
+        step_speed_row.addWidget(QLabel("Speed:"))
+        step_speed_row.addWidget(self.velocity_spin, stretch=1)
+        outer.addLayout(step_speed_row)
 
         jog_row = QHBoxLayout()
-        jog_row.addWidget(self.jog_minus_btn)
-        jog_row.addWidget(self.jog_plus_btn)
+        jog_row.addWidget(self.jog_minus_btn, stretch=1)
+        jog_row.addWidget(self.jog_plus_btn, stretch=1)
         outer.addLayout(jog_row)
 
         action_row = QHBoxLayout()
-        action_row.addWidget(self.stop_btn)
         action_row.addWidget(self.home_btn)
+        action_row.addWidget(self.enable_btn)
+        action_row.addWidget(self.disable_btn)
         outer.addLayout(action_row)
-
-        enable_row = QHBoxLayout()
-        enable_row.addWidget(self.enable_btn)
-        enable_row.addWidget(self.disable_btn)
-        outer.addLayout(enable_row)
 
         outer.addStretch(1)
 
@@ -1333,6 +1372,10 @@ class ConexAxisPanel(QGroupBox):
         self.home_btn.clicked.connect(lambda: self._safe(self.axis.home))
         self.enable_btn.clicked.connect(lambda: self._safe(self.axis.enable))
         self.disable_btn.clicked.connect(lambda: self._safe(self.axis.disable))
+        self.velocity_spin.editingFinished.connect(self._on_set_velocity)
+
+    def _on_set_velocity(self) -> None:
+        self._safe(self.axis.set_velocity, self.velocity_spin.value())
 
     def _set_motion_enabled(self, enabled: bool) -> None:
         for btn in (

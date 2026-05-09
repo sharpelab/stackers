@@ -179,6 +179,14 @@ class ConexAxis:
     def positive_limit(self) -> float:
         return float(self.query("SR?"))
 
+    def velocity(self) -> float:
+        return float(self.query("VA?"))
+
+    # --- transient setters ---
+    def set_velocity(self, v: float) -> None:
+        # VA without a PW1/PW0 wrap is RAM-only — does not touch flash.
+        self.send(f"VA{v}")
+
     # --- motion (do not call until intended) ---
     def move_absolute(self, target: float) -> None:
         self.send(f"PA{target}")
