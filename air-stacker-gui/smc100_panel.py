@@ -413,6 +413,10 @@ class SMC100Panel(QGroupBox):
             )
         self._jog_direction = 0
         self._jog_continuous = False
+        # Reconcile button-enabled state now that the jog buttons are no
+        # longer held. _refresh_button_enables skipped them while pressed.
+        if self._last_state_code is not None:
+            self._refresh_button_enables(self._last_state_code)
 
     def _on_set_velocity(self) -> None:
         self._safe(self.axis.set_velocity, self.velocity_spin.value())
@@ -516,8 +520,15 @@ class SMC100Panel(QGroupBox):
         in_jogging = state_code in JOGGING_STATES
 
         self.go_btn.setEnabled(in_ready)
-        self.jog_minus_btn.setEnabled(in_ready)
-        self.jog_plus_btn.setEnabled(in_ready)
+        # Jog buttons: skip toggling while one is held. Qt fires released()
+        # when you setEnabled(False) on a pressed button, so disabling them
+        # mid-press (e.g. when the controller transitions READY → MOVING
+        # after our move_relative goes through) cancels the continuous-mode
+        # jog right after it started. _on_jog_released reconciles state on
+        # actual release.
+        if self._jog_direction == 0:
+            self.jog_minus_btn.setEnabled(in_ready)
+            self.jog_plus_btn.setEnabled(in_ready)
         self.target_spin.setEnabled(in_ready)
         self.step_spin.setEnabled(in_ready)
         self.velocity_spin.setEnabled(in_ready)
