@@ -2520,6 +2520,9 @@ class HeaterPanel(QGroupBox):
         sp_caption.setStyleSheet(caption_style)
         sp_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
+        # --- status line (text, lives directly under the temps) -------------
+        self.status_text_label = QLabel("status: —")
+
         # --- output bar ------------------------------------------------------
         self.output_pct_label = QLabel("output  —")
         self.output_bar = QProgressBar()
@@ -2528,11 +2531,9 @@ class HeaterPanel(QGroupBox):
         self.output_bar.setFixedHeight(12)
         self.output_cap_label = QLabel("")
         self.output_cap_label.setStyleSheet(caption_style)
-
-        # --- state pill ------------------------------------------------------
-        self.state_pill = QLabel("—")
-        self.state_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.state_pill.setStyleSheet(self._pill_style("idle"))
+        self.output_cap_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
 
         # --- editable controls ----------------------------------------------
         self.setpoint_spin = QDoubleSpinBox()
@@ -2566,22 +2567,21 @@ class HeaterPanel(QGroupBox):
         hero_grid.addWidget(sp_caption, 1, 1)
         outer.addLayout(hero_grid)
 
+        outer.addWidget(self.status_text_label)
+
         outer.addSpacing(8)
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep)
 
-        outer.addWidget(self.output_pct_label)
+        out_row = QHBoxLayout()
+        out_row.addWidget(self.output_pct_label)
+        out_row.addStretch(1)
+        out_row.addWidget(self.output_cap_label)
+        outer.addLayout(out_row)
         outer.addWidget(self.output_bar)
-        outer.addWidget(self.output_cap_label)
 
-        outer.addSpacing(6)
-        pill_row = QHBoxLayout()
-        pill_row.addStretch(1)
-        pill_row.addWidget(self.state_pill)
-        pill_row.addStretch(1)
-        outer.addLayout(pill_row)
         outer.addSpacing(6)
 
         sp_row = QHBoxLayout()
@@ -2679,19 +2679,12 @@ class HeaterPanel(QGroupBox):
             pass
         return payload
 
-    @staticmethod
-    def _pill_style(kind: str) -> str:
-        palette = {
-            "run": "#2e7d32",   # green
-            "fault": "#c0392b", # red
-            "tune": "#1976d2",  # blue
-            "idle": "#888888",
-        }
-        bg = palette.get(kind, palette["idle"])
-        return (
-            f"QLabel {{ background-color: {bg}; color: white; "
-            f"font-weight: bold; padding: 4px 12px; border-radius: 8px; }}"
-        )
+    _STATUS_COLORS = {
+        "run": "#2e7d32",   # green
+        "fault": "#c0392b", # red
+        "tune": "#1976d2",  # blue
+        "idle": "#888888",
+    }
 
     @Slot(object)
     def _apply_state(self, payload: dict) -> None:
@@ -2709,7 +2702,6 @@ class HeaterPanel(QGroupBox):
 
         if "state" in payload:
             state = payload["state"]
-            self.state_pill.setText(f"● {state.name}")
             if state == SystemState.RUN:
                 kind = "run"
             elif state in (SystemState.FAULT, SystemState.SHUTDOWN):
@@ -2718,7 +2710,11 @@ class HeaterPanel(QGroupBox):
                 kind = "tune"
             else:
                 kind = "idle"
-            self.state_pill.setStyleSheet(self._pill_style(kind))
+            color = self._STATUS_COLORS[kind]
+            self.status_text_label.setText(
+                f"status: <span style='color: {color}; font-weight: bold;'>"
+                f"{state.name}</span>"
+            )
 
         if "out" in payload:
             out = payload["out"]
