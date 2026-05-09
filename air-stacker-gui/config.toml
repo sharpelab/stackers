@@ -24,3 +24,16 @@ baud = 19200
 slave_id = 1
 units = "°C"
 poll_interval_ms = 1000
+
+# Newport SMC100CC Z-axis motion controller (RS-232C → USB-RS232).
+# `position_limits` is the operational software cap. Stay within the rig's
+# 30 mm safe travel envelope (see docs/air-stacker-pc.md "Z stage — SMC100CC").
+# The controller's ESP-loaded SL/SR are wider (-0.1 to +50.1 mm); the panel
+# enforces this tighter range without writing it to the controller.
+[smc100]
+port = "COM5"
+baud = 57600
+units = "mm"
+step = 0.1
+poll_interval_ms = 100
+position_limits = [0.0, 30.0]
