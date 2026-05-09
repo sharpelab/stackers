@@ -2,7 +2,7 @@
 name = "air-stacker-gui"
 version = "0.1.0"
 description = "Custom microscope viewer + recorder for the Air Stacker"
-requires-python = ">=3.13,<3.14"
+requires-python = ">=3.10,<3.11"
 dependencies = [
     "harvesters>=1.4",
     "pyside6>=6.3",
