@@ -12,11 +12,13 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 
 ## Camera
 
-- **Hardware**: Point Grey Research **Flea3 FL3-U3-20E4C** (USB3, 1.3MP color Bayer, 1280x1024 ~60 fps native). Sole connected camera.
-- **SDK**: FLIR Spinnaker **2.3.0.77** (built Nov 25 2020). Installed at `C:\Program Files\FLIR Systems\Spinnaker\`.
-- **GUI in use**: `SpinView_WPF.exe` at `bin64/vs2015/SpinView_WPF.exe` (Desktop shortcut: `new camera.lnk`). Used today for exposure / WB / gamma / color sliders.
-- **GenTL producer** (relevant for `harvesters`): `.cti` files under `C:\Program Files\FLIR Systems\Spinnaker\cti64\vs2015\`. The env var `GENICAM_GENTL64_PATH` points there.
-- **PySpin**: not installed; SDK 2.3.0 is too old to have cp310 wheels. Going with `harvesters` (pure-Python GenTL client) for our custom viewer.
+- **Hardware**: **Flea3 FL3-U3-20E4C** (USB3, **2.0 MP** color Bayer, **1600×1200** native, ~59.5 fps cap). Sole connected camera. Camera node map still reports `DeviceVendorName = "Point Grey Research"` even though FLIR / Teledyne now own the line.
+- **Pixel format**: default `BayerBG8`. Camera also exposes `BayerBG12p` / `BayerBG12Packed` / `BayerBG16` (higher bit depth), `Mono8` / `Mono12*` / `Mono16` (grayscale), `RGB8` (on-camera debayer), and several `YCbCr*` variants. Custom GUI uses `BayerBG8` and debayers host-side via OpenCV.
+- **Binning**: 2×2 only. Set via `BinningVertical = 2` — the "vertical" name is misleading; on this Flea3 the horizontal node is read-only and slaves to the vertical, so writing 2 to `BinningVertical` gives 2×2 binning (1600×1200 → 800×600). No mode toggle (`BinningVerticalMode` is missing — camera does whatever it does, presumably averaging like-colored Bayer pixels). No 4× option, no decimation. Frame-rate cap stays at 59.47 Hz at both binning settings (sensor-readout-bound, not bandwidth-bound). Probe lives at [`air-stacker-gui/probe_binning.py`](../air-stacker-gui/probe_binning.py).
+- **SDK**: FLIR / Teledyne Spinnaker **4.3** (rebranded from "FLIR Systems" → "Teledyne" in the 4.x install path: `C:\Program Files\Teledyne\Spinnaker\`).
+- **PySpin**: vendored as a wheel under `air-stacker-gui/vendor/spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl`, registered via `[tool.uv.sources]` in `pyproject.toml`. Pinned to Python 3.10 + numpy<2 (Spinnaker 4.3 ships only cp310 wheels and was built against the NumPy 1.x ABI).
+- **GenTL producer**: `.cti` files at `C:\Program Files\Teledyne\Spinnaker\cti64\vs2015\` (the `GENICAM_GENTL64_PATH` env var points there). PySpin doesn't need this — only consumers like `harvesters` (no longer used in our GUI; SpinView still does).
+- **Diagnostic GUIs**: `SpinView` at `bin64\vs2015\SpinView.exe` (replaces the old `SpinView_WPF.exe`). Useful for live exposure / WB / gamma sliders without launching our app.
 - **Legacy / unused** Desktop shortcuts (ignore): FlyCap2 (`Camera.lnk`), IC Capture 2.5, Micro-Manager / ImageJ (`hist but slower fps.lnk`).
 
 ## Stage — CONEX-CC
@@ -28,16 +30,19 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
   - LabVIEW custom UI: `~/Desktop/CONEX-CC-GUI/` — git remote `https://github.com/caoyuan96421/CONEX-CC-GUI.git`. Likely the day-to-day tool. `.lvproj`/`.lvlps` LabVIEW project. Uses NI-VISA (NI MAX is installed).
 - **Protocol**: ASCII serial (Newport CONEX-CC documented protocol). Easy to drive directly without LabVIEW.
 
-## Stage — SMC100 (newly added, 2026-05-08)
+## Z stage — SMC100CC (added 2026-05-08)
 
-- **Hardware**: Newport **SMC100 Series Motion Controller / Driver**, single-axis. Daisy-chain capable but the lab uses a single unit currently.
+- **Hardware**: Newport **SMC100CC** (DC servo variant of the SMC100 Series Motion Controller / Driver), single-axis. Daisy-chain capable but the lab uses a single unit currently. Variant identified from `1VE?` reply (`SMC_CC`); the PP variant would identify as `SMC_PP`.
+- **Firmware**: Controller-driver version **3.1.2**.
+- **Stage**: Newport **LTA-HS** "high-speed" linear translation actuator (DC servo + rotary encoder, ESP-compatible — the SMC100 reads `ZX=3` and pulls config straight from the stage's smart-memory chip on connect). Reported via `1ID?` as `LTA-HS_PN:B0601246985103_UD:062509`. Configured travel: software limits **−0.1 mm to +50.1 mm** (`1SL`/`1SR`), encoder unit **3.539 × 10⁻⁵ mm ≈ 35.4 nm/count** (`1SU`). Default velocity 5 mm/s (`1VA`), acceleration 20 mm/s² (`1AC`), homing velocity 2.5 mm/s (`1OH`), home-search type 4 (`1HT`).
 - **Connectors** (front face, photo: [`img/smc100.jpeg`](img/smc100.jpeg)): KEYPAD, **RS232C** (DB9), RS485 IN, RS485 OUT, CONFIG. Top face: MOTOR, GPIO, DC OUT, +48V power input.
-- **PC link**: RS-232C → USB-RS232 adapter (FTDI VID_0403+PID_6001, unit `FTE75V52A`) → enumerates as **COM5**.
-- **Protocol**: ASCII over 57600 8N1; addressed commands prefixed with controller index (`1` for first/master), terminated CRLF. `1VE?` = firmware version, `1ID?` = stage ID, `1TS` = state, `1TP` = position, `1RS` = reset.
-- **State machine** (printed on the box): `CONFIG` ↔ `AUTO CONFIG` → `NOT REFERENCED` → `HOMING` → `READY` ↔ `MOVING` / `JOGGING` / `DISABLE`. Faults: `ERROR FE`, `MM0/MM1 ERROR FE`, `HARDWARE FAULT`.
+- **PC link**: RS-232C → USB-RS232 adapter (FTDI VID_0403+PID_6001, unit `FTE75V52A`) → enumerates as **COM5**. Confirmed reachable on 2026-05-08; `1VE?` returns `1VE SMC_CC - Controller-driver version  3. 1. 2`.
+- **Protocol**: ASCII over 57600 8N1; addressed commands prefixed with controller index (`1` for first/master), terminated CRLF. `1VE?` = firmware version, `1ID?` = stage ID, `1TS` = state, `1TP` = position, `1RS` = reset. Full command set in the [Command Interface Manual](newport-smc100-command-interface.pdf).
+- **State machine** (printed on the box): `CONFIG` ↔ `AUTO CONFIG` → `NOT REFERENCED` → `HOMING` → `READY` ↔ `MOVING` / `JOGGING` / `DISABLE`. Faults: `ERROR FE`, `MM0/MM1 ERROR FE`, `HARDWARE FAULT`. Detailed in §5 (Programming) of the [User's Manual](newport-smc100-user-manual.pdf).
 - **DIP switches** on the back select RS-232 master vs. RS-485 slave; first controller in the chain must be in RS-232 master mode for PC comms.
 - **Probe script**: [`air-stacker-gui/probe_smc100.py`](../air-stacker-gui/probe_smc100.py) — sends `1VE?` and reports whether the controller replies. Useful for cabling iteration.
-- **Cabling note**: Newport's stock PC cable is wired DCE-style on the SMC100 end. A generic DB9 + USB-RS232 dongle (both DTE) needs a **null-modem adapter** to swap TX/RX. As of writing, controller is silent on COM5 — null-modem hasn't been tried yet.
+- **Cabling**: Newport's stock PC cable is wired DCE-style on the SMC100 end; a generic DB9 + USB-RS232 dongle (both DTE) needs a **null-modem adapter** to swap TX/RX. Current setup includes the null-modem and is working.
+- **Manuals**: [User's Manual](newport-smc100-user-manual.pdf) (EDH0206En2060, 02/25 — install, wiring, state machine, ESP stage configuration), [Command Interface Manual](newport-smc100-command-interface.pdf) (EDH0311En1023, 12/21 — `Newport.SMC100.CommandInterface.dll` reference, but the ASCII command names match what goes over RS-232).
 
 ## Heater
 

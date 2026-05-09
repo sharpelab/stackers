@@ -145,6 +145,38 @@ def _node_bool_set(nm, name: str, value: bool) -> bool:
     return False
 
 
+def _node_int_get(nm, name: str) -> int | None:
+    try:
+        node = PySpin.CIntegerPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+            return int(node.GetValue())
+    except Exception as e:
+        log.debug("camera %s read: %s", name, e)
+    return None
+
+
+def _node_int_range(nm, name: str) -> tuple[int, int] | None:
+    try:
+        node = PySpin.CIntegerPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsReadable(node):
+            return int(node.GetMin()), int(node.GetMax())
+    except Exception as e:
+        log.debug("camera %s range: %s", name, e)
+    return None
+
+
+def _node_int_set(nm, name: str, value: int) -> bool:
+    try:
+        node = PySpin.CIntegerPtr(nm.GetNode(name))
+        if PySpin.IsAvailable(node) and PySpin.IsWritable(node):
+            v = max(node.GetMin(), min(node.GetMax(), int(value)))
+            node.SetValue(v)
+            return True
+    except Exception as e:
+        log.debug("camera %s set: %s", name, e)
+    return False
+
+
 def to_rgb(data: np.ndarray, width: int, height: int, fmt: str) -> np.ndarray:
     """Convert a Spinnaker image buffer into an owned RGB888 ndarray.
 
@@ -1224,11 +1256,20 @@ class CameraOptionsPanel(QGroupBox):
     The Defaults button reverts everything to OUR_DEFAULTS — factory values
     plus the lab's preferred gain/exposure tweaks. config.toml's [camera]
     section can override gain/exposure for those keys it provides.
+    Binning is intentionally NOT touched by Defaults: it's a session-level
+    knob that requires restarting acquisition, so changes must go through
+    the dropdown's signal so CameraWindow can orchestrate the restart.
 
     Gamma and sharpness are intentionally not exposed: the on-board nodes
     are read-only on this Flea3 / Spinnaker 2.3 combo. Software gamma
     lives in the Image Adjustments panel.
     """
+
+    # Emitted when the user picks a new binning value. CameraWindow owns
+    # the restart dance (stop workers → EndAcquisition → write node →
+    # BeginAcquisition → respawn workers) and calls binning_change_complete()
+    # to re-enable the dropdown when the swap finishes.
+    binning_change_requested = Signal(int)
 
     # Hard cap on the exposure spinbox. The camera's actual ceiling is
     # ~1/AcquisitionFrameRate.min (≈900 ms on the Flea3); 1 s is the
@@ -1245,6 +1286,15 @@ class CameraOptionsPanel(QGroupBox):
         "BalanceRatioRed": 0.6,
         "BalanceRatioBlue": 3.3,
     }
+
+    # Binning options shown in the dropdown. Filtered against the actual
+    # camera-reported BinningVertical range at construction time. On the
+    # Flea3 only [1, 2] is supported; entries outside that range get
+    # dropped silently.
+    BINNING_OPTIONS: tuple[tuple[int, str], ...] = (
+        (1, "1× (1600×1200)"),
+        (2, "2× (800×600)"),
+    )
 
     def __init__(self, cam, defaults: dict) -> None:
         super().__init__("Camera Options")
@@ -1279,6 +1329,9 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.setSingleStep(0.05)
         self.wb_auto = QCheckBox("auto")
 
+        self.binning_combo = QComboBox()
+        self._populate_binning_combo()
+
         self.defaults_btn = QPushButton("Defaults")
 
         outer = QVBoxLayout(self)
@@ -1300,6 +1353,12 @@ class CameraOptionsPanel(QGroupBox):
         wb_blue_row.addWidget(QLabel("WB Blue:"))
         wb_blue_row.addWidget(self.wb_blue_spin, stretch=1)
         outer.addLayout(wb_blue_row)
+
+        binning_row = QHBoxLayout()
+        binning_row.addWidget(QLabel("Binning:"))
+        binning_row.addWidget(self.binning_combo, stretch=1)
+        outer.addLayout(binning_row)
+
         outer.addWidget(self.defaults_btn)
 
         self._setup_range_float("Gain", self.gain_spin)
@@ -1333,7 +1392,50 @@ class CameraOptionsPanel(QGroupBox):
         self.wb_blue_spin.editingFinished.connect(
             lambda: self._set_balance_ratio("Blue", self.wb_blue_spin.value())
         )
+        self.binning_combo.activated.connect(self._on_binning_activated)
         self.defaults_btn.clicked.connect(self._apply_defaults)
+
+    def _populate_binning_combo(self) -> None:
+        """Build entries from BINNING_OPTIONS, filtered to the camera's
+        actual BinningVertical range. Selects the current value. If only
+        one option remains, the dropdown is disabled (purely informational)."""
+        rng = _node_int_range(self._nm, "BinningVertical")
+        current = _node_int_get(self._nm, "BinningVertical")
+        if rng is None or current is None:
+            self.binning_combo.addItem("unavailable", 1)
+            self.binning_combo.setEnabled(False)
+            return
+        lo, hi = rng
+        # `activated` (not currentIndexChanged) is used so this initial
+        # populate doesn't fire a binning-change signal.
+        for v, label in self.BINNING_OPTIONS:
+            if lo <= v <= hi:
+                self.binning_combo.addItem(label, v)
+        idx = self.binning_combo.findData(current)
+        if idx >= 0:
+            self.binning_combo.setCurrentIndex(idx)
+        self.binning_combo.setEnabled(self.binning_combo.count() > 1)
+
+    def _on_binning_activated(self, idx: int) -> None:
+        value = self.binning_combo.itemData(idx)
+        if value is None:
+            return
+        # Disable while the restart is in flight; CameraWindow re-enables
+        # via binning_change_complete() once workers are back up.
+        self.binning_combo.setEnabled(False)
+        self.binning_change_requested.emit(int(value))
+
+    def binning_change_complete(self, applied_value: int) -> None:
+        """Re-enable the combo and sync its index to whatever actually got
+        applied (defends against the camera ignoring or clamping the
+        write — e.g. if EndAcquisition/Begin failed mid-cycle)."""
+        idx = self.binning_combo.findData(applied_value)
+        if idx >= 0:
+            # blockSignals so the resync doesn't re-emit the request.
+            self.binning_combo.blockSignals(True)
+            self.binning_combo.setCurrentIndex(idx)
+            self.binning_combo.blockSignals(False)
+        self.binning_combo.setEnabled(self.binning_combo.count() > 1)
 
     def _setup_range_float(self, name: str, spin: QDoubleSpinBox) -> None:
         rng = _node_float_range(self._nm, name)
@@ -2105,13 +2207,38 @@ class CameraWindow(QMainWindow):
         layout.addWidget(right_panel)
         self.setCentralWidget(central)
 
-        # Three-stage pipeline:
-        #   acq thread → acq_mailbox → proc thread ─┬─→ GUI mailbox → display
-        #                                           └─→ hist_mailbox → hist thread
-        # acq fetches + debayers; proc applies adjustments and forks
-        # the post-adjust frame to both the GUI (via take_latest /
-        # frame_ready) and the hist thread; hist computes + renders
-        # curve QImages off the critical path.
+        if self.camera_options_panel is not None:
+            self.camera_options_panel.binning_change_requested.connect(
+                self._on_binning_change_requested
+            )
+
+        # Pipeline state — workers and mailboxes are recreated every time
+        # acquisition (re)starts, e.g. on a binning swap.
+        self.acq_mailbox: FrameMailbox | None = None
+        self.hist_mailbox: FrameMailbox | None = None
+        self.acq_thread: QThread | None = None
+        self.proc_thread: QThread | None = None
+        self.hist_thread: QThread | None = None
+        self.acq_worker: CameraAcquireWorker | None = None
+        self.proc_worker: CameraProcessWorker | None = None
+        self.hist_worker: HistWorker | None = None
+        self._spawn_workers()
+
+    def _spawn_workers(self) -> None:
+        """Build the three-stage pipeline and start its threads.
+
+        Three-stage pipeline:
+          acq thread → acq_mailbox → proc thread ─┬─→ GUI mailbox → display
+                                                  └─→ hist_mailbox → hist thread
+        acq fetches + debayers; proc applies adjustments and forks the
+        post-adjust frame to both the GUI (via take_latest / frame_ready)
+        and the hist thread; hist computes + renders curve QImages off
+        the critical path.
+
+        Workers + mailboxes are freshly constructed each call so a
+        binning swap (which goes through EndAcquisition / BeginAcquisition)
+        starts with no stale frames in flight.
+        """
         self.acq_mailbox = FrameMailbox()
         self.hist_mailbox = FrameMailbox()
 
@@ -2146,6 +2273,29 @@ class CameraWindow(QMainWindow):
         self.proc_thread.start()
         self.hist_thread.start()
 
+    def _stop_workers(self) -> None:
+        """Tear down the pipeline: stop workers, quit threads, wait.
+
+        Stop order matters: acq first so no new frames land in the
+        mailbox, then proc and hist (both will drain their take(timeout)
+        waits via the wake)."""
+        if self.acq_worker is not None:
+            self.acq_worker.stop()
+        if self.proc_worker is not None:
+            self.proc_worker.stop()
+        if self.hist_worker is not None:
+            self.hist_worker.stop()
+        for label, thread in (
+            ("acq", self.acq_thread),
+            ("proc", self.proc_thread),
+            ("hist", self.hist_thread),
+        ):
+            if thread is None:
+                continue
+            thread.quit()
+            if not thread.wait(2000):
+                log.warning("%s thread did not exit cleanly", label)
+
     def _apply_camera_startup(self) -> None:
         """Set acquisition mode, balance-white-auto, and unlock the frame rate.
 
@@ -2153,6 +2303,10 @@ class CameraWindow(QMainWindow):
         camera (it's persistent), so without resetting it we inherit
         whatever the last user picked. We turn off auto, enable explicit
         control, and pin to the camera's max for live preview.
+
+        Binning likewise persists across SpinView/our-app sessions; we
+        force BinningVertical = 1 so a fresh launch always starts at full
+        resolution. Operators flip to 2× per session via the dropdown.
 
         Gain / exposure / their auto modes are applied later by
         CameraOptionsPanel from the camera section of config.toml.
@@ -2169,17 +2323,66 @@ class CameraWindow(QMainWindow):
         for name in ("AcquisitionFrameRateEnabled", "AcquisitionFrameRateEnable"):
             if _node_bool_set(nm, name, True):
                 break
+        # Default to no binning. Setting BinningVertical alone is the
+        # right move on this Flea3: BinningHorizontal is read-only and
+        # slaves to vertical, so writing 2 here gives full 2×2.
+        _node_int_set(nm, "BinningVertical", 1)
+        self._pin_frame_rate_max(nm)
+
+    def _pin_frame_rate_max(self, nm) -> None:
+        """Pin AcquisitionFrameRate to its current max. The achievable
+        max shifts after binning / exposure changes, so re-pin after any
+        of those."""
         rng = _node_float_range(nm, "AcquisitionFrameRate")
-        if rng is not None:
-            _node_float_set(nm, "AcquisitionFrameRate", rng[1])
-            v = _node_float_get(nm, "AcquisitionFrameRate")
-            log.info(
-                "camera AcquisitionFrameRate = %.2f Hz (range %.2f..%.2f)",
-                v if v is not None else float("nan"),
-                rng[0], rng[1],
-            )
-        else:
+        if rng is None:
             log.warning("camera AcquisitionFrameRate: not available")
+            return
+        _node_float_set(nm, "AcquisitionFrameRate", rng[1])
+        v = _node_float_get(nm, "AcquisitionFrameRate")
+        log.info(
+            "camera AcquisitionFrameRate = %.2f Hz (range %.2f..%.2f)",
+            v if v is not None else float("nan"),
+            rng[0], rng[1],
+        )
+
+    @Slot(int)
+    def _on_binning_change_requested(self, value: int) -> None:
+        """Stop workers, change BinningVertical, restart workers.
+
+        Called from CameraOptionsPanel.binning_change_requested. Blocks
+        the GUI thread for ~1 s while the worker chain restarts; the
+        dropdown is disabled by the panel during that window."""
+        log.info("binning change requested: %d×", value)
+        self._stop_workers()
+        try:
+            self.cam.EndAcquisition()
+        except Exception as e:  # noqa: BLE001
+            log.warning("EndAcquisition during binning change: %s", e)
+        nm = self.cam.GetNodeMap()
+        if not _node_int_set(nm, "BinningVertical", value):
+            log.warning("BinningVertical=%d write failed", value)
+        # Frame-rate ceiling shifts after a binning change; re-pin to max.
+        self._pin_frame_rate_max(nm)
+        try:
+            self.cam.BeginAcquisition()
+        except PySpin.SpinnakerException as e:
+            log.error("BeginAcquisition after binning change failed: %s", e)
+            self.label.clear_frame()
+            self.label.setText(f"binning swap failed: {e}")
+            applied = _node_int_get(nm, "BinningVertical") or value
+            if self.camera_options_panel is not None:
+                # Re-enable the combo so the user can attempt to recover.
+                self.camera_options_panel.binning_change_complete(applied)
+            return
+        # Reset FPS counter — old timestamps are pre-restart and would
+        # show a fake "frozen" rate during the recovery.
+        self._frame_times.clear()
+        self.label.set_fps(None)
+        self._spawn_workers()
+        applied = _node_int_get(nm, "BinningVertical") or value
+        if self.camera_options_panel is not None:
+            self.camera_options_panel.binning_change_complete(applied)
+        log.info("binning change complete: %d×", applied)
 
     def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
         panel = QWidget()
@@ -2226,6 +2429,8 @@ class CameraWindow(QMainWindow):
 
     def _on_frame(self) -> None:
         self._on_frame_calls += 1
+        if self.proc_worker is None:
+            return
         rgb = self.proc_worker.take_latest()
         if rgb is None:
             self._on_frame_noops += 1
@@ -2288,21 +2493,7 @@ class CameraWindow(QMainWindow):
             self.label.set_fps(fps)
 
     def closeEvent(self, event) -> None:
-        # Stop acq first so no new frames land in the mailbox; then
-        # proc and hist, both of which will drain their take(timeout)
-        # waits via the wake.
-        self.acq_worker.stop()
-        self.proc_worker.stop()
-        self.hist_worker.stop()
-        self.acq_thread.quit()
-        self.proc_thread.quit()
-        self.hist_thread.quit()
-        if not self.acq_thread.wait(2000):
-            log.warning("acq thread did not exit cleanly")
-        if not self.proc_thread.wait(2000):
-            log.warning("proc thread did not exit cleanly")
-        if not self.hist_thread.wait(2000):
-            log.warning("hist thread did not exit cleanly")
+        self._stop_workers()
         for ap in self.axis_panels:
             ap.shutdown()
         if self.heater_panel is not None:
