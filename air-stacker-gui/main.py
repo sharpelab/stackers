@@ -462,7 +462,7 @@ class _CameraGLWindow(QOpenGLWindow):
     def paintGL(self) -> None:
         if self._blitter is None:
             return
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         if self._paint_last_t > 0.0:
             cycle = t0 - self._paint_last_t
             self._paint_cycle_total += cycle
@@ -501,7 +501,7 @@ class _CameraGLWindow(QOpenGLWindow):
                 QOpenGLTextureBlitter.Origin.OriginTopLeft,
             )
             self._blitter.release()
-        elapsed = time.monotonic() - t0
+        elapsed = time.perf_counter() - t0
         self._paint_total += elapsed
         self._paint_max = max(self._paint_max, elapsed)
         self._paint_count += 1
@@ -685,7 +685,7 @@ class CameraAcquireWorker(QObject):
     def run(self) -> None:
         self._running = True
         log_count = 0
-        log_start = time.monotonic()
+        log_start = time.perf_counter()
         t_fetch = t_debayer = t_publish = 0.0
         # Cache stream-invariant component properties on first frame.
         # Each comp.{width,height,data_format} read goes through
@@ -694,18 +694,18 @@ class CameraAcquireWorker(QObject):
         width = height = fmt = None
         while self._running:
             try:
-                t0 = time.monotonic()
+                t0 = time.perf_counter()
                 with self._acquirer.fetch(timeout=0.5) as buffer:
                     comp = buffer.payload.components[0]
                     if width is None:
                         width = comp.width
                         height = comp.height
                         fmt = comp.data_format
-                    t1 = time.monotonic()
+                    t1 = time.perf_counter()
                     rgb = to_rgb(comp.data, width, height, fmt)
-                t2 = time.monotonic()
+                t2 = time.perf_counter()
                 self._mailbox.publish(rgb)
-                t3 = time.monotonic()
+                t3 = time.perf_counter()
                 t_fetch += t1 - t0
                 t_debayer += t2 - t1
                 t_publish += t3 - t2
@@ -773,17 +773,17 @@ class CameraProcessWorker(QObject):
         self._running = True
         log_count = 0
         log_emits = 0
-        log_start = time.monotonic()
+        log_start = time.perf_counter()
         t_wait = t_adjust = t_publish = 0.0
         while self._running:
-            t0 = time.monotonic()
+            t0 = time.perf_counter()
             rgb = self._source.take(timeout=0.1)
             if rgb is None:
                 continue
             # Fork the raw post-debayer frame to hist before adjustments.
             if self._hist_sink is not None:
                 self._hist_sink.publish(rgb)
-            t1 = time.monotonic()
+            t1 = time.perf_counter()
             if self._adjustments is not None:
                 snap = self._adjustments.get()
                 if not snap.is_identity:
@@ -797,12 +797,12 @@ class CameraProcessWorker(QObject):
                         rgb = apply_adjustments(rgb, snap, scratch=self._adjust_scratch)
                     except Exception as e:  # noqa: BLE001
                         log.warning("adjustment err: %s", e)
-            t3 = time.monotonic()
+            t3 = time.perf_counter()
             with self._lock:
                 self._latest = rgb
             self.frame_ready.emit()
             log_emits += 1
-            t4 = time.monotonic()
+            t4 = time.perf_counter()
             t_wait += t1 - t0
             t_adjust += t3 - t1
             t_publish += t4 - t3
@@ -861,7 +861,7 @@ class HistWorker(QObject):
     @Slot()
     def run(self) -> None:
         self._running = True
-        log_start = time.monotonic()
+        log_start = time.perf_counter()
         # Per-iteration ms samples — distribution shape distinguishes
         # GIL-contention starvation (heavy-tailed) from genuine slow work
         # (tight cluster near the mean).
@@ -871,13 +871,13 @@ class HistWorker(QObject):
             rgb = self._source.take(timeout=0.1)
             if rgb is None:
                 continue
-            t1 = time.monotonic()
+            t1 = time.perf_counter()
             try:
                 hist = compute_histograms(rgb)
             except Exception as e:  # noqa: BLE001
                 log.warning("hist compute err: %s", e)
                 continue
-            t2 = time.monotonic()
+            t2 = time.perf_counter()
             try:
                 images = (
                     render_hist_image(hist[0], self.CHANNEL_COLORS[0]),
@@ -887,7 +887,7 @@ class HistWorker(QObject):
             except Exception as e:  # noqa: BLE001
                 log.warning("hist render err: %s", e)
                 continue
-            t3 = time.monotonic()
+            t3 = time.perf_counter()
             self.images_ready.emit(*images)
             comp_ms.append((t2 - t1) * 1000)
             rend_ms.append((t3 - t2) * 1000)
@@ -1752,7 +1752,7 @@ class CameraWindow(QMainWindow):
         self._proc_count = 0
         self._on_frame_calls = 0
         self._on_frame_noops = 0
-        self._on_frame_log_start = time.monotonic()
+        self._on_frame_log_start = time.perf_counter()
 
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
@@ -1921,12 +1921,12 @@ class CameraWindow(QMainWindow):
             self._on_frame_noops += 1
             self._maybe_log_on_frame_rates()
             return  # drained by a previous slot run
-        t0 = time.monotonic()
+        t0 = time.perf_counter()
         # GL display: hand the numpy array straight to paintGL — no
         # QImage build, no CPU pre-scale. paintGL uploads to texture.
         self.label.set_frame(rgb)
         self._update_fps()
-        elapsed = time.monotonic() - t0
+        elapsed = time.perf_counter() - t0
         self._proc_total += elapsed
         self._proc_max = max(self._proc_max, elapsed)
         self._proc_count += 1
@@ -1945,7 +1945,7 @@ class CameraWindow(QMainWindow):
         self._maybe_log_on_frame_rates()
 
     def _maybe_log_on_frame_rates(self) -> None:
-        now = time.monotonic()
+        now = time.perf_counter()
         span = now - self._on_frame_log_start
         if span < 2.0:
             return
@@ -1967,7 +1967,7 @@ class CameraWindow(QMainWindow):
         self.label.set_fps(None)
 
     def _update_fps(self) -> None:
-        now = time.monotonic()
+        now = time.perf_counter()
         self._frame_times.append(now)
         if now - self._fps_last_update < 0.25:
             return
