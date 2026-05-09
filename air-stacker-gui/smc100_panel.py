@@ -34,7 +34,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
@@ -103,6 +103,10 @@ class SMC100Panel(QGroupBox):
     """Live status + control surface for a single SMC100CC axis."""
 
     DEFAULT_POLL_MS = 100
+    # Mouse-down duration past which a jog button switches from step to
+    # continuous mode. 250 ms is comfortable for an intentional click and
+    # short enough that a hold feels responsive.
+    JOG_HOLD_MS = 250
 
     def __init__(self, cfg: dict) -> None:
         super().__init__("Z stage (SMC100)")
@@ -199,6 +203,17 @@ class SMC100Panel(QGroupBox):
         self._worker: _PollWorker | None = None
         self._worker_thread: QThread | None = None
         self._last_state_code: str | None = None
+
+        # Click-vs-hold state for the ± jog buttons. _jog_direction is
+        # 0 when idle, ±1 while a button is held. _jog_continuous flips
+        # to True once the timer fires (we've committed to continuous
+        # mode). See _on_jog_pressed / _on_jog_released.
+        self._jog_direction: int = 0
+        self._jog_continuous: bool = False
+        self._jog_timer = QTimer(self)
+        self._jog_timer.setSingleShot(True)
+        self._jog_timer.setInterval(self.JOG_HOLD_MS)
+        self._jog_timer.timeout.connect(self._on_jog_continuous_fire)
 
         try:
             self.axis.open()
@@ -305,13 +320,14 @@ class SMC100Panel(QGroupBox):
 
     def _wire_signals(self) -> None:
         self.go_btn.clicked.connect(self._on_go)
-        # Hold-for-continuous: on press, send move_relative toward the
-        # appropriate limit; on release, stop. Single clicks still work
-        # because release fires before the controller has moved far.
-        self.jog_minus_btn.pressed.connect(self._on_jog_minus_pressed)
-        self.jog_minus_btn.released.connect(lambda: self._safe(self.axis.stop))
-        self.jog_plus_btn.pressed.connect(self._on_jog_plus_pressed)
-        self.jog_plus_btn.released.connect(lambda: self._safe(self.axis.stop))
+        # Click=step, hold>JOG_HOLD_MS=continuous. On press we just start a
+        # one-shot timer. If release fires first → step. If the timer fires
+        # first → continuous travel toward the limit. Release in continuous
+        # mode → stop. See _on_jog_pressed / _on_jog_released.
+        self.jog_minus_btn.pressed.connect(lambda: self._on_jog_pressed(-1))
+        self.jog_minus_btn.released.connect(self._on_jog_released)
+        self.jog_plus_btn.pressed.connect(lambda: self._on_jog_pressed(+1))
+        self.jog_plus_btn.released.connect(self._on_jog_released)
 
         self.velocity_spin.editingFinished.connect(self._on_set_velocity)
 
@@ -333,42 +349,54 @@ class SMC100Panel(QGroupBox):
     def _on_go(self) -> None:
         self._safe(self.axis.move_absolute, self.target_spin.value())
 
-    def _on_jog_minus_pressed(self) -> None:
-        # If we have effective limits, drive toward the lower bound; the
-        # controller will decelerate at SL or wherever we stop it. Without
-        # limits, fall back to a single-step jog.
-        if (
-            self.axis.effective_limits is not None
-            and self._last_state_code in READY_STATES
-        ):
-            try:
-                here = self.axis.position()
-            except SMC100Error:
-                self._safe(self.axis.move_relative, -self.step_spin.value())
-                return
-            lo, _ = self.axis.effective_limits
-            travel = lo - here  # negative
-            if travel < 0:
-                self._safe(self.axis.move_relative, travel)
-            return
-        self._safe(self.axis.move_relative, -self.step_spin.value())
+    def _on_jog_pressed(self, direction: int) -> None:
+        """Mouse-down on a jog button — arm the click-vs-hold timer."""
+        self._jog_direction = direction
+        self._jog_continuous = False
+        self._jog_timer.start()
 
-    def _on_jog_plus_pressed(self) -> None:
-        if (
-            self.axis.effective_limits is not None
-            and self._last_state_code in READY_STATES
-        ):
+    def _on_jog_continuous_fire(self) -> None:
+        """Hold threshold elapsed — switch from step to continuous travel."""
+        if self._jog_direction == 0:
+            return  # released before the timer got here
+        direction = self._jog_direction
+        # Position read happens on the GUI thread (matches ConexAxisPanel's
+        # existing pattern). Falls back to a single step if we can't read,
+        # since we have no idea how far the controller can travel.
+        if self.axis.effective_limits is not None:
             try:
                 here = self.axis.position()
             except SMC100Error:
-                self._safe(self.axis.move_relative, self.step_spin.value())
+                self._safe(
+                    self.axis.move_relative, direction * self.step_spin.value()
+                )
+                self._jog_continuous = True
                 return
-            _, hi = self.axis.effective_limits
-            travel = hi - here  # positive
-            if travel > 0:
+            lo, hi = self.axis.effective_limits
+            target = lo if direction < 0 else hi
+            travel = target - here
+            if (direction < 0 and travel < 0) or (direction > 0 and travel > 0):
                 self._safe(self.axis.move_relative, travel)
+        else:
+            self._safe(self.axis.move_relative, direction * self.step_spin.value())
+        self._jog_continuous = True
+
+    def _on_jog_released(self) -> None:
+        """Mouse-up on either jog button — finish a step or stop a continuous run."""
+        if self._jog_direction == 0:
             return
-        self._safe(self.axis.move_relative, self.step_spin.value())
+        if self._jog_continuous:
+            self._safe(self.axis.stop)
+        else:
+            # Quick click: cancel the pending continuous switch and fire
+            # a single step move using whatever's in the Step spinbox.
+            self._jog_timer.stop()
+            self._safe(
+                self.axis.move_relative,
+                self._jog_direction * self.step_spin.value(),
+            )
+        self._jog_direction = 0
+        self._jog_continuous = False
 
     def _on_set_velocity(self) -> None:
         self._safe(self.axis.set_velocity, self.velocity_spin.value())
