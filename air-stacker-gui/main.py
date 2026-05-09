@@ -637,7 +637,10 @@ class _CameraGLWindow(QOpenGLWindow):
                 )
                 self._frame_dirty = False
             tw, th = self.width(), self.height()
-            scale = min(tw / sw, th / sh, 1.0)
+            # No 1.0 cap — binned frames (e.g. 800×600 at BinningVertical=2)
+            # should upscale to fill the display, not sit pixel-mapped in a
+            # tiny rectangle. Linear filtering on _tex handles the upscale.
+            scale = min(tw / sw, th / sh)
             dw = int(sw * scale)
             dh = int(sh * scale)
             x = (tw - dw) // 2
@@ -1259,9 +1262,9 @@ class CameraOptionsPanel(QGroupBox):
     The Defaults button reverts everything to OUR_DEFAULTS — factory values
     plus the lab's preferred gain/exposure tweaks. config.toml's [camera]
     section can override gain/exposure for those keys it provides.
-    Binning is intentionally NOT touched by Defaults: it's a session-level
-    knob that requires restarting acquisition, so changes must go through
-    the dropdown's signal so CameraWindow can orchestrate the restart.
+    Binning resets to OUR_DEFAULTS["BinningVertical"] too, but it's
+    routed through binning_change_requested so CameraWindow can do the
+    EndAcquisition / BeginAcquisition restart dance.
 
     Gamma and sharpness are intentionally not exposed: the on-board nodes
     are read-only on this Flea3 / Spinnaker 2.3 combo. Software gamma
@@ -1288,6 +1291,7 @@ class CameraOptionsPanel(QGroupBox):
         "BalanceWhiteAuto": "Off",
         "BalanceRatioRed": 0.6,
         "BalanceRatioBlue": 3.3,
+        "BinningVertical": 1,  # 1 = no binning, 2 = 2×2 (800×600)
     }
 
     # Binning options shown in the dropdown. Filtered against the actual
@@ -1542,6 +1546,20 @@ class CameraOptionsPanel(QGroupBox):
         self.exp_spin.setValue(float(d["ExposureTime"]) / 1000.0)
         self.wb_red_spin.setValue(float(d["BalanceRatioRed"]))
         self.wb_blue_spin.setValue(float(d["BalanceRatioBlue"]))
+
+        # Binning is a separate flow because the swap requires
+        # EndAcquisition / BeginAcquisition. Only kick the restart if
+        # we'd actually change the value — and only if the dropdown is
+        # enabled (i.e. the camera supports more than one binning level).
+        target_bin = int(d["BinningVertical"])
+        current_bin = _node_int_get(self._nm, "BinningVertical")
+        if (
+            self.binning_combo.isEnabled()
+            and current_bin is not None
+            and current_bin != target_bin
+        ):
+            self.binning_combo.setEnabled(False)
+            self.binning_change_requested.emit(target_bin)
 
 
 class ChannelHistogram(QWidget):
@@ -2393,6 +2411,16 @@ class CameraWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
+        recording = QGroupBox("Recording")
+        recording_layout = QHBoxLayout(recording)
+        record_btn = QPushButton("Record")
+        record_btn.setEnabled(False)
+        stop_btn = QPushButton("Stop")
+        stop_btn.setEnabled(False)
+        recording_layout.addWidget(record_btn)
+        recording_layout.addWidget(stop_btn)
+        layout.addWidget(recording)
+
         self.adjustments_panel = ImageAdjustmentsPanel(
             self.adjustments, ImagePresetStore(CONFIG_PATH)
         )
@@ -2409,16 +2437,6 @@ class CameraWindow(QMainWindow):
         panel.setFixedWidth(300)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
-
-        recording = QGroupBox("Recording")
-        recording_layout = QHBoxLayout(recording)
-        record_btn = QPushButton("Record")
-        record_btn.setEnabled(False)
-        stop_btn = QPushButton("Stop")
-        stop_btn.setEnabled(False)
-        recording_layout.addWidget(record_btn)
-        recording_layout.addWidget(stop_btn)
-        layout.addWidget(recording)
 
         for cfg in axes_cfg:
             ap = ConexAxisPanel(cfg)
