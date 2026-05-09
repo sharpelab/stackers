@@ -186,7 +186,10 @@ class SMC100Panel(QGroupBox):
         self.reset_btn = QPushButton("Reset")
         # Escape hatch out of JOGGING state. Sends JM0 (silence keypad)
         # then JD (leave JOGGING). Both transient — no flash writes.
+        # Hidden until polling reports JOGGING; the layout row collapses
+        # when it's not visible.
         self.leave_jog_btn = QPushButton("Leave jog")
+        self.leave_jog_btn.setVisible(False)
 
         # Stop sits on the top-right of the panel (same line as status)
         # rather than as a full-width banner. Red styling keeps it visually
@@ -537,7 +540,9 @@ class SMC100Panel(QGroupBox):
         self.home_btn.setEnabled(in_not_ref)
         self.enable_btn.setEnabled(in_disable)
         self.disable_btn.setEnabled(in_ready)
-        self.leave_jog_btn.setEnabled(in_jogging)
+        # Leave-jog only appears when actually in JOGGING — it's an
+        # escape-hatch button, not part of the normal control surface.
+        self.leave_jog_btn.setVisible(in_jogging)
         # Stop and Reset are always live as long as the controller is
         # responding — Stop is the panic button, Reset works from any
         # state except CONFIGURATION (and we don't expose CONFIG-mode here).
