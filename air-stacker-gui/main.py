@@ -46,7 +46,9 @@ from PySide6.QtWidgets import (
 from superqt import QRangeSlider
 
 from conex import ConexAxis, error_label, state_label
+from focus_metric import sharpness as compute_sharpness
 from heater import OmegaPlatinum
+from status_bar import StatusBar
 
 import tomlkit
 
@@ -830,15 +832,13 @@ class _CameraGLWindow(QOpenGLWindow):
 
 
 class CameraDisplay(QWidget):
-    """Wrapper around _CameraGLWindow + overlay QLabels.
+    """Wrapper around _CameraGLWindow + a centered status QLabel.
 
     The GL window is embedded via createWindowContainer (a native
-    child window), with overlay labels stacked on top via WA_NativeWindow
-    + raise_() so they get their own native window handles and proper
-    Win32 z-order above the GL container.
+    child window), with the status label stacked on top via
+    WA_NativeWindow + raise_() so it gets its own native window
+    handle and proper Win32 z-order above the GL container.
     """
-
-    OVERLAY_MARGIN = 8
 
     def __init__(self) -> None:
         super().__init__()
@@ -855,15 +855,6 @@ class CameraDisplay(QWidget):
         self.text_label.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self.text_label.hide()
 
-        self.fps_label = QLabel("-- fps", self)
-        self.fps_label.setStyleSheet(
-            "color: white; background-color: rgba(0, 0, 0, 140);"
-            " padding: 2px 6px; border-radius: 3px;"
-        )
-        self.fps_label.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
-        self.fps_label.adjustSize()
-        self._reposition_overlay()
-
     def set_frame(self, frame_ref: np.ndarray) -> None:
         self._gl_window.set_frame(frame_ref)
         if self.text_label.isVisible():
@@ -879,24 +870,12 @@ class CameraDisplay(QWidget):
         self.text_label.raise_()
         self._gl_window.clear_frame()
 
-    def set_fps(self, fps: float | None) -> None:
-        self.fps_label.setText("-- fps" if fps is None else f"{fps:.1f} fps")
-        self.fps_label.adjustSize()
-        self._reposition_overlay()
-        self.fps_label.raise_()
-
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._gl_container.setGeometry(self.rect())
         self.text_label.setGeometry(self.rect())
-        self._reposition_overlay()
-        # Keep overlays above the GL container after every resize.
+        # Keep the text overlay above the GL container after every resize.
         self.text_label.raise_()
-        self.fps_label.raise_()
-
-    def _reposition_overlay(self) -> None:
-        m = self.OVERLAY_MARGIN
-        self.fps_label.move(m, self.height() - self.fps_label.height() - m)
 
 
 class PollWorker(QObject):
@@ -1163,6 +1142,7 @@ class HistWorker(QObject):
     """
 
     images_ready = Signal(QImage, QImage, QImage)
+    metrics_ready = Signal(float)
     finished = Signal()
 
     CHANNEL_COLORS = (
@@ -1207,6 +1187,10 @@ class HistWorker(QObject):
                 continue
             t3 = time.perf_counter()
             self.images_ready.emit(*images)
+            try:
+                self.metrics_ready.emit(compute_sharpness(rgb))
+            except Exception as e:  # noqa: BLE001
+                log.warning("sharpness compute err: %s", e)
             comp_ms.append((t2 - t1) * 1000)
             rend_ms.append((t3 - t2) * 1000)
             if t3 - log_start > 2.0:
@@ -2657,6 +2641,7 @@ class CameraWindow(QMainWindow):
         self.label = CameraDisplay()
         self.label.setText("connecting…")
         self.label.setMinimumSize(640, 480)
+        self.status_bar = StatusBar()
         self._frame_times: deque[float] = deque(maxlen=60)
         self._fps_last_update = 0.0
         self._proc_total = 0.0
@@ -2694,7 +2679,15 @@ class CameraWindow(QMainWindow):
         central = QWidget()
         layout = QHBoxLayout(central)
         layout.addWidget(settings_panel)
-        layout.addWidget(self.label, stretch=1)
+
+        middle = QWidget()
+        middle_layout = QVBoxLayout(middle)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setSpacing(0)
+        middle_layout.addWidget(self.label, stretch=1)
+        middle_layout.addWidget(self.status_bar)
+        layout.addWidget(middle, stretch=1)
+
         layout.addWidget(right_panel)
         self.setCentralWidget(central)
 
@@ -2759,6 +2752,10 @@ class CameraWindow(QMainWindow):
                 self.adjustments_panel.set_hist_images,
                 Qt.ConnectionType.QueuedConnection,
             )
+        self.hist_worker.metrics_ready.connect(
+            self.status_bar.set_sharpness,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
         self.acq_thread.start()
         self.proc_thread.start()
@@ -2865,10 +2862,12 @@ class CameraWindow(QMainWindow):
                 # Re-enable the combo so the user can attempt to recover.
                 self.camera_options_panel.binning_change_complete(applied)
             return
-        # Reset FPS counter — old timestamps are pre-restart and would
-        # show a fake "frozen" rate during the recovery.
+        # Reset status — old FPS timestamps are pre-restart and would
+        # show a fake "frozen" rate during the recovery; sharpness from
+        # the previous binning is meaningless once the sensor changes.
         self._frame_times.clear()
-        self.label.set_fps(None)
+        self.status_bar.set_fps(None)
+        self.status_bar.set_sharpness(None)
         self._spawn_workers()
         applied = _node_int_get(nm, "BinningVertical") or value
         if self.camera_options_panel is not None:
@@ -2972,7 +2971,8 @@ class CameraWindow(QMainWindow):
         self.label.clear_frame()
         self.label.setText(f"frame error: {msg}")
         self._frame_times.clear()
-        self.label.set_fps(None)
+        self.status_bar.set_fps(None)
+        self.status_bar.set_sharpness(None)
 
     def _update_fps(self) -> None:
         now = time.perf_counter()
@@ -2983,7 +2983,7 @@ class CameraWindow(QMainWindow):
         if len(self._frame_times) >= 2:
             span = self._frame_times[-1] - self._frame_times[0]
             fps = (len(self._frame_times) - 1) / span if span > 0 else None
-            self.label.set_fps(fps)
+            self.status_bar.set_fps(fps)
 
     def closeEvent(self, event) -> None:
         self._stop_workers()
