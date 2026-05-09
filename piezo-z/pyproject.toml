@@ -1,8 +1,0 @@
-[project]
-name = "piezo-z"
-version = "0.1.0"
-description = "GUI for controlling Z axis piezo driver on the dggstacker setup"
-requires-python = ">=3.11"
-dependencies = [
-    "pyside6>=6.7",
-]

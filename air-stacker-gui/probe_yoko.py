@@ -15,7 +15,7 @@ pre-SCPI vintage Yokogawa instrument:
         |   |  |   `--- mantissa·E·exponent (volts or amps)
         |   |  `------ V / A function (V = voltage mode)
         |   `--------- DC (the 7651 only does DC)
-        `------------- N normal · O overload · E error
+        `------------- N normal · E overload (per IM 7651-01E §6.2.4)
 
 Usage::
 
@@ -32,16 +32,17 @@ import sys
 
 
 _OD_RE = re.compile(
-    r"^(?P<status>[NOE])DC(?P<func>[VA])(?P<value>[+-]?\d+\.\d+E[+-]?\d+)"
+    r"^(?P<status>[NE])DC(?P<func>[VA])(?P<value>[+-]?\d+\.\d+E[+-]?\d+)"
 )
 
-_STATUS_LABEL = {"N": "normal", "O": "overload", "E": "error"}
+_STATUS_LABEL = {"N": "normal", "E": "overload"}
 
 
 def probe(resource: str) -> int:
     print(f"Probing {resource}…")
     try:
         import pyvisa
+        from pyvisa.resources import MessageBasedResource
     except ImportError as e:
         print(f"  pyvisa not installed: {e}")
         return 2
@@ -51,6 +52,11 @@ def probe(resource: str) -> int:
         inst = rm.open_resource(resource)
     except Exception as e:
         print(f"  resource error: {type(e).__name__}: {e}")
+        return 2
+
+    if not isinstance(inst, MessageBasedResource):
+        print(f"  resource {resource!r} is not message-based")
+        inst.close()
         return 2
 
     inst.timeout = 1500

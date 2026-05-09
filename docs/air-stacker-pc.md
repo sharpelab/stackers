@@ -49,12 +49,12 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Hardware**: Yokogawa **7651** programmable DC source driving the piezo stack that gives us fine Z. Sole GPIB instrument on the box.
 - **PC link**: GPIB-USB adapter (vendor TBD — surfaces to NI-VISA as `GPIB0`) → NI-VISA → resource string **`GPIB0::29::INSTR`**. GPIB primary address **29** is set on DIP switches on the back of the 7651; if those get bumped, the device disappears from `pyvisa.ResourceManager().list_resources()` until reconfigured.
 - **Currently observed (probe)**: ~+11.40 V DC, status `N` (normal), ~4 mV jitter on the readback. Probe captured on 2026-05-08 with the unit live on the piezo.
-- **Protocol — pre-SCPI Yokogawa command set**:
-  - Commands are terminated with `;` (NOT LF). Configure VISA with `write_termination=""` and put the `;` in every command string.
-  - Replies are terminated with `\r`. Configure VISA with `read_termination='\r'`.
+- **Protocol — pre-SCPI Yokogawa command set** (full reference: [`yokogawa-7651-user-manual.pdf`](../air-stacker-gui/manuals/yokogawa-7651-user-manual.pdf), IM 7651-01E §6 Communication Functions):
+  - Commands are terminated with `;` (CR LF and bare LF are also accepted by the unit; we standardize on `;`). Configure VISA with `write_termination=""` and put the `;` in every command string.
+  - Replies are terminated with **CR LF**. Use `read_termination='\n'` and strip residual `\r`.
   - **No `*IDN?`.** Sending `*IDN?` doesn't error, but the reply you read back is just whatever the talker has queued (the live OD-format output) — there is no real identification.
-  - **Set commands are write-only** — programmed voltage / current / mode / output state cannot be queried back. The canonical QCoDeS driver caches them in software.
-  - After any setting change you must send **`E;`** to trigger / apply.
+  - **Set commands are write-only** — programmed voltage / current / function / range / output state cannot be queried back. The driver caches them in software.
+  - After any setting change you must send **`E;`** (or GPIB `<GET>`) to trigger / apply.
 - **Common commands** (from the canonical driver):
 
   | Command | Meaning |
@@ -66,15 +66,16 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
   | `E;` | Trigger — apply pending changes |
   | `OD;` | Read current output data (non-perturbing) |
 
-- **OD reply format**: `NDCV+0.11402E+02` →
-  - `N` status (`N` normal · `O` overload · `E` error)
+- **OD reply format** (IM 7651-01E §6.2.4 Table 6.10): `NDCV+0.11402E+02` →
+  - `N` status (`N` normal · `E` overload — only two values; the manual does not define a separate "error" letter)
   - `DC` mode (the 7651 is DC-only)
   - `V` function (`V` voltage / `A` current)
   - signed mantissa·E·exponent — for the example, +11.402 V
 
-- **Operating range** (per the QCoDeS driver validators): voltage **±30 V**, current **±0.12 A**.
+- **Operating range** (IM 7651-01E §1.1.1): voltage ranges 10 mV / 100 mV / 1 V / 10 V / 30 V (full output ±30 V); current ranges 1 mA / 10 mA / 100 mA (full output ±120 mA).
+- **Driver**: [`air-stacker-gui/yoko.py`](../air-stacker-gui/yoko.py) — thin pyvisa wrapper. Methods: `open` / `close`, `read_output` (parses OD), `set_voltage` / `set_current` / `set_mode` / `set_output` / `reset`, `ramp_voltage`. Set commands write-only with software cache; `E;` trigger is sent automatically after every set.
 - **Probe script**: [`air-stacker-gui/probe_yoko.py`](../air-stacker-gui/probe_yoko.py) — sends `OD;`, decodes the reply, reports the live output. Read-only and safe.
-- **Canonical driver to reuse, not re-implement**: [`~/sharpelab/measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py`](../../measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py) — QCoDeS `VisaInstrument` subclass that already handles the cache-on-set / no-IDN / `;`-terminator / `E;`-trigger idiosyncrasies, plus software ramp helpers (`ramp_voltage`, `ramp_current`). When piezo-z grows real code, depend on or port from this; don't re-derive the protocol quirks from scratch.
+- **Reference driver** (different framework, same protocol): [`~/sharpelab/measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py`](../../measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py) — QCoDeS `VisaInstrument` subclass with the same cache-on-set semantics; useful sanity check when extending `yoko.py`.
 
 ## Heater
 

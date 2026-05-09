@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=1.22,<2",
     "opencv-python>=4.5",
     "pyserial>=3.5",
+    "pyvisa>=1.13",
     "minimalmodbus>=2.1",
     "superqt>=0.8.1",
     "tomlkit>=0.13",

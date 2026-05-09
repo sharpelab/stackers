@@ -19,6 +19,7 @@ dependencies = [
     { name = "opencv-python" },
     { name = "pyserial" },
     { name = "pyside6" },
+    { name = "pyvisa" },
     { name = "spinnaker-python", version = "4.3.0.189", source = { path = "vendor/spinnaker_python-4.3.0.189-cp310-cp310-linux_x86_64.whl" }, marker = "sys_platform == 'linux'" },
     { name = "spinnaker-python", version = "4.3.0.190", source = { path = "vendor/spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl" }, marker = "sys_platform == 'win32'" },
     { name = "superqt" },
@@ -38,6 +39,7 @@ requires-dist = [
     { name = "opencv-python", specifier = ">=4.5" },
     { name = "pyserial", specifier = ">=3.5" },
     { name = "pyside6", specifier = ">=6.3" },
+    { name = "pyvisa", specifier = ">=1.13" },
     { name = "spinnaker-python", marker = "sys_platform == 'linux'", path = "vendor/spinnaker_python-4.3.0.189-cp310-cp310-linux_x86_64.whl" },
     { name = "spinnaker-python", marker = "sys_platform == 'win32'", path = "vendor/spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl" },
     { name = "superqt", specifier = ">=0.8.1" },
@@ -168,6 +170,18 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/7c/35/f06b1b641d7600ec46374c16cd37c66fa4a22870326b4eb073a95471035f/pyside6_essentials-6.11.0-cp310-abi3-manylinux_2_39_aarch64.whl", hash = "sha256:4854cb0a1b061e7a576d8fb7bb7cf9f49540d558b1acb7df0742a7afefe61e4e", size = 77380821, upload-time = "2026-03-23T12:43:24.649Z" },
     { url = "https://files.pythonhosted.org/packages/ff/37/ba95c6262836d2b286b4e05a9d16a5e870995d5d2503ac6adc6312208049/pyside6_essentials-6.11.0-cp310-abi3-win_amd64.whl", hash = "sha256:3b3362882ad9389357a80504e600180006a957731fec05786fced7b038461fdf", size = 75793322, upload-time = "2026-03-23T12:43:35.575Z" },
     { url = "https://files.pythonhosted.org/packages/53/27/d17f25e45820e633a70e6109b35991eda09a5e8000c2a306f0ab7538d48c/pyside6_essentials-6.11.0-cp310-abi3-win_arm64.whl", hash = "sha256:81ca603dbf21bc39f89bb42db215c25ebe0c879a1a4c387625c321d2730ec187", size = 56337457, upload-time = "2026-03-23T12:43:43.573Z" },
+]
+
+[[package]]
+name = "pyvisa"
+version = "1.16.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/13/72/a50adff945e66f2161a44b243970f809de19152a2e7da0473ae8ff96d642/pyvisa-1.16.2.tar.gz", hash = "sha256:75beb93eeafe20a50be5726fa4e3a645948c93d86819f9c1f8c542efa4085a38", size = 238729, upload-time = "2026-02-27T12:14:08.54Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e4/a9/776da4f397003cca093659524c3526590522f81b642936838428c11274e6/pyvisa-1.16.2-py3-none-any.whl", hash = "sha256:54f034adafd3e8d1858d57cdafec64e920444f4b84b31c9fd17487fbad0a197a", size = 181413, upload-time = "2026-02-27T12:14:07.301Z" },
 ]
 
 [[package]]
