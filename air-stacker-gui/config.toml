@@ -48,5 +48,7 @@ resource = "GPIB0::29::INSTR"
 voltage_limits = [-20.0, 30.0]
 nm_per_volt = 933.33
 poll_interval_ms = 1000
-ramp_step_v = 0.05
-ramp_delay_ms = 50
+# Ramp at 0.1 V / 20 ms = 5 V/s. Hardware-side current limit on the 7651
+# may slew slower than this; software ramp just caps at the unit's rate.
+ramp_step_v = 0.1
+ramp_delay_ms = 20

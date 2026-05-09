@@ -36,7 +36,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -57,11 +57,22 @@ log = logging.getLogger("airstacker.yoko")
 # = 933.33 nm/V. See docs/air-stacker-pc.md.
 DEFAULT_NM_PER_VOLT = 140_000.0 / 150.0  # ≈ 933.33
 
-# Default ramp parameters — match yoko.py's ramp_voltage() defaults
-# (1 V/s overall: 0.05 V steps every 50 ms). The piezo's resonant
-# frequency is 670 Hz so anything well below that is fine for stability.
-DEFAULT_RAMP_STEP_V = 0.05
-DEFAULT_RAMP_DELAY_MS = 50
+# Default ramp parameters — 0.1 V steps every 20 ms = 5 V/s. The piezo's
+# resonant frequency is 670 Hz (period 1.5 ms), so 20 ms per step is
+# ~13× the period — plenty of settling time, no risk of mechanical ringing.
+# yoko.py.ramp_voltage()'s own defaults are gentler (1 V/s); the panel
+# uses the faster pace because that's what the operator actually wants
+# at the GUI. Override per-deployment via [yoko] in config.toml.
+#
+# Caveat: the 7651 is also current-limited (Albert sets the output range
+# / current cap deliberately to protect the piezo). The actual on-the-wire
+# slew rate is min(software ramp rate, I_limit / C_piezo). If the unit is
+# slewing slower than our software ramp, the ramp_progress label will say
+# "done" before OD actually reaches the target — you'll see OD continue
+# climbing for a while after. If that becomes annoying, either raise the
+# current limit on the unit or add OD-settle-detection to _on_ramp_finished.
+DEFAULT_RAMP_STEP_V = 0.1
+DEFAULT_RAMP_DELAY_MS = 20
 
 
 class _PollWorker(QObject):
@@ -256,8 +267,25 @@ class YokoPanel(QGroupBox):
         self.ramp_progress = QLabel("")
         self.ramp_progress.setStyleSheet("color: #888;")
 
-        self.output_check = QCheckBox("Output ON")
-        self.reset_btn = QPushButton("Reset (RC)")
+        # Output state — the most common point of operator confusion. The
+        # protocol is write-only so we never know the unit's true state at
+        # startup; the cache shows what *we* last set, not what's live on
+        # the binding posts. The banner makes the implication ("Set/Ramp
+        # programs but doesn't drive when off") visible without staring at
+        # a checkbox at the bottom of the panel.
+        self.output_check = QCheckBox("Output enabled")
+        self.output_banner = QLabel()
+        self.output_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # Reinit — RC; — equivalent to a software reset of the unit's
+        # runtime state (output OFF, mode reset, programmed level cleared).
+        # Doesn't touch flash. "Reinit" is less ambiguous than "Reset".
+        self.reset_btn = QPushButton("Reinit (RC)")
+        self.reset_btn.setToolTip(
+            "Send RC; — full setting initialization. Turns output OFF, "
+            "resets mode, clears the programmed voltage. Doesn't touch "
+            "flash. Use only as a panic / start-over button."
+        )
 
         self._build_layout()
         self._wire_signals()
@@ -316,13 +344,26 @@ class YokoPanel(QGroupBox):
         sep1.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep1)
 
-        outer.addWidget(self.voltage_label)
-        outer.addWidget(self.travel_label)
+        # Output state up top — the protocol is write-only so the panel
+        # never knows the live state, only what we last set. The banner
+        # surfaces that fact loudly. _refresh_output_banner keeps it in
+        # sync with the cache.
+        outer.addWidget(self.output_banner)
+        outer.addWidget(self.output_check)
+        self._refresh_output_banner()
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep2)
+
+        outer.addWidget(self.voltage_label)
+        outer.addWidget(self.travel_label)
+
+        sep3 = QFrame()
+        sep3.setFrameShape(QFrame.Shape.HLine)
+        sep3.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(sep3)
 
         set_row = QHBoxLayout()
         set_row.addWidget(QLabel("Set:"))
@@ -339,7 +380,6 @@ class YokoPanel(QGroupBox):
         outer.addWidget(self.ramp_progress)
 
         action_row = QHBoxLayout()
-        action_row.addWidget(self.output_check)
         action_row.addStretch(1)
         action_row.addWidget(self.reset_btn)
         outer.addLayout(action_row)
@@ -405,17 +445,55 @@ class YokoPanel(QGroupBox):
 
     def _on_output_toggled(self, checked: bool) -> None:
         self._safe(self.yoko.set_output, checked)
+        self._refresh_output_banner()
 
     def _on_reset(self) -> None:
         self._safe(self.yoko.reset)
+        # RC; turns the unit's output OFF and clears caches. Reflect that
+        # in the checkbox + banner; we re-show as "unknown" since the
+        # cache is now blown away.
         self.output_check.blockSignals(True)
         self.output_check.setChecked(False)
         self.output_check.blockSignals(False)
+        self._refresh_output_banner()
+
+    def _refresh_output_banner(self) -> None:
+        """Update the output-state banner from the driver's cache.
+
+        The protocol is write-only for output state — the cache reflects
+        what *we* last set, not what's electrically live. At startup the
+        cache is None ("unknown"); after the user toggles the checkbox
+        it's True/False.
+        """
+        state = self.yoko.cached_output_on
+        if state is None:
+            self.output_banner.setText("OUTPUT STATE UNKNOWN — toggle to set")
+            self.output_banner.setStyleSheet(
+                "color: white; background-color: #888; "
+                "font-weight: bold; padding: 4px; "
+            )
+        elif state:
+            self.output_banner.setText("OUTPUT ON")
+            self.output_banner.setStyleSheet(
+                "color: white; background-color: #2d8a4a; "
+                "font-weight: bold; padding: 4px; "
+            )
+        else:
+            self.output_banner.setText(
+                "OUTPUT OFF — Set/Ramp programs but does not drive"
+            )
+            self.output_banner.setStyleSheet(
+                "color: white; background-color: #b04040; "
+                "font-weight: bold; padding: 4px; "
+            )
 
     def _safe(self, fn, *args) -> None:
+        name = getattr(fn, "__name__", repr(fn))
+        log.info("yoko: %s(%s)", name, args if args else "")
         try:
             fn(*args)
         except Exception as e:  # noqa: BLE001
+            log.exception("yoko: %s failed", name)
             self.status_label.setText(f"err: {e}")
 
     # --- worker / state plumbing --------------------------------------------
