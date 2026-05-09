@@ -18,6 +18,7 @@ import PySpin
 from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
     QColor,
+    QFont,
     QIcon,
     QImage,
     QPainter,
@@ -31,12 +32,14 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSlider,
@@ -47,7 +50,7 @@ from superqt import QRangeSlider
 
 from conex import ConexAxis, error_label, state_label
 from focus_metric import sharpness as compute_sharpness
-from heater import OmegaPlatinum
+from heater import OmegaPlatinum, SystemState
 from smc100_panel import SMC100Panel
 from status_bar import StatusBar
 from yoko_panel import YokoPanel
@@ -2481,16 +2484,50 @@ class HeaterPanel(QGroupBox):
             slave_id=int(cfg.get("slave_id", 1)),
         )
 
+        # Hidden — kept so existing _on_set / _on_run / etc. error setters
+        # don't need to change while we revamp the visible layout.
         self.status_label = QLabel("disconnected")
         self.status_label.setVisible(False)
-        self.pv_label = QLabel("—")
-        font = self.pv_label.font()
-        font.setPointSize(font.pointSize() + 4)
-        self.pv_label.setFont(font)
-        self.run_label = QLabel("")
-        self.run_label.setStyleSheet("color: #888;")
-        self.output_label = QLabel("output: —")
 
+        # --- hero readouts: PV + setpoint side by side ----------------------
+        hero_font = QFont()
+        hero_font.setPointSize(hero_font.pointSize() + 14)
+        hero_font.setStyleHint(QFont.StyleHint.Monospace)
+        hero_font.setFamily("monospace")
+        hero_font.setBold(True)
+
+        self.pv_label = QLabel("—")
+        self.pv_label.setFont(hero_font)
+        self.pv_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.setpoint_value_label = QLabel("—")
+        self.setpoint_value_label.setFont(hero_font)
+        self.setpoint_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setpoint_value_label.setStyleSheet("color: #888;")
+
+        caption_style = "color: #888;"
+        pv_caption = QLabel("process")
+        pv_caption.setStyleSheet(caption_style)
+        pv_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sp_caption = QLabel("setpoint")
+        sp_caption.setStyleSheet(caption_style)
+        sp_caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        # --- output bar ------------------------------------------------------
+        self.output_pct_label = QLabel("output  —")
+        self.output_bar = QProgressBar()
+        self.output_bar.setRange(0, 100)
+        self.output_bar.setTextVisible(False)
+        self.output_bar.setFixedHeight(12)
+        self.output_cap_label = QLabel("")
+        self.output_cap_label.setStyleSheet(caption_style)
+
+        # --- state pill ------------------------------------------------------
+        self.state_pill = QLabel("—")
+        self.state_pill.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.state_pill.setStyleSheet(self._pill_style("idle"))
+
+        # --- editable controls ----------------------------------------------
         self.setpoint_spin = QDoubleSpinBox()
         self.setpoint_spin.setRange(-1000.0, 1000.0)
         self.setpoint_spin.setDecimals(2)
@@ -2510,10 +2547,34 @@ class HeaterPanel(QGroupBox):
 
         outer = QVBoxLayout(self)
         outer.addWidget(self.status_label)
-        outer.addWidget(QLabel("Process:"))
-        outer.addWidget(self.pv_label)
-        outer.addWidget(self.run_label)
-        outer.addWidget(self.output_label)
+
+        hero_grid = QGridLayout()
+        hero_grid.setHorizontalSpacing(16)
+        hero_grid.setVerticalSpacing(0)
+        hero_grid.addWidget(self.pv_label, 0, 0)
+        hero_grid.addWidget(self.setpoint_value_label, 0, 1)
+        hero_grid.addWidget(pv_caption, 1, 0)
+        hero_grid.addWidget(sp_caption, 1, 1)
+        outer.addLayout(hero_grid)
+
+        outer.addSpacing(8)
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setFrameShadow(QFrame.Shadow.Sunken)
+        outer.addWidget(sep)
+
+        outer.addWidget(self.output_pct_label)
+        outer.addWidget(self.output_bar)
+        outer.addWidget(self.output_cap_label)
+
+        outer.addSpacing(6)
+        pill_row = QHBoxLayout()
+        pill_row.addStretch(1)
+        pill_row.addWidget(self.state_pill)
+        pill_row.addStretch(1)
+        outer.addLayout(pill_row)
+        outer.addSpacing(6)
+
         sp_row = QHBoxLayout()
         sp_row.addWidget(QLabel("Setpoint:"))
         sp_row.addWidget(self.setpoint_spin, stretch=1)
@@ -2609,25 +2670,59 @@ class HeaterPanel(QGroupBox):
             pass
         return payload
 
+    @staticmethod
+    def _pill_style(kind: str) -> str:
+        palette = {
+            "run": "#2e7d32",   # green
+            "fault": "#c0392b", # red
+            "tune": "#1976d2",  # blue
+            "idle": "#888888",
+        }
+        bg = palette.get(kind, palette["idle"])
+        return (
+            f"QLabel {{ background-color: {bg}; color: white; "
+            f"font-weight: bold; padding: 4px 12px; border-radius: 8px; }}"
+        )
+
     @Slot(object)
     def _apply_state(self, payload: dict) -> None:
         """Main-thread: render a payload from the polling worker."""
         if "pv" in payload:
             self.pv_label.setText(f"{payload['pv']:.2f} {self.units}")
         elif "pv_err" in payload:
-            self.pv_label.setText(f"pv err: {payload['pv_err']}")
-        if "sp" in payload and not self.setpoint_spin.hasFocus():
-            self.setpoint_spin.setValue(payload["sp"])
+            self.pv_label.setText("pv err")
+
+        if "sp" in payload:
+            sp = payload["sp"]
+            self.setpoint_value_label.setText(f"{sp:.2f} {self.units}")
+            if not self.setpoint_spin.hasFocus():
+                self.setpoint_spin.setValue(sp)
+
         if "state" in payload:
-            self.run_label.setText(f"state: {payload['state'].name}")
-        else:
-            self.run_label.setText("")
+            state = payload["state"]
+            self.state_pill.setText(f"● {state.name}")
+            if state == SystemState.RUN:
+                kind = "run"
+            elif state in (SystemState.FAULT, SystemState.SHUTDOWN):
+                kind = "fault"
+            elif state == SystemState.AUTOTUNE:
+                kind = "tune"
+            else:
+                kind = "idle"
+            self.state_pill.setStyleSheet(self._pill_style(kind))
+
         if "out" in payload:
-            self.output_label.setText(f"output: {payload['out']:.1f} %")
+            out = payload["out"]
+            self.output_pct_label.setText(f"output  {out:.1f} %")
+            self.output_bar.setValue(int(round(max(0.0, min(100.0, out)))))
         elif "out_err" in payload:
-            self.output_label.setText(f"output err: {payload['out_err']}")
-        if "out_hi" in payload and not self.max_output_spin.hasFocus():
-            self.max_output_spin.setValue(payload["out_hi"])
+            self.output_pct_label.setText(f"output err: {payload['out_err']}")
+
+        if "out_hi" in payload:
+            cap = payload["out_hi"]
+            self.output_cap_label.setText(f"cap {cap:.0f} %")
+            if not self.max_output_spin.hasFocus():
+                self.max_output_spin.setValue(cap)
 
     def shutdown(self) -> None:
         if self._worker is not None and self._worker_thread is not None:
