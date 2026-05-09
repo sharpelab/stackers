@@ -204,6 +204,10 @@ class SMC100Panel(QGroupBox):
         self._worker: _PollWorker | None = None
         self._worker_thread: QThread | None = None
         self._last_state_code: str | None = None
+        # Cached position from the polling worker — read by the
+        # click-vs-hold continuous-fire path so it doesn't have to do a
+        # synchronous serial query on the GUI thread.
+        self._last_position: float | None = None
 
         # Click-vs-hold state for the ± jog buttons. _jog_direction is
         # 0 when idle, ±1 while a button is held. _jog_continuous flips
@@ -352,33 +356,39 @@ class SMC100Panel(QGroupBox):
 
     def _on_jog_pressed(self, direction: int) -> None:
         """Mouse-down on a jog button — arm the click-vs-hold timer."""
+        log.info("smc100: jog pressed dir=%+d (timer armed)", direction)
         self._jog_direction = direction
         self._jog_continuous = False
         self._jog_timer.start()
 
     def _on_jog_continuous_fire(self) -> None:
-        """Hold threshold elapsed — switch from step to continuous travel."""
+        """Hold threshold elapsed — switch from step to continuous travel.
+
+        Uses the cached position from the polling worker rather than a
+        synchronous query — the polling worker holds the serial lock most
+        of the time, so a query on the GUI thread can stall ~100 ms,
+        making the press feel like it "cuts off after 250 ms". The cache
+        is at most one poll interval stale (default 100 ms), accurate
+        enough for travel-to-limit math.
+        """
         if self._jog_direction == 0:
             return  # released before the timer got here
         direction = self._jog_direction
-        # Position read happens on the GUI thread (matches ConexAxisPanel's
-        # existing pattern). Falls back to a single step if we can't read,
-        # since we have no idea how far the controller can travel.
-        if self.axis.effective_limits is not None:
-            try:
-                here = self.axis.position()
-            except SMC100Error:
-                self._safe(
-                    self.axis.move_relative, direction * self.step_spin.value()
-                )
-                self._jog_continuous = True
-                return
+        log.info(
+            "smc100: jog continuous-fire dir=%+d here=%s",
+            direction,
+            self._last_position,
+        )
+        if self.axis.effective_limits is not None and self._last_position is not None:
+            here = self._last_position
             lo, hi = self.axis.effective_limits
             target = lo if direction < 0 else hi
             travel = target - here
             if (direction < 0 and travel < 0) or (direction > 0 and travel > 0):
                 self._safe(self.axis.move_relative, travel)
         else:
+            # No limits or no cached position — fall back to a step move.
+            # Better than refusing to move at all.
             self._safe(self.axis.move_relative, direction * self.step_spin.value())
         self._jog_continuous = True
 
@@ -386,6 +396,11 @@ class SMC100Panel(QGroupBox):
         """Mouse-up on either jog button — finish a step or stop a continuous run."""
         if self._jog_direction == 0:
             return
+        log.info(
+            "smc100: jog released dir=%+d continuous=%s",
+            self._jog_direction,
+            self._jog_continuous,
+        )
         if self._jog_continuous:
             self._safe(self.axis.stop)
         else:
@@ -452,9 +467,11 @@ class SMC100Panel(QGroupBox):
             self.status_label.setText(f"poll err: {payload['_worker_err']}")
             return
 
-        # Position readout.
+        # Position readout. The cache feeds _on_jog_continuous_fire so it
+        # doesn't have to do its own synchronous serial query.
         if "pos" in payload:
             pos = payload["pos"]
+            self._last_position = pos
             text = f"{pos:.3f} {self.units}"
             if "setpoint" in payload:
                 text += f"  →  {payload['setpoint']:.3f}"
