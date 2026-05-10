@@ -20,7 +20,7 @@ Usage::
     uv run python probe_yoko.py --diagnose           # full protocol walk
     uv run python probe_yoko.py GPIB0::5::INSTR      # custom resource
 
-Default resource is ``GPIB0::29::INSTR``. The ``--diagnose`` walk asks
+Default resource is ``GPIB0::15::INSTR``. The ``--diagnose`` walk asks
 before doing anything that would change the unit's output level. The
 non-disruptive first step writes the live OD value back via ``SA<v>;E;``,
 so if the unit accepts SA at all you'll see ``last_cmd_err=0`` after.
@@ -220,7 +220,7 @@ def main(argv: list[str]) -> int:
     if "--diagnose" in args:
         do_diagnose = True
         args.remove("--diagnose")
-    resource = args[0] if args else "GPIB0::29::INSTR"
+    resource = args[0] if args else "GPIB0::15::INSTR"
     if do_diagnose:
         return diagnose(resource)
     return probe(resource)

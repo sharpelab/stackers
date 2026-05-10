@@ -46,7 +46,7 @@ position_limits = [0.0, 30.0]
 # nm_per_volt comes from the NPM140 datasheet (140 µm / 150 V span).
 # See docs/air-stacker-pc.md "Z stage — fine (Yokogawa 7651 + NPM140)".
 [yoko]
-resource = "GPIB0::29::INSTR"
+resource = "GPIB0::15::INSTR"
 voltage_limits = [-20.0, 30.0]
 nm_per_volt = 933.33
 poll_interval_ms = 1000

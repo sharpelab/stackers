@@ -8,7 +8,9 @@ The 7651 is pre-SCPI:
 - Commands are 1-3 ASCII letters with an optional numeric argument,
   terminated by ``;`` (or CR LF / LF — all three are accepted by the
   unit; we always send ``;``).
-- Replies are CR LF-terminated by default.
+- Replies are terminated by **CR only** on the Air Stacker unit (the DL
+  command selects CR LF / CR / LF / EOI; ours is configured CR-only and
+  the setting is persistent). pyvisa's ``read_termination`` must match.
 - Set-commands (function, range, output level, output enable) buffer
   in the unit; an ``E;`` trigger is required to apply them. Without
   the trigger nothing changes on the front panel.
@@ -18,6 +20,18 @@ The 7651 is pre-SCPI:
 - ``OD;`` returns the live output reading in a header+mantissa+exponent
   format (see :class:`OutputReading`). This is the one always-on
   query; it does not perturb state.
+
+**LOCAL / REMOTE caveat**: pressing the front-panel LOCAL key drops the
+unit into LOCS, where setting commands (F, SA, O, RC) are silently
+accepted on the bus but **not acted on** — the unit's relay never
+clicks, OD keeps reading the quiescent ~0 V, and there's no error
+returned. OD; still works, so the symptom looks like "the unit ignores
+everything except reads." :meth:`open` asserts REN to transition the
+unit back to REMS. If the talker also stops responding (OD; times out)
+call :meth:`recover` — it sends a Device Clear (DCL) interface message
+which flushes the I/O buffers. **DCL also turns the unit's OUTPUT OFF
+on this 7651 firmware**, so don't call ``recover()`` while the piezo is
+at non-zero voltage unless you re-ramp from 0 afterward.
 """
 
 from __future__ import annotations
@@ -176,6 +190,7 @@ class Yoko7651:
         # Lazy import so non-instrument code (tests, docs builds) can import
         # this module without pyvisa or a VISA backend installed.
         import pyvisa
+        from pyvisa.constants import RENLineOperation
         from pyvisa.resources import MessageBasedResource
 
         rm = pyvisa.ResourceManager()
@@ -188,9 +203,22 @@ class Yoko7651:
             )
         inst.timeout = 1500
         # The 7651 carries its own ';' terminator on each command; we
-        # don't want pyvisa appending another. Replies are CR LF.
+        # don't want pyvisa appending another. Reply terminator is CR
+        # only on our unit — see the module docstring for the DL setting.
         inst.write_termination = ""
-        inst.read_termination = "\n"
+        inst.read_termination = "\r"
+        # Assert REN + address-as-listener so a stray LOCAL key press
+        # doesn't leave us in LOCS where writes silently no-op. Some
+        # USB-GPIB adapters don't implement control_ren; we treat that
+        # as best-effort. control_ren lives on GPIBInstrument, a
+        # subclass of MessageBasedResource — use getattr so non-GPIB
+        # resources (testing with serial loopback, etc.) don't break.
+        control_ren = getattr(inst, "control_ren", None)
+        if control_ren is not None:
+            try:
+                control_ren(RENLineOperation.asrt_address)
+            except Exception:
+                pass
         self._inst = inst
 
     def close(self) -> None:
@@ -300,6 +328,43 @@ class Yoko7651:
         self._voltage_cache = None
         self._current_cache = None
         self._output_cache = None
+
+    def recover(self) -> None:
+        """Send a GPIB Device Clear (DCL) to flush stuck I/O buffers.
+
+        Use only when ``OD;`` itself stops responding (the unit's talker
+        queue is jammed). DCL is bus-level and reliable, but on this 7651
+        firmware it **also turns the output OFF and clears the programmed
+        level**, so all caches are invalidated. Don't call this while the
+        piezo is at non-zero voltage unless you re-ramp from 0 afterward.
+        """
+        with self._lock:
+            self._require().clear()
+        self._mode_cache = None
+        self._voltage_cache = None
+        self._current_cache = None
+        self._output_cache = False  # DCL drops the relay open
+
+    def safe_disable(self, step: float = 0.1, delay: float = 0.05) -> None:
+        """Shutdown protocol — ramp voltage to 0, then ``O0;``.
+
+        Always use this in preference to a bare ``set_output(False)`` when
+        the unit is at non-zero voltage and driving a piezo. Slamming
+        ``O0`` while sitting at V≠0 V drops the full programmed voltage
+        across the (capacitive) NPM140 in one step when the relay opens,
+        which risks mechanical ringing (resonance at 670 Hz) and isn't
+        kind to piezo life.
+
+        Blocks until done (the ramp is synchronous). Call from a worker
+        thread if you don't want to freeze the GUI.
+
+        No-ops the ramp if the cache says we're already at ~0 V or in
+        current mode; still always sends the final ``O0;``.
+        """
+        v = self._voltage_cache
+        if self._mode_cache == "V" and v is not None and abs(v) > 1e-4:
+            self.ramp_voltage(0.0, step=step, delay=delay)
+        self.set_output(False)
 
     # --- caches -------------------------------------------------------------
 

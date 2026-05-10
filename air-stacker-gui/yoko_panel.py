@@ -15,7 +15,7 @@ who needs current mode reaches for :class:`yoko.Yoko7651` directly.
 Expected ``cfg`` keys (parallel to the ``[heater]`` and ``[smc100]`` blocks
 in ``config.toml``):
 
-  - ``resource`` (str, required) — VISA resource, e.g. ``"GPIB0::29::INSTR"``
+  - ``resource`` (str, required) — VISA resource, e.g. ``"GPIB0::15::INSTR"``
   - ``voltage_limits`` (list of two floats, optional) — operational software
     cap; passed through to :class:`Yoko7651`. The piezo caller passes
     ``[-20.0, 30.0]`` (anything below −20 V damages the piezo).
@@ -571,4 +571,15 @@ class YokoPanel(QGroupBox):
             self._poll_thread.quit()
             if not self._poll_thread.wait(2000):
                 log.warning("yoko poll thread did not exit cleanly")
+        # Shutdown protocol: ramp to 0 V before dropping the output
+        # relay. safe_disable is a no-op on the ramp if cache says we're
+        # already near 0 V; it always sends the final O0;. Blocking is
+        # fine here — the GUI is tearing down anyway.
+        if self.yoko.is_open and self.yoko.cached_output_on:
+            try:
+                self.yoko.safe_disable(
+                    step=self._ramp_step_v, delay=self._ramp_delay_s
+                )
+            except Exception as e:  # noqa: BLE001
+                log.warning("yoko safe_disable failed during shutdown: %s", e)
         self.yoko.close()
