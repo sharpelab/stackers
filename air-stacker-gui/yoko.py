@@ -36,11 +36,14 @@ at non-zero voltage unless you re-ramp from 0 afterward.
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
 from dataclasses import dataclass
 from typing import Literal
+
+log = logging.getLogger("airstacker.yoko")
 
 # OD; reply header — per IM 7651-01E §6.2.4 Table 6.10:
 #   a1   = 'N' (Normal) | 'E' (Overload)
@@ -296,6 +299,16 @@ class Yoko7651:
     def read_output(self) -> OutputReading:
         """Read the live output value via ``OD;``. Non-perturbing."""
         resp = self._query("OD")
+        if not resp:
+            # Talker hiccup — the first OD; after open() (and the
+            # occasional mid-session poll) returns empty: pyvisa times
+            # out waiting for the CR terminator and emits the
+            # "read string doesn't end with termination characters"
+            # UserWarning, leaving us with ''. A second OD; usually
+            # comes back clean. Log so we can spot if the rate creeps
+            # up.
+            log.info("yoko OD; empty reply, retrying once")
+            resp = self._query("OD")
         m = _OD_RE.match(resp)
         if not m:
             raise YokoError(f"unexpected OD reply: {resp!r}")
