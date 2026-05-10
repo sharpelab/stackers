@@ -505,6 +505,10 @@ class YokoPanel(QGroupBox):
         try:
             r = self.yoko.read_output()
         except Exception as e:  # noqa: BLE001
+            # Surface to console so the offending raw OD reply is visible
+            # — the on-panel label truncates. read_output() bakes the
+            # raw response into the message via repr().
+            log.warning("yoko OD read failed: %s", e)
             return {"od_err": str(e)}
         return {
             "value": r.value,
