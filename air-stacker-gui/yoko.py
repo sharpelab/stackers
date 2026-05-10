@@ -56,6 +56,26 @@ FUNC_CURRENT = "F5"
 VOLTAGE_RANGE_V: tuple[float, float] = (-30.0, 30.0)
 CURRENT_RANGE_A: tuple[float, float] = (-0.120, 0.120)
 
+# Voltage range codes per IM 7651-01E §6.3 — each entry is
+# (Rn command, full-scale magnitude with 20% overshoot allowance).
+# Smaller ranges are preferred for resolution; the largest one in this
+# table that contains the caller's max-abs voltage is chosen.
+VOLTAGE_RANGE_CODES: tuple[tuple[str, float], ...] = (
+    ("R2", 0.012),   # 10 mV range (+20% overshoot)
+    ("R3", 0.12),    # 100 mV range
+    ("R4", 1.2),     # 1 V range
+    ("R5", 12.0),    # 10 V range
+    ("R6", 30.0),    # 30 V range
+)
+
+
+def _pick_voltage_range(max_abs_v: float) -> str:
+    """Return the Rn code for the smallest range that contains *max_abs_v*."""
+    for code, fs in VOLTAGE_RANGE_CODES:
+        if max_abs_v <= fs:
+            return code
+    raise YokoError(f"voltage {max_abs_v} V exceeds 7651 max range (30 V)")
+
 # OD; reply parser. Manual specifies header `a1a2a3a4` (4 alphabets) +
 # data `mantissa E sign exponent`. Mantissa may carry an explicit sign.
 _OD_RE = re.compile(
@@ -154,6 +174,7 @@ class Yoko7651:
         *,
         voltage_limits: tuple[float, float] = VOLTAGE_RANGE_V,
         current_limits: tuple[float, float] = CURRENT_RANGE_A,
+        fix_voltage_range: bool = False,
     ) -> None:
         """Construct a 7651 driver.
 
@@ -162,6 +183,14 @@ class Yoko7651:
         a load with a narrower safe range — e.g. the NPM140 piezo wants a
         floor of −20 V and won't see anything above the Yoko's +30 V ceiling
         anyway, so a piezo caller passes ``voltage_limits=(-20.0, 30.0)``.
+
+        ``fix_voltage_range``: if True, :meth:`open` switches the unit to
+        voltage mode and pins the range to the smallest one that contains
+        ``max(|voltage_limits|)`` (e.g. ±30 V → R6 30-V range). This stops
+        the unit from auto-ranging mid-operation, which would otherwise
+        click internal range relays and glitch the output during ramps.
+        Default False to avoid surprising current-mode callers; the piezo
+        panel passes True.
         """
         if not voltage_limits[0] >= VOLTAGE_RANGE_V[0]:
             raise YokoError(
@@ -176,6 +205,7 @@ class Yoko7651:
         self.resource = resource
         self._voltage_limits = voltage_limits
         self._current_limits = current_limits
+        self._fix_voltage_range = fix_voltage_range
         self._inst = None  # pyvisa MessageBasedResource once open()'d
         self._lock = threading.Lock()
         # Software caches — protocol does not allow reading these back.
@@ -220,6 +250,15 @@ class Yoko7651:
             except Exception:
                 pass
         self._inst = inst
+
+        # Optionally pin the voltage range so the unit doesn't auto-range
+        # during ramps. Derived from voltage_limits so the smallest range
+        # that covers the operational envelope is used.
+        if self._fix_voltage_range:
+            max_abs = max(
+                abs(self._voltage_limits[0]), abs(self._voltage_limits[1])
+            )
+            self.set_voltage_range(max_abs)
 
     def close(self) -> None:
         with self._lock:
@@ -297,6 +336,20 @@ class Yoko7651:
     def set_mode(self, mode: Literal["V", "A"]) -> None:
         self._write((FUNC_VOLTAGE if mode == "V" else FUNC_CURRENT) + ";E")
         self._mode_cache = mode
+
+    def set_voltage_range(self, max_abs_v: float) -> None:
+        """Pin the unit to voltage mode at the smallest range containing
+        ``|max_abs_v|``.
+
+        Sends ``F1;Rn;E;`` as a single bus write so the function-set and
+        range-set apply together. Once pinned, subsequent ``SA;`` writes
+        program the level inside the fixed range without triggering an
+        auto range-change (which would briefly disturb the output via
+        internal relay switching).
+        """
+        code = _pick_voltage_range(max_abs_v)
+        self._write(f"{FUNC_VOLTAGE};{code};E")
+        self._mode_cache = "V"
 
     def set_voltage(self, value: float) -> None:
         """Program output voltage (auto-range via ``SAm``)."""

@@ -221,6 +221,7 @@ class YokoPanel(QGroupBox):
         self.yoko = Yoko7651(
             resource=cfg["resource"],
             voltage_limits=voltage_limits,
+            fix_voltage_range=True,
             **current_kwargs,
         )
 
