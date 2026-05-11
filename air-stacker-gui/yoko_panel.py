@@ -322,17 +322,25 @@ class YokoPanel(QGroupBox):
             self._set_all_enabled(False)
             return
 
-        # Output state is unknown at open() — the 7651 protocol is
-        # write-only, no way to query whether the relay is engaged.
-        # _refresh_status_label will show "output state unknown" until
-        # the operator clicks Enable or Disable.
-        self._refresh_status_label()
-
-        # Seed-from-OD: don't write anything; the first poll picks up the
-        # live OD value and we use seed_voltage_cache so a subsequent ramp
-        # has a known starting point. Output stays in whatever state the
-        # unit was in.
+        # Seed-from-OD: don't write anything; the first poll picks up
+        # the live OD value and we use seed_voltage_cache so a
+        # subsequent ramp has a known starting point.
         self._apply_state(self._read_state())
+
+        # Infer output state from that OD reading. The 7651 protocol
+        # can't query relay state directly; we approximate by treating
+        # any non-trivial OD value as "output is on" — when the relay
+        # is open the unit reads ~0 V. Below the 10 mV threshold we
+        # default to OFF, which is correct in the dominant case
+        # (clean prior shutdown) and harmless in the rare "on at 0 V"
+        # case (subsequent Enable just sends SA0;O1; — both no-ops).
+        # If OD failed entirely we leave the cache as None so the
+        # status label says "unknown" rather than lying.
+        v_seed = self.yoko.cached_voltage
+        if v_seed is not None:
+            self.yoko.seed_output_cache(abs(v_seed) > 0.01)
+        self._refresh_status_label()
+        self._refresh_output_buttons()
 
         # Pre-populate the ramp spinbox with the live voltage so a
         # fat-fingered Ramp click doesn't sweep the piezo from the

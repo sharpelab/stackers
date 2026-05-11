@@ -470,6 +470,18 @@ class Yoko7651:
         """
         self._voltage_cache = value
 
+    def seed_output_cache(self, on: bool) -> None:
+        """Seed the output-state cache after a kernel/app restart.
+
+        The 7651 protocol is write-only for output state — we can't
+        query whether the relay is engaged. Callers can infer it from
+        the ``OD;`` reading (any non-trivial value implies the relay is
+        closed and driving) and seed the cache here so the panel can
+        show a definite state on startup without performing any writes
+        to the unit.
+        """
+        self._output_cache = on
+
     # --- safety: software ramp ---------------------------------------------
 
     def ramp_voltage(
