@@ -10,5 +10,5 @@ Python projects use uv.
 
 ## Subdirectories
 
-- `air-stacker-gui/` — custom microscope viewer + recorder for the Air Stacker (FLIR Flea3 via harvesters/GenTL).
+- `air-stacker-gui/` — custom microscope viewer + recorder for the Air Stacker (FLIR Flea3 via PySpin, plus an Anker PowerConf C200 USB webcam as a secondary view).
 - `piezo-z/` — controller UI for a piezo controlling the Z stage of the stacker. Interacts with a Yokogawa 7651.

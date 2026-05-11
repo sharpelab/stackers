@@ -17,9 +17,34 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Binning**: 2×2 only. Set via `BinningVertical = 2` — the "vertical" name is misleading; on this Flea3 the horizontal node is read-only and slaves to the vertical, so writing 2 to `BinningVertical` gives 2×2 binning (1600×1200 → 800×600). No mode toggle (`BinningVerticalMode` is missing — camera does whatever it does, presumably averaging like-colored Bayer pixels). No 4× option, no decimation. Frame-rate cap stays at 59.47 Hz at both binning settings (sensor-readout-bound, not bandwidth-bound). Probe lives at [`air-stacker-gui/probe_binning.py`](../air-stacker-gui/probe_binning.py).
 - **SDK**: FLIR / Teledyne Spinnaker **4.3** (rebranded from "FLIR Systems" → "Teledyne" in the 4.x install path: `C:\Program Files\Teledyne\Spinnaker\`).
 - **PySpin**: vendored as a wheel under `air-stacker-gui/vendor/spinnaker_python-4.3.0.190-cp310-cp310-win_amd64.whl`, registered via `[tool.uv.sources]` in `pyproject.toml`. Pinned to Python 3.10 + numpy<2 (Spinnaker 4.3 ships only cp310 wheels and was built against the NumPy 1.x ABI).
-- **GenTL producer**: `.cti` files at `C:\Program Files\Teledyne\Spinnaker\cti64\vs2015\` (the `GENICAM_GENTL64_PATH` env var points there). PySpin doesn't need this — only consumers like `harvesters` (no longer used in our GUI; SpinView still does).
+- **GenTL producer**: `.cti` files at `C:\Program Files\Teledyne\Spinnaker\cti64\vs2015\` (the `GENICAM_GENTL64_PATH` env var points there). Our GUI uses PySpin directly and doesn't need GenTL — only consumers like `harvesters` (no longer used in our GUI) or SpinView do.
 - **Diagnostic GUIs**: `SpinView` at `bin64\vs2015\SpinView.exe` (replaces the old `SpinView_WPF.exe`). Useful for live exposure / WB / gamma sliders without launching our app.
 - **Legacy / unused** Desktop shortcuts (ignore): FlyCap2 (`Camera.lnk`), IC Capture 2.5, Micro-Manager / ImageJ (`hist but slower fps.lnk`).
+
+## Secondary camera
+
+- **Hardware**: **Anker PowerConf C200** USB-C UVC webcam. Used as a contextual view of the stage + front-panel instruments alongside the through-objective FLIR feed. Display-only — not part of the science data path.
+- **USB enumeration**: `VID_291A`, `PID_3369`, single video interface (`MI_00`). PnP `FriendlyName = "Anker PowerConf C200"`. Enumerates under `Get-PnpDevice -Class Camera`.
+- **Native resolutions & framerates** (probed 2026-05-10 via `QMediaDevices.videoInputs()`):
+
+  | Resolution | NV12 / MJPEG | YUYV   |
+  |------------|--------------|--------|
+  | 2560×1440  | 30 fps       | —      |
+  | 1920×1080  | 30 fps       | —      |
+  | 1280×720   | 30 fps       | —      |
+  |  640×480   | 30 fps       | 30 fps |
+  |  640×360   | 30 fps       | 30 fps |
+  |  320×240   | 30 fps       | 30 fps |
+
+  `cv2.VideoCapture` + DSHOW forces YUYV and caps at ~18 fps above 1080p. Qt Multimedia / Media Foundation negotiates NV12 or MJPEG and sustains 30 fps at every supported resolution. GUI default: **1280×720 NV12 @ 30 fps**.
+
+- **GUI integration**: opens via `PySide6.QtMultimedia` (`QCamera` + `QMediaCaptureSession` + `QVideoWidget`). Toggle lives on the bottom `StatusBar` of [`air-stacker-gui/main.py`](../air-stacker-gui/main.py); closed by default. Window class: [`webcam_window.py`](../air-stacker-gui/webcam_window.py). Config-parsing + device/format picking: [`webcam.py`](../air-stacker-gui/webcam.py). Design rationale: [`WEBCAM_PIP_PROPOSAL.md`](../air-stacker-gui/WEBCAM_PIP_PROPOSAL.md).
+
+- **Standard UVC controls accessible** (typed in Qt Multimedia where noted): brightness, contrast, saturation, sharpness, gamma, hue, focus + autofocus (`QCamera.setFocusMode` / `setFocusDistance`), exposure + auto (`setExposureMode` / `setManualExposureTime`), white balance + auto (`setWhiteBalanceMode` / `setColorTemperature`), digital zoom (`setZoomFactor`), digital pan/tilt. Gain, backlight, iris, roll are not exposed on this model. AI tracking, HDR, anti-flicker, FoV preset are vendor UVC extension units (XU) — configurable only via the Anker Work utility, not via standard APIs. None of those vendor features are useful for our static-frame monitoring use case; already configured on the box and the GUI doesn't touch them.
+
+- **DirectShow filter conflict**: index 1 under `cv2.CAP_DSHOW` enumerates the Spinnaker DirectShow filter for the FLIR Flea3 (Spinnaker installs one). Don't open by numeric index — pin by `QCameraDevice.id()` or by description substring match. Our GUI does the latter.
+
+- **Probe scripts**: [`probe_webcam.py`](../air-stacker-gui/probe_webcam.py) (cv2 / DSHOW resolution × fps grid), [`probe_webcam_controls.py`](../air-stacker-gui/probe_webcam_controls.py) (cv2 CAP_PROP_* + Qt Multimedia format enumeration). Both read-only and safe to re-run.
 
 ## Stage — CONEX-CC
 
