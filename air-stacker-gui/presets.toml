@@ -1,0 +1,16 @@
+# User-created camera/image presets, maintained by the Air Stacker GUI.
+# Edits live here (not config.toml) so they don't collide with device
+# config changes during merges/rebases between the lab PC and laptops.
+#
+# "Default" entries are hardcoded in the panel and never written here.
+
+[[camera_preset]]
+name = "2x Binning"
+gain_auto = "Off"
+exposure_auto = "Off"
+balance_white_auto = "Off"
+binning_vertical = 2
+gain = 1.0
+exposure_us = 5000.0
+balance_ratio_red = 0.6
+balance_ratio_blue = 3.3

@@ -58,6 +58,7 @@ from yoko_panel import YokoPanel
 import tomlkit
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
+PRESETS_PATH = Path(__file__).resolve().parent / "presets.toml"
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "icons" / "air_stacker.ico"
 
 log = logging.getLogger("airstacker")
@@ -340,7 +341,7 @@ def _coerce_pair(v) -> tuple[int, int]:
 
 
 class ImagePresetStore:
-    """Round-trips user-created [[image_preset]] entries to/from config.toml.
+    """Round-trips user-created [[image_preset]] entries to/from presets.toml.
 
     "Default" is hardcoded in the panel and never stored — only user
     presets live in the file. Saves rewrite the image_preset array-of-tables
@@ -406,7 +407,7 @@ class ImagePresetStore:
 
 
 class CameraPresetStore:
-    """Round-trips user-created [[camera_preset]] entries to/from config.toml.
+    """Round-trips user-created [[camera_preset]] entries to/from presets.toml.
 
     "Default" is hardcoded (derived from OUR_DEFAULTS + [camera] overrides)
     and never stored — only user presets live in the file. Saves rewrite
@@ -2040,7 +2041,7 @@ class CameraOptionsPanel(QGroupBox):
             QMessageBox.critical(
                 self,
                 "Save failed",
-                f"Could not write preset to config.toml:\n\n{e}",
+                f"Could not write preset to presets.toml:\n\n{e}",
             )
             return
 
@@ -2064,7 +2065,7 @@ class CameraOptionsPanel(QGroupBox):
             QMessageBox.critical(
                 self,
                 "Save failed",
-                f"Could not write preset to config.toml:\n\n{e}",
+                f"Could not write preset to presets.toml:\n\n{e}",
             )
             return
         self._loaded_snapshot = snap
@@ -2091,7 +2092,7 @@ class CameraOptionsPanel(QGroupBox):
             QMessageBox.critical(
                 self,
                 "Delete failed",
-                f"Could not write config.toml:\n\n{e}",
+                f"Could not write presets.toml:\n\n{e}",
             )
             return
 
@@ -2546,7 +2547,7 @@ class ImageAdjustmentsPanel(QGroupBox):
             QMessageBox.critical(
                 self,
                 "Save failed",
-                f"Could not write preset to config.toml:\n\n{e}",
+                f"Could not write preset to presets.toml:\n\n{e}",
             )
             return
 
@@ -2570,7 +2571,7 @@ class ImageAdjustmentsPanel(QGroupBox):
             QMessageBox.critical(
                 self,
                 "Save failed",
-                f"Could not write preset to config.toml:\n\n{e}",
+                f"Could not write preset to presets.toml:\n\n{e}",
             )
             return
         self._loaded_snapshot = snap
@@ -2597,7 +2598,7 @@ class ImageAdjustmentsPanel(QGroupBox):
             QMessageBox.critical(
                 self,
                 "Delete failed",
-                f"Could not write config.toml:\n\n{e}",
+                f"Could not write presets.toml:\n\n{e}",
             )
             return
 
@@ -3131,11 +3132,11 @@ class CameraWindow(QMainWindow):
         layout.addWidget(recording)
 
         self.adjustments_panel = ImageAdjustmentsPanel(
-            self.adjustments, ImagePresetStore(CONFIG_PATH)
+            self.adjustments, ImagePresetStore(PRESETS_PATH)
         )
 
         self.camera_options_panel = CameraOptionsPanel(
-            self.cam, camera_cfg, CameraPresetStore(CONFIG_PATH)
+            self.cam, camera_cfg, CameraPresetStore(PRESETS_PATH)
         )
 
         layout.addWidget(self.camera_options_panel)
