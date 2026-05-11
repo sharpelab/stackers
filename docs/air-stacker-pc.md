@@ -34,7 +34,7 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 
 - **Hardware**: Newport **SMC100CC** (DC servo variant of the SMC100 Series Motion Controller / Driver), single-axis. Daisy-chain capable but the lab uses a single unit currently. Variant identified from `1VE?` reply (`SMC_CC`); the PP variant would identify as `SMC_PP`.
 - **Firmware**: Controller-driver version **3.1.2**.
-- **Stage**: Newport **LTA-HS** "high-speed" linear translation actuator (DC servo + rotary encoder, ESP-compatible — the SMC100 reads `ZX=3` and pulls config straight from the stage's smart-memory chip on connect). Reported via `1ID?` as `LTA-HS_PN:B0601246985103_UD:062509`. ESP-loaded soft limits **−0.1 mm to +50.1 mm** (`1SL`/`1SR`); encoder unit **3.539 × 10⁻⁵ mm ≈ 35.4 nm/count** (`1SU`). Default velocity 5 mm/s (`1VA`), acceleration 20 mm/s² (`1AC`), homing velocity 2.5 mm/s (`1OH`), home-search type 4 (`1HT`).
+- **Stage**: Newport **LTA-HS** "high-speed" linear translation actuator (DC servo + rotary encoder, ESP-compatible — the SMC100 reads `ZX=3` and pulls config straight from the stage's smart-memory chip on connect). Reported via `1ID?` as `LTA-HS_PN:B0601246985103_UD:062509`. ESP-loaded soft limits **−0.1 mm to +50.1 mm** (`1SL`/`1SR`); encoder unit **3.539 × 10⁻⁵ mm ≈ 35.4 nm/count** (`1SU`). Default velocity 5 mm/s (`1VA`), acceleration 20 mm/s² (`1AC`), homing velocity 2.5 mm/s (`1OH`), home-search type 4 (`1HT`). The LTA-HS shaft engages the microscope's focus-axis drive — photo: [`img/smc100-focus-drive-shaft.jpeg`](img/smc100-focus-drive-shaft.jpeg).
 - **Safe operating envelope**:
   - **Positive cap: 30 mm (operational limit)** — must not exceed on this rig regardless of what the ESP-loaded `SR` says. Enforced in software only: the upcoming SMC100 driver/panel will take a `position_limits=` kwarg (parallel to `Yoko7651`'s `voltage_limits=`) and the air-stacker caller passes an upper bound of **30.0 mm**. **Do not push this cap to the controller persistently** (i.e. CONFIG-mode `1SR30` → `PW0`) without explicit per-action authorization — see global rule against persistent writes to lab controllers.
 - **Connectors** (front face, photo: [`img/smc100.jpeg`](img/smc100.jpeg)): KEYPAD, **RS232C** (DB9), RS485 IN, RS485 OUT, CONFIG. Top face: MOTOR, GPIO, DC OUT, +48V power input.
@@ -75,7 +75,7 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 
 - **Hardware**: Yokogawa **7651** programmable DC source. One of two GPIB instruments on the box (the other is a Keithley DMM at GPIB primary 29 — see below).
 - **PC link**: GPIB-USB adapter (vendor TBD — surfaces to NI-VISA as `GPIB0`) → NI-VISA → resource string **`GPIB0::15::INSTR`**. GPIB primary address **15** is set on DIP switches on the back of the 7651; if those get bumped, the device disappears from `pyvisa.ResourceManager().list_resources()` until reconfigured. **Historical note (2026-05-10)**: this doc previously listed address 29 — that was wrong, 29 belongs to the Keithley voltmeter on the same bus, and `yoko.py` was talking to the wrong device for weeks. The Keithley happens to emit `NDCV+x.xxxxxE+xx` readings that vaguely match the 7651's `OD;` reply format, which masked the misconfiguration entirely (`SA`/`F`/`O` writes silently did nothing on the Keithley, and OD reads returned the live measured voltage across the piezo, which was always ~0 because the real Yoko's output was off).
-- **Sibling on the bus — Keithley DMM at GPIB0::29**: parked across the piezo terminals as a closed-loop readback. Doesn't speak SCPI / no `*IDN?`; defaults to dumping the current measurement on any read. Model not yet recorded — check the front panel next time at the rack. Not currently used by the GUI but could be wired in for true output verification (vs the 7651's open-loop SA cache).
+- **Sibling on the bus — Keithley 617 electrometer at GPIB0::29**: wired in series with the piezo for current readback (charging current during ramps + leakage at steady state). See its own section below.
 - **Currently observed (probe)**: ~+11.40 V DC, status `N` (normal), ~4 mV jitter on the readback. Probe captured on 2026-05-08 with the unit live on the piezo.
 - **Protocol — pre-SCPI Yokogawa command set** (full reference: [`yokogawa-7651-user-manual.pdf`](../air-stacker-gui/manuals/yokogawa-7651-user-manual.pdf), IM 7651-01E §6 Communication Functions):
   - Commands are terminated with `;` (CR LF and bare LF are also accepted by the unit; we standardize on `;`). Configure VISA with `write_termination=""` and put the `;` in every command string.
@@ -107,6 +107,87 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Shutdown protocol — always ramp before disabling output**: callers must use `Yoko7651.safe_disable()` (or `ramp_voltage(0.0)` followed by `set_output(False)`) when the unit is at non-zero voltage. Slamming `O0;` while sitting at V≠0 V opens the relay and dumps the full programmed voltage across the 1.7 µF NPM140 in one step, risking mechanical ringing at the piezo's 670 Hz resonance. `yoko_panel.py.shutdown()` wires this in for the GUI close path.
 - **Probe script**: [`air-stacker-gui/probe_yoko.py`](../air-stacker-gui/probe_yoko.py) — sends `OD;`, decodes the reply, reports the live output. Read-only and safe.
 - **Reference driver** (different framework, same protocol): [`~/sharpelab/measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py`](../../measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py) — QCoDeS `VisaInstrument` subclass with the same cache-on-set semantics; useful sanity check when extending `yoko.py`.
+
+### Current readback — Keithley 617 (added 2026-05-10)
+
+The 7651 → NPM140 path is open-loop; the 617 sits in series with the piezo and gives us a real current trace. Two useful regimes:
+
+- **During ramps**: charging current `I = C·dV/dt` (≈ 8.5 µA at 5 V/s with the 1.7 µF NPM140) — direct confirmation that the piezo is actually being driven.
+- **At steady state**: leakage current of the piezo + cabling. Sub-pA resolution lets us spot insulation problems long before they show on the Yoko's open-loop reading.
+
+#### Hardware
+
+- **Model**: Keithley **617 Programmable Electrometer**. Sits physically on top of the 7651 in the rack — photo: [`img/keithley-617-yoko-stack.jpeg`](img/keithley-617-yoko-stack.jpeg).
+- **Stack-up**: triax input from the rear panel (INPUT HI = red, INPUT LO = black, plus *unconnected* green guard). The 6011 input cable supplied by Keithley is what's wired here.
+- **Capabilities** (per [quick-reference manual](../air-stacker-gui/manuals/keithley-617-quick-reference.pdf)):
+  - **Volts**: ±200 mV / ±2 V / ±20 V / ±200 V, > 200 TΩ input impedance (vs the 34401A's 10 MΩ — important when the load is capacitive)
+  - **Amps**: ±2 pA / ±20 pA / ±200 pA / ±2 nA / ±20 nA / ±200 nA / ±2 µA / ±20 µA / ±200 µA / ±2 mA / ±20 mA — resolution down to **0.1 fA** on the 2 pA range, input voltage burden < 1 mV
+  - **Ohms**: 2 kΩ to 200 GΩ
+  - **Coulombs**: 200 pC / 2 nC / 20 nC
+  - **V-Source**: programmable −102 V to +102 V in 50 mV steps, ±2 mA max (current-limited at ~4 mA). **Not currently wired into the piezo loop** — the V-source is independent of the meter input.
+- **Conversion time**: 330 ms — the unit is slow; don't expect µs-resolution traces. For ramp monitoring at 5 V/s, two-to-three readings during a 1-second ramp.
+- **Front panel safety**: yellow label "**Enable Zero Check When Connecting/Disconnecting**." Zero Check internally shorts the input (and changes input impedance — see the table in the manual); always toggle it on before touching the cabling.
+
+#### GPIB
+
+- **Resource**: **`GPIB0::29::INSTR`**. Primary address 27 is the manual's default in examples; ours is set to 29 via the front-panel `IEEE "address"` program (Shift + SELECT until display shows IEEE).
+- **Protocol — pre-SCPI letter-code commands** ([full reference: §35-39 of the quick-ref](../air-stacker-gui/manuals/keithley-617-quick-reference.pdf), much more detail in the [instruction manual](../air-stacker-gui/manuals/keithley-617-instruction-manual.pdf)):
+  - Commands are 1-3 ASCII letters with an optional numeric argument. **`X` is the execute command** — like `E;` on the Yoko, the unit buffers settings until `X` applies them. Concatenate freely: `F1R0T1X` programs Amps + Autorange + Single-Talk-trigger + execute.
+  - Default reply terminator is **CR LF** (`Y0`). Configure pyvisa with `read_termination='\r\n'`. The terminator is selectable (`Ym` / `Ymn` / `Y`) — don't change unless you re-record here.
+  - **No `*IDN?`**. Sending it raises an IDDC (Invalid Device-Dependent Command) error and the talker silently returns the next OD-style reading. Use enumeration + `U0X` to identify.
+  - **Default talker output** = the live measurement, format `NDCA+0.12345E-09` (see Data Format below). Like the 7651, any read without a preceding query just dumps the current reading.
+- **Data format** (`*NDCA+0.12345E+06,nnn`):
+  - `*` (or `N`/`O`): `N` Normal · `O` Overflow
+  - `DCA` = function (`DCA` Amps · `DCV` Volts · `OHM` Ohms · `DCC` Coulombs · `DCX` External Feedback · `VSCR` when reading the V-Source via B4X)
+  - `+0.12345` = 5½-digit mantissa
+  - `E+06` = exponent
+  - `,nnn` = buffer address (only on Data Store reads, B1X)
+- **Common commands** for our use case:
+
+  | Command | Meaning |
+  |---|---|
+  | `F1X` | Amps mode |
+  | `F0X` | Volts mode |
+  | `R0X` | Autorange |
+  | `R1X` … `R10X` | Fixed range (table on p35 of quick-ref — pick the smallest covering your signal for best resolution / speed) |
+  | `C0X` / `C1X` | Zero Check off / **on** (input internally shorted) |
+  | `Z0X` / `Z1X` | Zero Correct off / on |
+  | `U0X` | Next read returns the machine status word |
+  | `U1X` | Next read returns the error status word (clears the error STB bit) |
+  | `U2X` | Next read returns the data status word |
+  | `B0X` | Read mode = live electrometer (default) |
+  | `B4X` | Read mode = V-Source readback |
+- **Status byte** (serial poll, `inst.read_stb()`): bit 0 Overflow · bit 1 Buffer Full · bit 2 Reading Done · bit 3 Ready · bit 4 Error · bit 6 SRQ-by-617. Power-up default SRQ mask is 70.
+- **Machine-status decode** (positions in the `U0X` reply after the `617` prefix): `F RR C Z N T O B G D Q MM K YY`. Each field maps to the corresponding command letter — useful for sanity-checking front-panel state from the bus.
+
+#### Currently observed (2026-05-10)
+
+- Function = AMPS, range = Autorange, **Zero Check = ON** (input is internally shorted; the ~0.91 pA we see on the bus is the unit's own residual offset, not the piezo current).
+- Zero Correct = OFF, Suppress = OFF, V-Source Operate = OFF.
+- The unit had an IDDC error pending from our earlier `*IDN?` / OD; attempts at GPIB 29 before we knew which device was which; `U1X` (or any subsequent valid command) clears it.
+
+#### Workflow notes
+
+To take it from current state to "actually measuring the piezo":
+
+1. Warm up at least an hour after power-on (per the manual).
+2. Press front-panel ZERO CORRECT (or send `Z1X`) to capture the offset.
+3. Press front-panel ZERO CHECK to take it out (or send `C0X`).
+4. Now the AMPS reading reflects the live piezo current; range will auto-adjust.
+5. When done / re-cabling: Zero Check back ON before touching the triax.
+
+#### Physical interaction needed?
+
+For ongoing operation: **no — everything is bus-driven**. The GPIB command set covers function/range select, Zero Check on/off (`C0X`/`C1X`), Zero Correct (`Z0X`/`Z1X`), suppress, V-Source value/operate, trigger mode, and all reads. The whole "zero / take out of zero check / read current" workflow above can be done from a Python script over GPIB.
+
+Front-panel-only (no bus equivalent):
+- Setting the **IEEE-488 primary address** itself — `IEEE "address"` front-panel program (SHIFT + SELECT → ADJUST). Ours is 29; only needs a touch if we change rigs or the address gets bumped.
+- Power on/off and physical triax cabling (obviously).
+- Calibration entry (and we won't touch that).
+
+So once cabled and on the bus, the 617 is a fully remote instrument. A `keithley617.py` driver + GUI panel can drive the full measurement loop without anyone reaching over to the rack.
+
+For the GUI integration (TBD): a `keithley617.py` driver mirroring `yoko.py`'s shape — open() asserts REN, sends `F1R0X` to land in AMPS/auto, reads via raw `inst.read()`, parses NDCA replies with a regex like the Yoko's `_OD_RE`. Poll thread at ~1-2 Hz (conversion time is 330 ms). The panel would surface the live current alongside the Yoko's voltage, and optionally compute live `I/dV·1/C` for piezo-capacitance sanity-check.
 
 ## Heater
 
