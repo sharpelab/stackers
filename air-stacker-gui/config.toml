@@ -94,12 +94,15 @@ voltage_limits = [-20.0, 30.0]
 nm_per_volt = 933.33
 poll_interval_ms = 1000
 
-# NPM140 capacitance per datasheet (1.7 µF ± 20 %). Used by the
-# closed-loop Move to size the predictive scale-down on final
-# approach (i_needed = error * C / dt). A wrong value here means
-# under/overshoot proportional to the C error — the next loop
-# iteration corrects, just with one extra cycle.
-piezo_capacitance_uf = 1.7
+# NPM140 capacitance — measured 2026-05-11 by ramping V at constant
+# +1 µA and observing the slope (0.49 V/s implies C = 2.0 µF). The
+# datasheet quotes 1.7 µF ±20 %, so 2.0 sits at the high end of the
+# tolerance band but is consistent with it. Used by the closed-loop
+# Move to size the predictive scale-down (i_needed = error * C / dt);
+# the wrong value just produces a proportional gain error that the
+# next iteration corrects, but the right value gives one-shot
+# convergence.
+piezo_capacitance_uf = 2.0
 
 # Default sourcing current for Move/Jog. 5 µA on a 1.7 µF piezo is
 # dV/dt ≈ 2.94 V/s ≈ 2.7 µm/s — crosses the 50 V working range in
