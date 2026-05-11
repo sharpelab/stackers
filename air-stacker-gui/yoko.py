@@ -444,6 +444,36 @@ class Yoko7651:
         self.set_voltage(0.0)
         self.set_output(True)
 
+    def safe_enable_current(self) -> None:
+        """Engage protocol for current-source mode — ``SA0;`` then ``O1;``.
+
+        Same invariant as :meth:`safe_enable`: the relay is only
+        commanded when the programmed output (here, current) is 0.
+        Closing the relay onto a 0-A source leaves the piezo's voltage
+        wherever it was — no surprise charging current at relay-close,
+        so this is symmetric to the V-mode invariant.
+        """
+        self.set_current(0.0)
+        self.set_output(True)
+
+    def safe_disable_current(self) -> None:
+        """Disable protocol for current-source mode — ``SA0;`` then ``O0;``.
+
+        Unlike V-mode :meth:`safe_disable`, no ramp is needed: a
+        current source held at 0 A is already not moving charge in or
+        out of the piezo, so the piezo voltage is steady at whatever
+        the prior I·dt integration put it at. The explicit SA0 before
+        O0 enforces the relay-only-at-zero invariant even when the
+        cache says we're already at 0 A.
+
+        If the operator wants the piezo at 0 V before disconnecting
+        (e.g. before powering down the unit), run a Move to 0 V first
+        and *then* call this — leaving the piezo at non-zero V on
+        disable just means it floats there across the open relay.
+        """
+        self.set_current(0.0)
+        self.set_output(False)
+
     # --- caches -------------------------------------------------------------
 
     @property

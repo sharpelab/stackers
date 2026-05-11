@@ -75,28 +75,70 @@ poll_interval_ms = 100
 position_limits = [0.0, 30.0]
 
 # Yokogawa 7651 → NPM140 piezo (fine-Z axis), GPIB.
-# voltage_limits enforces the piezo's −20 V hard floor — anything below
-# damages the piezo, and the 7651 itself can swing to −30 V.
-# nm_per_volt comes from the NPM140 datasheet (140 µm / 150 V span).
-# See docs/air-stacker-pc.md "Z stage — fine (Yokogawa 7651 + NPM140)".
+# Panel operates the Yoko as a **constant-current source**: the piezo
+# voltage evolves as dV/dt = I/C, the Keithley 617 (across the piezo
+# terminals, DCV mode) provides voltage feedback for closed-loop
+# control. See docs/air-stacker-pc.md "Z stage — fine (Yokogawa 7651 +
+# NPM140)".
+#
+# voltage_limits is the piezo-safety window enforced in software:
+# −20 V is the NPM140 hard floor (anything below damages the piezo,
+# and the Yoko itself can swing to −30 V — no hardware protection).
+# +30 V is the Yoko's own compliance ceiling (so the +30 V side is
+# also a hardware limit, but tripping it just means the source ran
+# out of headroom, not damage). nm_per_volt comes from the NPM140
+# datasheet (140 µm / 150 V span).
 [yoko]
 resource = "GPIB0::15::INSTR"
 voltage_limits = [-20.0, 30.0]
 nm_per_volt = 933.33
 poll_interval_ms = 1000
-# Ramp at 0.05 V / 10 ms = 5 V/s @ 100 Hz updates. Smaller steps keep
-# the per-step piezo charging transient under the 617's 20 mA range
-# ceiling (Ipeak ≈ C·ΔV / t_slew ≈ 1.7 µF · 0.05 V / ~10 µs ≈ 8 mA) and
-# stay away from the NPM140's 670 Hz mechanical resonance. Bump
-# ramp_step_v to 0.1 V if 617 OLs become acceptable and you want
-# faster average travel.
-ramp_step_v = 0.05
-ramp_delay_ms = 10
 
-# Keithley 617 electrometer in series with the piezo (charging /
-# leakage current readback). Optional — drop this block to hide the
-# current readout in the Yoko panel. See docs/air-stacker-pc.md
-# "Current readback — Keithley 617" for the wiring.
+# NPM140 capacitance per datasheet (1.7 µF ± 20 %). Used by the
+# closed-loop Move to size the predictive scale-down on final
+# approach (i_needed = error * C / dt). A wrong value here means
+# under/overshoot proportional to the C error — the next loop
+# iteration corrects, just with one extra cycle.
+piezo_capacitance_uf = 1.7
+
+# Default sourcing current for Move/Jog. 5 µA on a 1.7 µF piezo is
+# dV/dt ≈ 2.94 V/s ≈ 2.7 µm/s — crosses the 50 V working range in
+# ~17 s, slow enough that a fat-fingered target doesn't blow past
+# the user-intended stop. Operator can adjust live via the Speed
+# spinbox within [min_speed_a, max_speed_a].
+default_speed_a = 5e-6        # 5 µA
+min_speed_a = 100e-9          # 100 nA — Yoko 1 mA range resolution floor
+max_speed_a = 20e-6           # 20 µA — beyond this, one 617 conversion
+                              # cycle (333 ms) eats > 4 V of motion before
+                              # the closed loop can react. Bump cautiously.
+
+# Per-click jog step (in V). Hold the +/− button past the click-vs-hold
+# threshold to switch into continuous mode at default_speed_a.
+jog_step_v = 0.1
+
+# Tolerance for "we've hit the target" in closed-loop Move (in V).
+# Must be larger than the 617's typical noise/jitter (~few mV at the
+# 200 mV range; ~tens of mV when autoranging up). Smaller → more
+# accurate but risks oscillating around target.
+move_tolerance_v = 0.05
+
+# Safety margin (in V) between the Move spinbox bounds and the
+# hard voltage_limits. Soft trip = voltage_limits ± this. Sized to
+# cover worst-case overshoot at max_speed_a (~0.8 V at 20 µA with
+# ±20 % C tolerance), with margin to spare.
+safety_margin_v = 1.5
+
+# Watchdog: if the 617 hasn't returned a fresh reading in this long
+# while output is on, the Move/Jog worker bails and the panel trips.
+# The 617's native conversion time is 330 ms, so anything < 500 ms
+# is a real comm-loss signal.
+move_stale_ms = 1000
+
+# Keithley 617 electrometer across the piezo terminals (live voltage
+# readback; 200 TΩ input keeps loading negligible). Optional — drop
+# this block to hide the 617 readout in the Yoko panel. See
+# docs/air-stacker-pc.md "Voltage readback — Keithley 617" for the
+# wiring.
 [yoko.keithley617]
 resource = "GPIB0::29::INSTR"
 poll_interval_ms = 1000

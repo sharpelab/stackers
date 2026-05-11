@@ -133,12 +133,14 @@ Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not**
 - **Probe script**: [`air-stacker-gui/probe_yoko.py`](../air-stacker-gui/probe_yoko.py) — sends `OD;`, decodes the reply, reports the live output. Read-only and safe.
 - **Reference driver** (different framework, same protocol): [`~/sharpelab/measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py`](../../measurement-env/src/sharpelab_nb/drivers/yokogawa_7651.py) — QCoDeS `VisaInstrument` subclass with the same cache-on-set semantics; useful sanity check when extending `yoko.py`.
 
-### Current readback — Keithley 617 (added 2026-05-10)
+### Voltage readback — Keithley 617 (added 2026-05-10)
 
-The 7651 → NPM140 path is open-loop; the 617 sits in series with the piezo and gives us a real current trace. Two useful regimes:
+The 7651 → NPM140 path is open-loop; the 617 sits **across the piezo terminals** in DCV mode and gives us a real voltage trace. The 617's > 200 TΩ input impedance keeps loading negligible (vs. a 34401A's 10 MΩ, which would discharge the piezo). Two useful regimes:
 
-- **During ramps**: charging current `I = C·dV/dt` (≈ 8.5 µA at 5 V/s with the 1.7 µF NPM140) — direct confirmation that the piezo is actually being driven.
-- **At steady state**: leakage current of the piezo + cabling. Sub-pA resolution lets us spot insulation problems long before they show on the Yoko's open-loop reading.
+- **Closed-loop control**: with the Yoko switched to constant-current source, the 617's V reading becomes the feedback signal — Yoko sources `I = C·dV/dt`, 617 reports where V actually is, software stops the source when V hits the target. See yoko_panel.py.
+- **Quiescent monitoring**: at any time, the 617 tells us the piezo's actual voltage, decoupled from the Yoko's open-loop set value. Drift, leakage, or a wiring fault all show up here.
+
+Prior incarnation (pre-2026-05-10): 617 was wired **in series with the piezo in AMPS mode** to read charging / leakage current. That topology produced asymmetric mA-scale currents during ramps that suggested wiring problems rather than piezo damage; the rewire to parallel-V was Aaron's fix. The driver / panel handle both modes (display adapts to `Reading.function`), but the steady-state rig is V.
 
 #### Hardware
 
@@ -185,21 +187,24 @@ The 7651 → NPM140 path is open-loop; the 617 sits in series with the piezo and
 - **Status byte** (serial poll, `inst.read_stb()`): bit 0 Overflow · bit 1 Buffer Full · bit 2 Reading Done · bit 3 Ready · bit 4 Error · bit 6 SRQ-by-617. Power-up default SRQ mask is 70.
 - **Machine-status decode** (positions in the `U0X` reply after the `617` prefix): `F RR C Z N T O B G D Q MM K YY`. Each field maps to the corresponding command letter — useful for sanity-checking front-panel state from the bus.
 
-#### Currently observed (2026-05-10)
+#### Currently observed (2026-05-10, after rewire + `F0R0X`)
 
-- Function = AMPS, range = Autorange, **Zero Check = ON** (input is internally shorted; the ~0.91 pA we see on the bus is the unit's own residual offset, not the piezo current).
-- Zero Correct = OFF, Suppress = OFF, V-Source Operate = OFF.
-- The unit had an IDDC error pending from our earlier `*IDN?` / OD; attempts at GPIB 29 before we knew which device was which; `U1X` (or any subsequent valid command) clears it.
+- **Function = VOLTS** (DCV), range = Autorange, **Zero Check = OFF**, **Zero Correct = ON**.
+- Reading: ~+14 µV with the Yoko output relay open (piezo floating near 0 V) — consistent with a parallel V probe on an undriven piezo.
+- Suppress = OFF, V-Source Operate = OFF.
+- The function-mode change was done via `F0R0X` over the bus (transient — survives until the next power cycle or front-panel function press). Earlier `*IDN?` / OD; attempts at GPIB 29 had left an IDDC error pending in a prior session; clears on any valid command.
 
 #### Workflow notes
 
-To take it from current state to "actually measuring the piezo":
+V-mode workflow (current configuration):
 
 1. Warm up at least an hour after power-on (per the manual).
-2. Press front-panel ZERO CORRECT (or send `Z1X`) to capture the offset.
-3. Press front-panel ZERO CHECK to take it out (or send `C0X`).
-4. Now the AMPS reading reflects the live piezo current; range will auto-adjust.
-5. When done / re-cabling: Zero Check back ON before touching the triax.
+2. Send `F0R0X` if the unit isn't already in VOLTS / Autorange (the front-panel function knob also works).
+3. Zero Correct (`Z1X` after a moment in Zero Check) — captures the offset.
+4. Zero Check OFF (`C0X`) — readings now reflect the live piezo voltage.
+5. When re-cabling: Zero Check back ON before touching the input.
+
+A-mode workflow (legacy series-current rig, no longer in use): `F1R0X` lands in AMPS/auto; same Zero Check / Zero Correct dance. Kept for the historical record in case the wiring gets reverted.
 
 #### Physical interaction needed?
 
@@ -210,9 +215,9 @@ Front-panel-only (no bus equivalent):
 - Power on/off and physical triax cabling (obviously).
 - Calibration entry (and we won't touch that).
 
-So once cabled and on the bus, the 617 is a fully remote instrument. A `keithley617.py` driver + GUI panel can drive the full measurement loop without anyone reaching over to the rack.
+So once cabled and on the bus, the 617 is a fully remote instrument. `keithley617.py` + the Yoko panel drive the full measurement loop without anyone reaching over to the rack.
 
-For the GUI integration (TBD): a `keithley617.py` driver mirroring `yoko.py`'s shape — open() asserts REN, sends `F1R0X` to land in AMPS/auto, reads via raw `inst.read()`, parses NDCA replies with a regex like the Yoko's `_OD_RE`. Poll thread at ~1-2 Hz (conversion time is 330 ms). The panel would surface the live current alongside the Yoko's voltage, and optionally compute live `I/dV·1/C` for piezo-capacitance sanity-check.
+GUI integration shipped: [`keithley617.py`](../air-stacker-gui/keithley617.py) mirrors `yoko.py`'s shape (open() asserts REN, raw `inst.read()`, regex-parsed NDC* replies). The driver intentionally does **not** change function/range/trigger — those track the unit's runtime state (front panel or one-shot bus writes). [`yoko_panel.py`](../air-stacker-gui/yoko_panel.py) polls at 1 Hz and shows the live reading via `Reading.unit` + `Reading.function`, so a DCV → DCA flip on the front panel surfaces as `617 · DCA` instead of being silently mis-labelled.
 
 ## Heater
 

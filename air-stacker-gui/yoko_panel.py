@@ -1,42 +1,40 @@
-"""PySide6 panel for the Yokogawa 7651 driving the NPM140 fine-Z piezo.
+"""PySide6 panel for the Yokogawa 7651 driving the NPM140 fine-Z piezo
+as a **constant-current source**, with a Keithley 617 voltmeter across
+the piezo terminals as the voltage-feedback probe.
 
-Self-contained: not yet imported from ``main.py``. When the master session
-wires it up, the integration call site will look like::
+The Yoko sources a programmed current I; the piezo voltage evolves
+linearly as dV/dt = I/C. The 617 reports the actual V (200 TΩ input,
+parallel across the piezo). Software closes the loop: pick a target V,
+the Move worker sources ±speed_a until V hits the target, then sets
+I = 0 (current source at zero holds the piezo's V steady — no ramp-
+back-to-0 needed on disable).
 
-    from yoko_panel import YokoPanel
-    yoko_cfg = config.get("yoko")
-    if yoko_cfg:
-        self.yoko_panel = YokoPanel(yoko_cfg)
+Why current-mode: prior V-mode panel stepped SA;E; in software at
+~5 V/s, generating per-step charging transients on the piezo. A real
+current source produces a smooth analog ramp by construction; the
+617 gives us a real voltage trace decoupled from the Yoko's open-loop
+set value. See docs/air-stacker-pc.md for the wiring and rationale.
 
-Voltage-only by design — the rig drives the NPM140 piezo as a DC voltage
-source, so this panel doesn't expose the 7651's current-source mode. Anyone
-who needs current mode reaches for :class:`yoko.Yoko7651` directly.
+Safety: the NPM140's −20 V hard floor has no hardware-side protection
+(the Yoko can swing to −30 V). The 617 poll thread is the safety
+watchdog — on every reading it checks against the voltage_limits and
+asserts ``set_current(0)`` if breached, then latches a tripped state
+that the operator has to acknowledge. The Move spinbox is clamped to
+``voltage_limits ± safety_margin_v`` so normal operation can't reach
+the trip wire. If the 617 stops answering (comm loss while output is
+on), the watchdog also trips — without V feedback we have no safety
+net, so we kill the source.
 
-Expected ``cfg`` keys (parallel to the ``[heater]`` and ``[smc100]`` blocks
-in ``config.toml``):
-
-  - ``resource`` (str, required) — VISA resource, e.g. ``"GPIB0::15::INSTR"``
-  - ``voltage_limits`` (list of two floats, optional) — operational software
-    cap; passed through to :class:`Yoko7651`. The piezo caller passes
-    ``[-20.0, 30.0]`` (anything below −20 V damages the piezo).
-  - ``current_limits`` (list of two floats, optional) — kept around for
-    completeness even though the panel doesn't use them.
-  - ``nm_per_volt`` (float, optional, default 933.33) — for the µm-equivalent
-    readout shown beside the volts. NPM140 datasheet gives 140 µm over the
-    full −20 → +130 V range = 150 V span = 933.33 nm/V.
-  - ``poll_interval_ms`` (int, default 1000) — OD; polling cadence.
-  - ``ramp_step_v`` (float, default 0.05) — ramp step size, in volts.
-  - ``ramp_delay_ms`` (int, default 50) — ramp delay between steps.
-
-Persistent / setup-mode commands and current-mode operation are not exposed.
+Expected ``cfg`` keys — see ``config.toml`` for the documented defaults.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
+import time
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
@@ -65,39 +63,82 @@ log = logging.getLogger("airstacker.yoko")
 # = 933.33 nm/V. See docs/air-stacker-pc.md.
 DEFAULT_NM_PER_VOLT = 140_000.0 / 150.0  # ≈ 933.33
 
-# Default ramp parameters — 0.05 V steps every 10 ms = 5 V/s, 100 Hz
-# cadence. Per-step charge is 1.7 µF · 0.05 V = 85 nC, giving an
-# instantaneous Yoko output current of ~8 mA during the slew between
-# steps (well under the Keithley 617's 20 mA ceiling). The 100 Hz
-# cadence also keeps each step's ΔV/dt away from the NPM140's 670 Hz
-# mechanical resonance. Override per-deployment via [yoko] in
-# config.toml; smaller steps trade speed for cleaner current traces,
-# larger steps trade clean traces for faster average travel.
-#
-# Caveat: the 7651's hardware slew rate is the real ceiling. If GPIB
-# write overhead pushes the effective cadence below 100 Hz, the
-# software ramp paces itself to whatever cycle time it actually
-# achieves; the unit follows along. If the ramp_progress label says
-# "done" before the piezo settles, raise the Yoko's current limit on
-# the unit or add OD-settle detection to _on_ramp_finished.
-DEFAULT_RAMP_STEP_V = 0.05
-DEFAULT_RAMP_DELAY_MS = 10
+# Defaults — see config.toml for the documented rationale.
+DEFAULT_CAPACITANCE_UF = 1.7
+DEFAULT_SPEED_A = 5e-6
+DEFAULT_MIN_SPEED_A = 100e-9
+DEFAULT_MAX_SPEED_A = 20e-6
+DEFAULT_JOG_STEP_V = 0.1
+DEFAULT_TOLERANCE_V = 0.05
+DEFAULT_SAFETY_MARGIN_V = 1.5
+DEFAULT_STALE_MS = 1000
+
+# 617 analog-front-end integration window. Sets the floor on closed-
+# loop period — anything faster is theatre. Quoted in the 617's quick-
+# ref; effectively fixed.
+KEITHLEY_CONVERSION_S = 0.333
+
+# Mouse-down duration past which a +/− jog button switches from a
+# single-step click to continuous travel at speed_a. Matches the
+# SMC100 panel's value.
+JOG_HOLD_MS = 250
+
+# "Output is on" inference threshold on the Yoko's OD; reading in I
+# mode. With the relay open the unit reads near 0 A regardless of the
+# programmed current; anything above this magnitude is definitely
+# sourcing into a load.
+OUTPUT_ON_THRESHOLD_A = 10e-9  # 10 nA
 
 
-class _PollWorker(QObject):
-    """Voltage-readout polling worker — gated mailbox via Qt's queued signal.
+class _LatestReading:
+    """Thread-safe handoff of the most recent 617 sample.
 
-    Same shape as ``smc100_panel._PollWorker`` and ``main.PollWorker``; we
-    inline a copy here to keep this module standalone (no import from
-    ``main`` while the master session is editing it).
+    The Keithley poll thread writes; Move/Jog workers read. Reading is
+    a snapshot — the workers don't block waiting for fresh data, they
+    just check the timestamp and bail if it's stale.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._value: float | None = None
+        self._function: str | None = None
+        self._timestamp: float = 0.0
+
+    def write(self, value: float, function: str) -> None:
+        with self._lock:
+            self._value = value
+            self._function = function
+            self._timestamp = time.monotonic()
+
+    def read(self) -> tuple[float | None, str | None, float]:
+        """Returns (value, function, age_seconds). Value is None if never written."""
+        with self._lock:
+            if self._value is None:
+                return (None, None, float("inf"))
+            return (self._value, self._function, time.monotonic() - self._timestamp)
+
+    def invalidate(self) -> None:
+        with self._lock:
+            self._value = None
+            self._function = None
+            self._timestamp = 0.0
+
+
+class _YokoPollWorker(QObject):
+    """Yoko OD; polling — surfaces the I the source is presently delivering.
+
+    In current mode OD; returns NDCA: the actually-sourced current, not
+    just an echo of SA. Useful as a "source is alive" confirmation and
+    surfaces compliance-clamp behavior (if the Yoko hits its ±30 V
+    compliance ceiling, OD reads back the reduced I).
     """
 
     state_ready = Signal(object)
     finished = Signal()
 
-    def __init__(self, read_fn, poll_interval_s: float) -> None:
+    def __init__(self, yoko: Yoko7651, poll_interval_s: float) -> None:
         super().__init__()
-        self._read = read_fn
+        self._yoko = yoko
         self._interval = poll_interval_s
         self._stop_event = threading.Event()
 
@@ -105,9 +146,15 @@ class _PollWorker(QObject):
     def run(self) -> None:
         while not self._stop_event.is_set():
             try:
-                payload = self._read()
-            except Exception as e:  # noqa: BLE001 — surface and continue
-                payload = {"_worker_err": str(e)}
+                r = self._yoko.read_output()
+                payload: dict = {
+                    "value": r.value,
+                    "function": r.function,
+                    "status": r.status,
+                }
+            except _YOKO_ERRORS as e:
+                log.warning("yoko OD read failed: %s", e)
+                payload = {"od_err": str(e)}
             self.state_ready.emit(payload)
             self._stop_event.wait(self._interval)
         self.finished.emit()
@@ -116,30 +163,136 @@ class _PollWorker(QObject):
         self._stop_event.set()
 
 
-class _RampWorker(QObject):
-    """One-shot ramp worker — runs Yoko7651.ramp_voltage off the GUI thread.
+class _KeithleyWatchdogWorker(QObject):
+    """617 polling + safety watchdog.
 
-    Created fresh per ramp, runs to completion (or until cancel), emits
-    ``finished`` with success/failure info, then its thread quits. The GUI
-    can call :meth:`cancel` to bail mid-ramp; we patch the driver's step
-    write through a cancel-aware shim so the ramp can be interrupted at a
-    granular level rather than only after each step.
+    Reads the 617 at ~3 Hz (the unit's native conversion rate), stashes
+    each reading on a shared _LatestReading so Move/Jog workers can
+    sample without lock contention, and asserts ``set_current(0)`` on
+    hard-limit breach. The watchdog is the single thread that touches
+    the 617 — Move/Jog never call ``keithley.read()`` directly.
+
+    Latching is the panel's responsibility: this worker emits a
+    ``tripped`` signal with the breach reason; the panel locks down
+    controls and shows the operator a "TRIPPED" banner with an
+    Acknowledge button.
     """
 
-    finished = Signal(object)  # dict payload
+    state_ready = Signal(object)
+    tripped = Signal(object)
+    finished = Signal()
+
+    def __init__(
+        self,
+        keithley: Keithley617,
+        yoko: Yoko7651,
+        latest: _LatestReading,
+        hard_limits: tuple[float, float],
+        poll_interval_s: float,
+    ) -> None:
+        super().__init__()
+        self._k = keithley
+        self._yoko = yoko
+        self._latest = latest
+        self._hard_lo, self._hard_hi = hard_limits
+        self._interval = poll_interval_s
+        self._stop_event = threading.Event()
+        self._tripped = False
+
+    @Slot()
+    def run(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                r = self._k.read()
+                payload: dict = {
+                    "value": r.value,
+                    "function": r.function,
+                    "unit": r.unit,
+                    "status": r.status,
+                }
+                # Only stash + trip-check when 617 is in DCV. Other
+                # functions (DCA from a stale rig config, OHM, …) leave
+                # us blind to piezo voltage; the panel's Enable button
+                # is gated on function == DCV so we never source into
+                # an unknown V.
+                if r.function == "DCV" and not self._tripped:
+                    self._latest.write(r.value, r.function)
+                    if r.value < self._hard_lo or r.value > self._hard_hi:
+                        self._fire_trip(
+                            f"V {r.value:+.3f} outside hard limits "
+                            f"[{self._hard_lo:+.2f}, {self._hard_hi:+.2f}] V"
+                        )
+            except _K617_ERRORS as e:
+                log.warning("keithley617 read failed: %s", e)
+                payload = {"k617_err": str(e)}
+            self.state_ready.emit(payload)
+            self._stop_event.wait(self._interval)
+        self.finished.emit()
+
+    def _fire_trip(self, reason: str) -> None:
+        """Latched emergency stop. Asserts I=0, signals the panel, latches
+        so subsequent readings don't re-fire."""
+        log.error("yoko watchdog TRIPPED: %s", reason)
+        self._tripped = True
+        try:
+            self._yoko.set_current(0.0)
+        except _YOKO_ERRORS as e:
+            log.exception("yoko set_current(0) during trip failed: %s", e)
+        self.tripped.emit({"reason": reason})
+
+    def acknowledge(self) -> None:
+        """Clear the latched-trip flag. Called from the GUI thread after
+        the operator clicks Acknowledge."""
+        self._tripped = False
+
+    def stop(self) -> None:
+        self._stop_event.set()
+
+
+class _MoveWorker(QObject):
+    """Closed-loop voltage Move: source ±I until 617 reports V at target.
+
+    Algorithm — one-shot predictive stop per cycle:
+        v_now = latest 617 sample
+        error = target - v_now
+        i_desired = error * C / dt           # the I that lands us in 1 cycle
+        i_clipped = clip(i_desired, ±speed_a)  # respect speed ceiling
+        set_current(i_clipped); wait dt
+        loop
+
+    On the final approach (|error| ≤ speed_a·dt/C), this scales I down
+    automatically so we hit target in one cycle within ±20 % (C
+    tolerance from the NPM140 datasheet). On the way there, it sources
+    full speed_a in the direction of error.
+
+    Bails out (set_current(0), emit err) on:
+      - cancel via STOP
+      - stale latest reading (no fresh 617 in `stale_s` seconds)
+      - soft-limit breach (V outside voltage_limits ± safety_margin)
+    """
+
+    finished = Signal(object)
 
     def __init__(
         self,
         yoko: Yoko7651,
-        target: float,
-        step: float,
-        delay_s: float,
+        latest: _LatestReading,
+        target_v: float,
+        speed_a: float,
+        tolerance_v: float,
+        capacitance_f: float,
+        soft_limits: tuple[float, float],
+        stale_s: float,
     ) -> None:
         super().__init__()
         self._yoko = yoko
-        self._target = target
-        self._step = step
-        self._delay_s = delay_s
+        self._latest = latest
+        self._target = target_v
+        self._speed_a = abs(speed_a)
+        self._tolerance = tolerance_v
+        self._C = capacitance_f
+        self._soft_lo, self._soft_hi = soft_limits
+        self._stale_s = stale_s
         self._cancel = threading.Event()
 
     def cancel(self) -> None:
@@ -147,67 +300,174 @@ class _RampWorker(QObject):
 
     @Slot()
     def run(self) -> None:
-        # Loop calling set_voltage one step at a time, checking the cancel
-        # flag between steps. Mirrors the inner loop of Yoko7651.ramp_voltage
-        # but interrupts cleanly. Reads the current voltage from the cache
-        # (or live OD if the cache is empty).
+        v_last: float | None = None
         try:
-            cur = self._yoko.cached_voltage
-            if cur is None:
-                r = self._yoko.read_output()
-                if r.function != "V":
-                    raise YokoError(
-                        "can't ramp voltage — instrument is in current mode"
+            dt = KEITHLEY_CONVERSION_S
+            while not self._cancel.is_set():
+                v_now, func, age = self._latest.read()
+                if v_now is None:
+                    raise RuntimeError("no 617 reading available")
+                if age > self._stale_s:
+                    raise RuntimeError(
+                        f"617 reading stale ({age * 1000:.0f} ms)"
                     )
-                cur = r.value
-                self._yoko.seed_voltage_cache(cur)
-
-            target = self._target
-            step = self._step
-            if step <= 0:
-                raise YokoError("step must be > 0")
-
-            direction = 1 if target >= cur else -1
-            step_signed = step * direction
-
-            while (direction > 0 and cur < target) or (direction < 0 and cur > target):
-                if self._cancel.is_set():
-                    self.finished.emit({"cancelled": True, "stopped_at": cur})
+                if func != "DCV":
+                    raise RuntimeError(f"617 not in DCV (got {func})")
+                if not self._soft_lo <= v_now <= self._soft_hi:
+                    raise RuntimeError(
+                        f"V {v_now:+.3f} outside soft limits "
+                        f"[{self._soft_lo:+.2f}, {self._soft_hi:+.2f}]"
+                    )
+                v_last = v_now
+                error = self._target - v_now
+                if abs(error) < self._tolerance:
+                    break
+                # Predictive: I that lands us at target in one cycle.
+                # Clipped to ±speed_a so the user-set speed ceiling holds.
+                i_desired = error * self._C / dt
+                if abs(i_desired) > self._speed_a:
+                    i_desired = self._speed_a if error > 0 else -self._speed_a
+                # Predictive soft-limit check: would V be outside the
+                # soft window by the time we sample next? `age` covers
+                # the staleness of v_now (617 conversion is ~333 ms),
+                # `dt` covers this loop's wait, +0.1 s slack. Without
+                # this, fast Move/Jog at max speed can cross the soft
+                # limit by ~5 V at 20 µA between worker decisions and
+                # rely on the watchdog's hard trip — which damages the
+                # piezo before catching it on the −20 V side.
+                lookahead_s = age + dt + 0.1
+                v_pred = v_now + i_desired * lookahead_s / self._C
+                if not self._soft_lo <= v_pred <= self._soft_hi:
+                    self._yoko.set_current(0.0)
+                    self.finished.emit(
+                        {"limit": True, "v_final": v_now, "v_pred": v_pred}
+                    )
                     return
-                nxt = cur + step_signed
-                if (direction > 0 and nxt > target) or (direction < 0 and nxt < target):
-                    nxt = target
-                self._yoko.set_voltage(nxt)
-                cur = nxt
-                if self._cancel.wait(self._delay_s):
-                    self.finished.emit({"cancelled": True, "stopped_at": cur})
-                    return
-            self.finished.emit({"ok": True, "final": cur})
-        except _YOKO_ERRORS as e:
-            self.finished.emit({"err": str(e)})
+                self._yoko.set_current(i_desired)
+                if self._cancel.wait(dt):
+                    break
+            # End of loop — success, cancel, or break. Source to 0 in
+            # all cases (the finally also covers exceptions).
+            self._yoko.set_current(0.0)
+            if self._cancel.is_set():
+                self.finished.emit({"cancelled": True, "v_final": v_last})
+            else:
+                self.finished.emit({"ok": True, "v_final": v_last})
+        except Exception as e:  # noqa: BLE001 — narrowed by re-raising would lose context
+            try:
+                self._yoko.set_current(0.0)
+            except _YOKO_ERRORS as e2:
+                log.exception("move worker: set_current(0) on err failed: %s", e2)
+            self.finished.emit({"err": str(e), "v_final": v_last})
+
+
+class _JogWorker(QObject):
+    """Continuous-jog worker: source ±speed_a until released or limit hit.
+
+    Click-vs-hold is handled in the panel; this worker only runs when
+    the operator has committed to continuous mode. On release, the
+    panel calls cancel() and the worker drops I to 0.
+
+    Same safety envelope as _MoveWorker — soft limits + stale-reading
+    + 617-in-DCV checks every loop iteration.
+    """
+
+    finished = Signal(object)
+
+    def __init__(
+        self,
+        yoko: Yoko7651,
+        latest: _LatestReading,
+        direction: int,
+        speed_a: float,
+        capacitance_f: float,
+        soft_limits: tuple[float, float],
+        stale_s: float,
+    ) -> None:
+        super().__init__()
+        self._yoko = yoko
+        self._latest = latest
+        self._direction = +1 if direction > 0 else -1
+        self._speed_a = abs(speed_a)
+        self._C = capacitance_f
+        self._soft_lo, self._soft_hi = soft_limits
+        self._stale_s = stale_s
+        self._cancel = threading.Event()
+
+    def cancel(self) -> None:
+        self._cancel.set()
+
+    @Slot()
+    def run(self) -> None:
+        v_last: float | None = None
+        try:
+            i_signed = self._direction * self._speed_a
+            self._yoko.set_current(i_signed)
+            # Poll faster than the 617's native rate — the watchdog
+            # writes _latest at ~3 Hz, but we want to respond to
+            # release quickly. The cancel wait is the rate limiter.
+            poll_s = 0.1
+            while not self._cancel.is_set():
+                v_now, func, age = self._latest.read()
+                if v_now is None:
+                    raise RuntimeError("no 617 reading available")
+                if age > self._stale_s:
+                    raise RuntimeError(
+                        f"617 reading stale ({age * 1000:.0f} ms)"
+                    )
+                if func != "DCV":
+                    raise RuntimeError(f"617 not in DCV (got {func})")
+                v_last = v_now
+                # Predictive soft-limit check — see _MoveWorker for
+                # the rationale. `age` covers the staleness of v_now,
+                # `poll_s` covers this loop's wait, +0.1 s slack.
+                lookahead_s = age + poll_s + 0.1
+                v_pred = v_now + i_signed * lookahead_s / self._C
+                hit_hi = self._direction > 0 and (
+                    v_now >= self._soft_hi or v_pred >= self._soft_hi
+                )
+                hit_lo = self._direction < 0 and (
+                    v_now <= self._soft_lo or v_pred <= self._soft_lo
+                )
+                if hit_hi or hit_lo:
+                    break
+                if self._cancel.wait(poll_s):
+                    break
+            self._yoko.set_current(0.0)
+            if self._cancel.is_set():
+                self.finished.emit({"cancelled": True, "v_final": v_last})
+            else:
+                self.finished.emit({"limit": True, "v_final": v_last})
+        except Exception as e:  # noqa: BLE001
+            try:
+                self._yoko.set_current(0.0)
+            except _YOKO_ERRORS as e2:
+                log.exception("jog worker: set_current(0) on err failed: %s", e2)
+            self.finished.emit({"err": str(e), "v_final": v_last})
 
 
 class YokoPanel(QGroupBox):
-    """Live readout + control surface for a Yokogawa 7651 driving a piezo."""
+    """Live readout + closed-loop CC control for the Yoko 7651 + NPM140."""
 
     DEFAULT_POLL_MS = 1000
 
     def __init__(self, cfg: dict) -> None:
-        super().__init__("Fine Z (Yoko 7651 → NPM140)")
-        self._poll_interval_s = (
+        super().__init__("Fine Z (Yoko 7651 → NPM140) [CC]")
+
+        # --- config ---------------------------------------------------------
+        self._yoko_poll_s = (
             int(cfg.get("poll_interval_ms", self.DEFAULT_POLL_MS)) / 1000.0
         )
         self._nm_per_volt = float(cfg.get("nm_per_volt", DEFAULT_NM_PER_VOLT))
-        self._ramp_step_v = float(cfg.get("ramp_step_v", DEFAULT_RAMP_STEP_V))
-        self._ramp_delay_s = (
-            int(cfg.get("ramp_delay_ms", DEFAULT_RAMP_DELAY_MS)) / 1000.0
-        )
+        self._C = float(cfg.get("piezo_capacitance_uf", DEFAULT_CAPACITANCE_UF)) * 1e-6
+        self._default_speed_a = float(cfg.get("default_speed_a", DEFAULT_SPEED_A))
+        self._min_speed_a = float(cfg.get("min_speed_a", DEFAULT_MIN_SPEED_A))
+        self._max_speed_a = float(cfg.get("max_speed_a", DEFAULT_MAX_SPEED_A))
+        self._jog_step_v = float(cfg.get("jog_step_v", DEFAULT_JOG_STEP_V))
+        self._tolerance_v = float(cfg.get("move_tolerance_v", DEFAULT_TOLERANCE_V))
+        self._margin_v = float(cfg.get("safety_margin_v", DEFAULT_SAFETY_MARGIN_V))
+        self._stale_s = int(cfg.get("move_stale_ms", DEFAULT_STALE_MS)) / 1000.0
 
-        # voltage_limits / current_limits: tomlkit hands us list-likes; coerce
-        # to plain tuples of floats. Defaulting voltage_limits to the 7651's
-        # full hardware envelope rather than the piezo-safe range — callers
-        # (config.toml) are responsible for the −20 V floor, mirroring how
-        # Yoko7651 itself defaults.
         v_raw = cfg.get("voltage_limits")
         if v_raw is None:
             voltage_limits = VOLTAGE_RANGE_V
@@ -216,48 +476,89 @@ class YokoPanel(QGroupBox):
             if len(v_list) != 2:
                 raise ValueError(f"voltage_limits must have 2 entries (got {v_raw!r})")
             voltage_limits = (v_list[0], v_list[1])
-        self._voltage_limits = voltage_limits
+        self._hard_limits = voltage_limits
+        self._soft_limits = (
+            voltage_limits[0] + self._margin_v,
+            voltage_limits[1] - self._margin_v,
+        )
 
         c_raw = cfg.get("current_limits")
+        current_limits: tuple[float, float] | None
         if c_raw is None:
-            current_kwargs: dict = {}
+            current_limits = None
         else:
             c_list = [float(x) for x in c_raw]
             if len(c_list) != 2:
                 raise ValueError(f"current_limits must have 2 entries (got {c_raw!r})")
-            current_kwargs = {"current_limits": (c_list[0], c_list[1])}
+            current_limits = (c_list[0], c_list[1])
 
-        self.yoko = Yoko7651(
-            resource=cfg["resource"],
-            voltage_limits=voltage_limits,
-            fix_voltage_range=True,
-            **current_kwargs,
-        )
+        # No fix_voltage_range — we're operating in current mode. The
+        # 7651's current ranges are 1/10/100 mA; max_speed_a clamps
+        # well inside the 1 mA range, so SA auto-ranging stays put.
+        if current_limits is not None:
+            self.yoko = Yoko7651(
+                resource=cfg["resource"],
+                voltage_limits=voltage_limits,
+                current_limits=current_limits,
+            )
+        else:
+            self.yoko = Yoko7651(
+                resource=cfg["resource"],
+                voltage_limits=voltage_limits,
+            )
 
-        # Optional Keithley 617 readback — wired in series with the
-        # piezo to measure charging / leakage current. Configured via
-        # a `keithley617` sub-block under [yoko] in config.toml.
+        # 617 is required for this CC panel — without V feedback we have
+        # no closed loop and no safety net. If the config doesn't carry
+        # a [yoko.keithley617] sub-block, we degrade to a display-only
+        # panel: status shows the problem; Enable/Move/Jog stay disabled.
         k617_cfg = cfg.get("keithley617")
         if k617_cfg:
             self.keithley = Keithley617(resource=k617_cfg["resource"])
-            self._k617_poll_interval_s = (
-                int(k617_cfg.get("poll_interval_ms", 1000)) / 1000.0
+            self._k617_poll_s = (
+                int(k617_cfg.get("poll_interval_ms", int(KEITHLEY_CONVERSION_S * 1000)))
+                / 1000.0
             )
         else:
             self.keithley = None
-            self._k617_poll_interval_s = 1.0
+            self._k617_poll_s = KEITHLEY_CONVERSION_S
+
+        # --- state ----------------------------------------------------------
+        self._latest = _LatestReading()
+        self._tripped: bool = False
+        self._trip_reason: str | None = None
+        self._cache_seeded = False  # for the Yoko I cache
+
+        # Worker / thread handles. Move and Jog share a single "active
+        # worker" slot — only one can run at a time.
+        self._active_worker: _MoveWorker | _JogWorker | None = None
+        self._active_thread: QThread | None = None
+        # Set when Disable kicks off a Move-to-0; consumed by the
+        # finished handler to chain safe_disable_current on success.
+        self._disable_after_move = False
+
+        self._yoko_poll_worker: _YokoPollWorker | None = None
+        self._yoko_poll_thread: QThread | None = None
+        self._k617_worker: _KeithleyWatchdogWorker | None = None
+        self._k617_thread: QThread | None = None
+
+        # Click-vs-hold jog state, matching smc100_panel.
+        self._jog_direction: int = 0
+        self._jog_continuous: bool = False
+        self._jog_timer = QTimer(self)
+        self._jog_timer.setSingleShot(True)
+        self._jog_timer.setInterval(JOG_HOLD_MS)
+        self._jog_timer.timeout.connect(self._on_jog_continuous_fire)
 
         # --- widgets --------------------------------------------------------
         self.status_label = QLabel("disconnected")
-        self.overload_label = QLabel("")
-        self.overload_label.setStyleSheet(
-            "color: white; background-color: #b04040; "
-            "font-weight: bold; padding: 2px 6px;"
+        self.trip_label = QLabel("")
+        self.trip_label.setStyleSheet(
+            "color: white; background-color: #c0392b; "
+            "font-weight: bold; padding: 4px 8px;"
         )
-        self.overload_label.setVisible(False)
-        self.id_label = QLabel("")
-        self.id_label.setStyleSheet("color: #888;")
-        self.id_label.setVisible(False)
+        self.trip_label.setVisible(False)
+        self.trip_ack_btn = QPushButton("Acknowledge")
+        self.trip_ack_btn.setVisible(False)
 
         self.voltage_label = QLabel("—")
         v_font = QFont(self.voltage_label.font())
@@ -267,199 +568,198 @@ class YokoPanel(QGroupBox):
         self.voltage_label.setFont(v_font)
         self.travel_label = QLabel("")
         self.travel_label.setStyleSheet("color: #888;")
-        # Keithley 617 current readout — sibling of the voltage display.
-        # Set visible only when a 617 is configured (see __init__ tail).
-        self.current_label = QLabel("—")
-        self.current_label.setFont(v_font)
-        self.current_label.setVisible(False)
-        self.current_status_label = QLabel("")
-        self.current_status_label.setStyleSheet("color: #888;")
-        self.current_status_label.setVisible(False)
 
-        # Ramp is the only path for changing voltage — single-shot Set has
-        # been removed because piezo callers shouldn't ever step the
-        # output, and 1 V/s ramps from the same spinbox cover the
-        # fine-adjustment case at one or two seconds of cost.
-        self.ramp_spin = QDoubleSpinBox()
-        self.ramp_spin.setKeyboardTracking(False)
-        self.ramp_spin.setDecimals(3)
-        self.ramp_spin.setSingleStep(0.1)
-        self.ramp_spin.setSuffix(" V")
-        self.ramp_spin.setRange(voltage_limits[0], voltage_limits[1])
-        self.ramp_btn = QPushButton("Ramp")
-        # STOP sits at top-right (status row) matching SMC100 and rotation
-        # panels. Always enabled — the handler no-ops when no ramp is in
-        # flight, so a wasted click is harmless and we don't lose clicks
-        # to a near-completed-ramp race.
+        # Yoko I sourcing readout — secondary, smaller, formatted A.
+        self.current_label = QLabel("—")
+        self.current_label.setStyleSheet("color: #888;")
+        self.dvdt_label = QLabel("")
+        self.dvdt_label.setStyleSheet("color: #888;")
+
+        # 617 mode + status — surfaces a front-panel function-knob bump.
+        self.k617_status_label = QLabel("")
+        self.k617_status_label.setStyleSheet("color: #888;")
+
+        # Target spinbox + Move button.
+        self.target_spin = QDoubleSpinBox()
+        self.target_spin.setKeyboardTracking(False)
+        self.target_spin.setDecimals(3)
+        self.target_spin.setSingleStep(0.1)
+        self.target_spin.setSuffix(" V")
+        self.target_spin.setRange(self._soft_limits[0], self._soft_limits[1])
+        self.move_btn = QPushButton("Move")
+
+        # Step + Speed spinboxes.
+        self.step_spin = QDoubleSpinBox()
+        self.step_spin.setKeyboardTracking(False)
+        self.step_spin.setDecimals(3)
+        self.step_spin.setSingleStep(0.01)
+        self.step_spin.setSuffix(" V")
+        self.step_spin.setRange(0.001, 10.0)
+        self.step_spin.setValue(self._jog_step_v)
+        # Speed in µA — friendlier than scientific notation. Converted
+        # to A on read via _speed_a().
+        self.speed_spin = QDoubleSpinBox()
+        self.speed_spin.setKeyboardTracking(False)
+        self.speed_spin.setDecimals(3)
+        self.speed_spin.setSingleStep(0.5)
+        self.speed_spin.setSuffix(" µA")
+        self.speed_spin.setRange(self._min_speed_a * 1e6, self._max_speed_a * 1e6)
+        self.speed_spin.setValue(self._default_speed_a * 1e6)
+
+        self.jog_minus_btn = QPushButton("−")
+        self.jog_plus_btn = QPushButton("+")
+
+        # STOP — top-right red panic button, matching smc100/rotation.
         self.stop_btn = QPushButton("STOP")
         self.stop_btn.setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; "
             "font-weight: bold; padding: 2px 10px; }"
             "QPushButton:pressed { background-color: #962d22; }"
         )
-        # Output state — Enable / Disable buttons. Disable always ramps
-        # to 0 first (via the existing ramp worker) before dropping the
-        # relay, so the operator path uses the shutdown protocol by
-        # default. The two-button design also acts as a state indicator:
-        # the inactive direction is disabled, so the live button shows
-        # what we last commanded. Cache is None at startup; we show both
-        # live until the operator's first action sets the cache.
+
         self.enable_btn = QPushButton("Enable")
         self.disable_btn = QPushButton("Disable")
         self.disable_btn.setToolTip(
-            "Ramp voltage to 0 V, then send O0. Always uses the shutdown "
-            "protocol — never slams the relay open at non-zero V."
+            "Stop sourcing (I→0) and open the relay. Piezo holds at its "
+            "current voltage. Move to 0 V first if you want it discharged."
         )
-
-        # Worker / thread state — must be initialized BEFORE _build_layout
-        # because _build_layout calls _refresh_output_buttons which reads
-        # self._ramp_thread to decide button-enable state.
-        self._poll_worker: _PollWorker | None = None
-        self._poll_thread: QThread | None = None
-        self._ramp_worker: _RampWorker | None = None
-        self._ramp_thread: QThread | None = None
-        # Set when Disable kicks off a ramp-to-0; consumed by
-        # _on_ramp_finished to chain set_output(False) on success.
-        self._disable_after_ramp = False
-        self._cache_seeded = False
 
         self._build_layout()
         self._wire_signals()
 
+        # --- bring up the hardware -----------------------------------------
         try:
             self.yoko.open()
         except _YOKO_ERRORS as e:
-            self.status_label.setText(f"open failed: {e}")
-            self._set_all_enabled(False)
+            self.status_label.setText(f"yoko open failed: {e}")
+            self._set_controls_enabled(False)
             return
 
-        # Seed-from-OD: don't write anything; the first poll picks up
-        # the live OD value and we use seed_voltage_cache so a
-        # subsequent ramp has a known starting point.
-        self._apply_state(self._read_state())
+        # Put the unit in current mode. set_mode("A") sends F5;E; — if
+        # we were previously in V mode at non-zero V this WILL switch
+        # the function, but the panel only allows this transition with
+        # the output already off in normal operation. At startup the
+        # OD; we just did would have told us if the relay was live;
+        # we defer the safety call to the watchdog once 617 is up.
+        try:
+            self.yoko.set_mode("A")
+        except _YOKO_ERRORS as e:
+            log.warning("yoko set_mode('A') failed at open: %s", e)
 
-        # Infer output state from that OD reading. The 7651 protocol
-        # can't query relay state directly; we approximate by treating
-        # any non-trivial OD value as "output is on" — when the relay
-        # is open the unit reads ~0 V. Below the 10 mV threshold we
-        # default to OFF, which is correct in the dominant case
-        # (clean prior shutdown) and harmless in the rare "on at 0 V"
-        # case (subsequent Enable just sends SA0;O1; — both no-ops).
-        # If OD failed entirely we leave the cache as None so the
-        # status label says "unknown" rather than lying.
-        v_seed = self.yoko.cached_voltage
-        if v_seed is not None:
-            self.yoko.seed_output_cache(abs(v_seed) > 0.01)
-        self._refresh_status_label()
-        self._refresh_output_buttons()
+        # Infer "is output on" from the first OD; reading. In I mode,
+        # OD; reads the actual sourced current — anything above the
+        # noise floor implies the relay is closed and we're delivering.
+        # If OD failed entirely, leave the cache as None and let the
+        # status label say "unknown".
+        try:
+            r = self.yoko.read_output()
+            if r.function == "A":
+                self.yoko.seed_output_cache(abs(r.value) > OUTPUT_ON_THRESHOLD_A)
+                self._cache_seeded = True
+            else:
+                log.warning("yoko OD at startup reports %s mode, expected A", r.function)
+        except _YOKO_ERRORS as e:
+            log.warning("yoko OD at startup failed: %s", e)
 
-        # Pre-populate the ramp spinbox with the live voltage so a
-        # fat-fingered Ramp click doesn't sweep the piezo from the
-        # spinbox's default of 0 to wherever the user actually wanted.
-        if self.yoko.cached_voltage is not None:
-            self.ramp_spin.blockSignals(True)
-            self.ramp_spin.setValue(self.yoko.cached_voltage)
-            self.ramp_spin.blockSignals(False)
+        # --- threads --------------------------------------------------------
+        # Yoko OD poll — informational, no safety responsibility.
+        self._yoko_poll_thread = QThread()
+        self._yoko_poll_worker = _YokoPollWorker(self.yoko, self._yoko_poll_s)
+        self._yoko_poll_worker.moveToThread(self._yoko_poll_thread)
+        self._yoko_poll_thread.started.connect(self._yoko_poll_worker.run)
+        self._yoko_poll_worker.state_ready.connect(self._apply_yoko_state)
+        self._yoko_poll_worker.finished.connect(self._yoko_poll_thread.quit)
+        self._yoko_poll_thread.start()
 
-        self._poll_thread = QThread()
-        self._poll_worker = _PollWorker(self._read_state, self._poll_interval_s)
-        self._poll_worker.moveToThread(self._poll_thread)
-        self._poll_thread.started.connect(self._poll_worker.run)
-        self._poll_worker.state_ready.connect(self._apply_state)
-        self._poll_worker.finished.connect(self._poll_thread.quit)
-        self._poll_thread.start()
-
-        # Keithley 617 — second poll thread, independent of the Yoko.
-        # If open() fails we drop self.keithley to None and skip the
-        # readout entirely; the panel still functions as a Yoko-only
-        # surface.
-        self._k617_poll_worker: _PollWorker | None = None
-        self._k617_poll_thread: QThread | None = None
+        # 617 poll + watchdog. Drives the big V readout, stashes the
+        # latest reading for Move/Jog, fires set_current(0) on trip.
         if self.keithley is not None:
             try:
                 self.keithley.open()
             except _K617_ERRORS as e:
                 log.warning("keithley617 open failed: %s", e)
-                self.current_status_label.setText(f"keithley open failed: {e}")
-                self.current_status_label.setVisible(True)
+                self.k617_status_label.setText(f"617 open failed: {e}")
                 self.keithley = None
-            else:
-                self.current_label.setVisible(True)
-                self.current_status_label.setVisible(True)
-                self.current_status_label.setText(
-                    f"617 @ {self.keithley.resource}"
-                )
-                self._k617_poll_thread = QThread()
-                self._k617_poll_worker = _PollWorker(
-                    self._read_keithley, self._k617_poll_interval_s
-                )
-                self._k617_poll_worker.moveToThread(self._k617_poll_thread)
-                self._k617_poll_thread.started.connect(self._k617_poll_worker.run)
-                self._k617_poll_worker.state_ready.connect(self._apply_keithley)
-                self._k617_poll_worker.finished.connect(
-                    self._k617_poll_thread.quit
-                )
-                self._k617_poll_thread.start()
+
+        if self.keithley is not None:
+            self.k617_status_label.setText(f"617 @ {self.keithley.resource}")
+            self._k617_thread = QThread()
+            self._k617_worker = _KeithleyWatchdogWorker(
+                self.keithley,
+                self.yoko,
+                self._latest,
+                self._hard_limits,
+                self._k617_poll_s,
+            )
+            self._k617_worker.moveToThread(self._k617_thread)
+            self._k617_thread.started.connect(self._k617_worker.run)
+            self._k617_worker.state_ready.connect(self._apply_k617_state)
+            self._k617_worker.tripped.connect(self._on_tripped)
+            self._k617_worker.finished.connect(self._k617_thread.quit)
+            self._k617_thread.start()
+        else:
+            self.k617_status_label.setText(
+                "no 617 configured — Enable/Move/Jog disabled (no V feedback)"
+            )
+
+        self._refresh_controls()
+        self._refresh_status_label()
 
     # --- layout / wiring ----------------------------------------------------
 
     def _build_layout(self) -> None:
         outer = QVBoxLayout(self)
 
-        # Top status row — connection text on the left, STOP on the
-        # right. Matches the SMC100 / rotation panel layouts.
         status_row = QHBoxLayout()
         status_row.addWidget(self.status_label, stretch=1)
         status_row.addWidget(self.stop_btn)
         outer.addLayout(status_row)
-        outer.addWidget(self.overload_label)
-        outer.addWidget(self.id_label)
+
+        trip_row = QHBoxLayout()
+        trip_row.addWidget(self.trip_label, stretch=1)
+        trip_row.addWidget(self.trip_ack_btn)
+        outer.addLayout(trip_row)
 
         sep1 = QFrame()
         sep1.setFrameShape(QFrame.Shape.HLine)
         sep1.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep1)
 
-        # Output state — Enable / Disable buttons. The button-enabled
-        # state mirrors the cache: when output is on, Enable is greyed
-        # out; when off, Disable is greyed out; when unknown (first
-        # connect, no command yet), both are live so the operator can
-        # commit to either direction.
-        output_row = QHBoxLayout()
-        output_row.addWidget(self.enable_btn)
-        output_row.addWidget(self.disable_btn)
-        output_row.addStretch(1)
-        outer.addLayout(output_row)
-        self._refresh_output_buttons()
+        # Primary readout: piezo V from 617. Secondary: Yoko I + dV/dt.
+        outer.addWidget(self.voltage_label)
+        outer.addWidget(self.travel_label)
+        outer.addWidget(self.current_label)
+        outer.addWidget(self.dvdt_label)
+        outer.addWidget(self.k617_status_label)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep2)
 
-        outer.addWidget(self.voltage_label)
-        outer.addWidget(self.travel_label)
-        outer.addWidget(self.current_label)
-        outer.addWidget(self.current_status_label)
+        target_row = QHBoxLayout()
+        target_row.addWidget(QLabel("Move to:"))
+        target_row.addWidget(self.target_spin, stretch=1)
+        target_row.addWidget(self.move_btn)
+        outer.addLayout(target_row)
+
+        step_speed_row = QHBoxLayout()
+        step_speed_row.addWidget(QLabel("Step:"))
+        step_speed_row.addWidget(self.step_spin, stretch=1)
+        step_speed_row.addWidget(QLabel("Speed:"))
+        step_speed_row.addWidget(self.speed_spin, stretch=1)
+        outer.addLayout(step_speed_row)
+
+        jog_row = QHBoxLayout()
+        jog_row.addWidget(self.jog_minus_btn, stretch=1)
+        jog_row.addWidget(self.jog_plus_btn, stretch=1)
+        outer.addLayout(jog_row)
 
         sep3 = QFrame()
         sep3.setFrameShape(QFrame.Shape.HLine)
         sep3.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep3)
 
-        ramp_row = QHBoxLayout()
-        ramp_row.addWidget(QLabel("Ramp to:"))
-        ramp_row.addWidget(self.ramp_spin, stretch=1)
-        ramp_row.addWidget(self.ramp_btn)
-        outer.addLayout(ramp_row)
-
-        sep4 = QFrame()
-        sep4.setFrameShape(QFrame.Shape.HLine)
-        sep4.setFrameShadow(QFrame.Shadow.Sunken)
-        outer.addWidget(sep4)
-
-        # Controls — Enable / Disable at the bottom, matching the SMC100
-        # and rotation panels' action_row pattern.
         action_row = QHBoxLayout()
         action_row.addWidget(self.enable_btn)
         action_row.addWidget(self.disable_btn)
@@ -469,110 +769,262 @@ class YokoPanel(QGroupBox):
         outer.addStretch(1)
 
     def _wire_signals(self) -> None:
-        self.ramp_btn.clicked.connect(self._on_ramp)
-        self.stop_btn.clicked.connect(self._on_ramp_stop)
+        self.move_btn.clicked.connect(self._on_move)
+        self.stop_btn.clicked.connect(self._on_stop)
         self.enable_btn.clicked.connect(self._on_enable)
         self.disable_btn.clicked.connect(self._on_disable)
+        self.trip_ack_btn.clicked.connect(self._on_trip_ack)
+        # Click-vs-hold jog, matching smc100_panel.
+        self.jog_minus_btn.pressed.connect(lambda: self._on_jog_pressed(-1))
+        self.jog_minus_btn.released.connect(self._on_jog_released)
+        self.jog_plus_btn.pressed.connect(lambda: self._on_jog_pressed(+1))
+        self.jog_plus_btn.released.connect(self._on_jog_released)
+
+    # --- helpers ------------------------------------------------------------
+
+    def _speed_a(self) -> float:
+        """Read the Speed spinbox in amperes."""
+        return self.speed_spin.value() * 1e-6
+
+    def _latest_v(self) -> float | None:
+        """GUI-thread snapshot of the latest 617 V — used for jog-click target."""
+        v, func, age = self._latest.read()
+        if v is None or func != "DCV" or age > self._stale_s:
+            return None
+        return v
+
+    def _ready_to_source(self) -> bool:
+        """True iff we can safely command the source on (Enable/Move/Jog).
+
+        Requires: not tripped, 617 present + in DCV + reading fresh and
+        within hard limits.
+        """
+        if self._tripped:
+            return False
+        if self.keithley is None or self._k617_worker is None:
+            return False
+        v, func, age = self._latest.read()
+        if v is None or func != "DCV" or age > self._stale_s:
+            return False
+        lo, hi = self._hard_limits
+        return lo <= v <= hi
 
     # --- click handlers (GUI thread) ----------------------------------------
 
-    def _on_ramp(self) -> None:
-        target = self.ramp_spin.value()
-        lo, hi = self._voltage_limits
-        if not lo <= target <= hi:
+    def _on_enable(self) -> None:
+        if not self._ready_to_source():
             self.status_label.setText(
-                f"ramp target {target} V outside ({lo}, {hi})"
+                "can't enable — no fresh 617 DCV reading inside hard limits"
             )
             return
-        self._start_ramp_to(target, label=f"ramping to {target:+.3f} V…")
-
-    def _on_enable(self) -> None:
-        # Invariant: relay (O1/O0) is only commanded when programmed V
-        # is 0. safe_enable sends SA0 then O1 — relay closes onto 0 V,
-        # operator ramps from 0 to wherever afterwards.
-        self._safe(self.yoko.safe_enable)
-        self._refresh_output_buttons()
+        self._safe(self.yoko.safe_enable_current)
         self._refresh_status_label()
+        self._refresh_controls()
 
     def _on_disable(self) -> None:
-        if self._ramp_thread is not None:
-            return  # already ramping; ignore
-        v = self.yoko.cached_voltage
-        if v is None or abs(v) < 1e-4:
-            # Already at 0 V (or cache empty) — safe_disable will skip
-            # the inner ramp and just do SA0; O0; which keeps the
-            # invariant explicit.
-            self._safe(self.yoko.safe_disable)
-            self._refresh_output_buttons()
+        """Safe-shutdown protocol: leave the piezo at V ≈ 0 V, I = 0 A.
+
+        Mirrors the V-mode Disable shape: ramp V down via a closed-loop
+        Move-to-0 first, then open the relay. If V is already near 0 V
+        we skip the move; if we have no 617 feedback we can't safely
+        ramp, so just drop the relay (operator can manually recover at
+        the rig if needed).
+        """
+        if self._active_thread is not None:
+            return  # busy
+        v = self._latest_v()
+        if v is None:
+            log.warning("disable without 617 feedback — opening relay at unknown V")
+            self._safe(self.yoko.safe_disable_current)
             self._refresh_status_label()
+            self._refresh_controls()
             return
-        # Non-zero — ramp to 0 in worker, then SA0 + O0 in the finished
-        # handler (still via safe_disable for consistency).
-        self._disable_after_ramp = True
-        self._start_ramp_to(0.0, label="ramping to 0 V before disable…")
+        if abs(v) < 0.5:
+            # Already at zero — skip the ramp, just open the relay.
+            self._safe(self.yoko.safe_disable_current)
+            self._refresh_status_label()
+            self._refresh_controls()
+            return
+        # Non-zero V — Move to 0 first, then chain safe_disable_current
+        # from the finished handler (gated on the Move succeeding).
+        self._disable_after_move = True
+        self._start_move(0.0, label=f"ramping {v:+.2f} → 0 V before disable…")
 
-    def _start_ramp_to(self, target: float, *, label: str) -> None:
-        """Kick off a _RampWorker; button-disable handled by refresh."""
-        if self._ramp_thread is not None:
-            return  # one ramp at a time
-        self._ramp_thread = QThread()
-        self._ramp_worker = _RampWorker(
-            self.yoko, target, self._ramp_step_v, self._ramp_delay_s
+    def _on_move(self) -> None:
+        if not self._ready_to_source():
+            return
+        target = self.target_spin.value()
+        self._start_move(target, label=f"moving to {target:+.3f} V…")
+
+    def _on_stop(self) -> None:
+        if self._active_worker is not None:
+            self._active_worker.cancel()
+
+    def _on_jog_pressed(self, direction: int) -> None:
+        if not self._ready_to_source() or self.yoko.cached_output_on is not True:
+            return
+        log.info("yoko: jog pressed dir=%+d (timer armed)", direction)
+        self._jog_direction = direction
+        self._jog_continuous = False
+        self._jog_timer.start()
+
+    def _on_jog_continuous_fire(self) -> None:
+        if self._jog_direction == 0:
+            return
+        direction = self._jog_direction
+        log.info("yoko: jog continuous-fire dir=%+d", direction)
+        self._jog_continuous = True
+        self._start_jog(direction)
+
+    def _on_jog_released(self) -> None:
+        if self._jog_direction == 0:
+            return
+        log.info(
+            "yoko: jog released dir=%+d continuous=%s",
+            self._jog_direction,
+            self._jog_continuous,
         )
-        self._ramp_worker.moveToThread(self._ramp_thread)
-        self._ramp_thread.started.connect(self._ramp_worker.run)
-        self._ramp_worker.finished.connect(self._on_ramp_finished)
-        self._ramp_thread.start()
-        self._refresh_output_buttons()
-        self.status_label.setText(label)
+        if self._jog_continuous:
+            # Continuous worker is running; cancel it (worker handles I=0).
+            if self._active_worker is not None:
+                self._active_worker.cancel()
+        else:
+            self._jog_timer.stop()
+            v = self._latest_v()
+            if v is None:
+                self.status_label.setText("can't jog — no 617 reading")
+            else:
+                target = v + self._jog_direction * self.step_spin.value()
+                # Clamp to soft limits — single-step jog at the edge of
+                # the working range just stops at the limit.
+                target = max(self._soft_limits[0], min(self._soft_limits[1], target))
+                self._start_move(target, label=f"jog {self._jog_direction:+d}…")
+        self._jog_direction = 0
+        self._jog_continuous = False
 
-    def _on_ramp_stop(self) -> None:
-        if self._ramp_worker is not None:
-            self._ramp_worker.cancel()
+    def _on_trip_ack(self) -> None:
+        self._tripped = False
+        self._trip_reason = None
+        self.trip_label.setVisible(False)
+        self.trip_ack_btn.setVisible(False)
+        if self._k617_worker is not None:
+            self._k617_worker.acknowledge()
+        self._refresh_status_label()
+        self._refresh_controls()
+
+    # --- worker management --------------------------------------------------
+
+    def _start_move(self, target_v: float, *, label: str) -> None:
+        if self._active_thread is not None:
+            return
+        worker = _MoveWorker(
+            self.yoko,
+            self._latest,
+            target_v,
+            self._speed_a(),
+            self._tolerance_v,
+            self._C,
+            self._soft_limits,
+            self._stale_s,
+        )
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_active_finished)
+        self._active_worker = worker
+        self._active_thread = thread
+        thread.start()
+        self.status_label.setText(label)
+        self._refresh_controls()
+
+    def _start_jog(self, direction: int) -> None:
+        if self._active_thread is not None:
+            return
+        worker = _JogWorker(
+            self.yoko,
+            self._latest,
+            direction,
+            self._speed_a(),
+            self._C,
+            self._soft_limits,
+            self._stale_s,
+        )
+        thread = QThread()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_active_finished)
+        self._active_worker = worker
+        self._active_thread = thread
+        thread.start()
+        self.status_label.setText(f"jog continuous {direction:+d}…")
+        self._refresh_controls()
 
     @Slot(object)
-    def _on_ramp_finished(self, payload: dict) -> None:
-        if self._ramp_thread is not None:
-            self._ramp_thread.quit()
-            self._ramp_thread.wait(1000)
-            self._ramp_thread = None
-        self._ramp_worker = None
-        # ramp_btn re-enable is handled by _refresh_output_buttons below.
+    def _on_active_finished(self, payload: dict) -> None:
+        if self._active_thread is not None:
+            self._active_thread.quit()
+            self._active_thread.wait(1000)
+            self._active_thread = None
+        self._active_worker = None
 
-        do_disable = self._disable_after_ramp
-        self._disable_after_ramp = False
+        do_disable = self._disable_after_move
+        self._disable_after_move = False
 
+        transient: str | None = None
         if payload.get("ok"):
+            v_final = payload.get("v_final")
+            if v_final is not None:
+                transient = f"at {v_final:+.3f} V"
             if do_disable:
-                # safe_disable here will skip the inner ramp (cache is
-                # already at 0 from the ramp we just finished) and
-                # send SA0 + O0 — invariant preserved.
-                self._safe(self.yoko.safe_disable)
-            # In either case, refresh the static state below.
-            transient = None
+                self._safe(self.yoko.safe_disable_current)
         elif payload.get("cancelled"):
-            # User aborted via STOP. Respect that — don't auto-disable
-            # even if we were heading toward a disable.
-            transient = f"ramp cancelled at {payload['stopped_at']:+.3f} V"
+            v_final = payload.get("v_final")
+            transient = (
+                f"cancelled at {v_final:+.3f} V"
+                if v_final is not None
+                else "cancelled"
+            )
+        elif payload.get("limit"):
+            v_final = payload.get("v_final")
+            transient = (
+                f"hit soft limit at {v_final:+.3f} V"
+                if v_final is not None
+                else "hit soft limit"
+            )
         elif "err" in payload:
-            transient = f"ramp err: {payload['err']}"
-        else:
-            transient = None
+            transient = f"err: {payload['err']}"
 
-        self._refresh_output_buttons()
+        self._refresh_controls()
         if transient is not None:
             self.status_label.setText(transient)
         else:
             self._refresh_status_label()
 
-    def _refresh_status_label(self) -> None:
-        """Set the status text to the current static output state.
+    @Slot(object)
+    def _on_tripped(self, payload: dict) -> None:
+        reason = payload.get("reason", "unknown")
+        log.error("yoko panel tripped: %s", reason)
+        self._tripped = True
+        self._trip_reason = reason
+        # Cancel any active worker — the watchdog has already set I=0
+        # via the Yoko driver lock, but we want the worker thread to
+        # exit cleanly so the action buttons re-enable.
+        if self._active_worker is not None:
+            self._active_worker.cancel()
+        self.trip_label.setText(f"TRIPPED — {reason}")
+        self.trip_label.setVisible(True)
+        self.trip_ack_btn.setVisible(True)
+        self._refresh_controls()
 
-        Called on idle transitions (after enable, after a successful
-        ramp, after a direct disable). During an in-flight ramp the
-        handlers write transient text directly; this method is the
-        canonical 'static' restoration.
-        """
+    # --- state refresh ------------------------------------------------------
+
+    def _refresh_status_label(self) -> None:
+        if self._tripped:
+            self.status_label.setText("TRIPPED — see banner")
+            return
+        if self.keithley is None:
+            self.status_label.setText("no 617 — display only")
+            return
         state = self.yoko.cached_output_on
         if state is None:
             self.status_label.setText("output state unknown")
@@ -581,37 +1033,59 @@ class YokoPanel(QGroupBox):
         else:
             self.status_label.setText("OUTPUT OFF")
 
-    def _refresh_output_buttons(self) -> None:
-        """Sync Enable / Disable / Ramp enabled state with current state.
-
-        During a ramp (user-initiated or disable-ramp) all three action
-        buttons are disabled; STOP stays live to cancel.
-
-        Off-ramp: gate Enable/Disable by the cached output state, and
-        gate Ramp by "output is currently on" — ramping with the relay
-        open just reprograms the level without driving anything, so the
-        button is misleading when output is off.
-        """
-        if self._ramp_thread is not None:
-            self.enable_btn.setEnabled(False)
-            self.disable_btn.setEnabled(False)
-            self.ramp_btn.setEnabled(False)
+    def _refresh_controls(self) -> None:
+        """Sync Enable / Disable / Move / Jog enabled state."""
+        # While tripped or while a worker is running, action buttons go
+        # cold. STOP and Acknowledge stay live.
+        if self._tripped:
+            for btn in (
+                self.enable_btn,
+                self.disable_btn,
+                self.move_btn,
+                self.jog_minus_btn,
+                self.jog_plus_btn,
+            ):
+                btn.setEnabled(False)
             return
 
+        if self._active_thread is not None:
+            # Workers stomp all action buttons except STOP. Jog buttons
+            # also get disabled but we skip toggling them mid-press to
+            # avoid Qt firing released() on a disabled-mid-press button.
+            self.enable_btn.setEnabled(False)
+            self.disable_btn.setEnabled(False)
+            self.move_btn.setEnabled(False)
+            if self._jog_direction == 0:
+                self.jog_minus_btn.setEnabled(False)
+                self.jog_plus_btn.setEnabled(False)
+            return
+
+        ready = self._ready_to_source()
         state = self.yoko.cached_output_on
-        if state is None:
-            # Initial-poll-failed case — let the operator pick.
-            self.enable_btn.setEnabled(True)
-            self.disable_btn.setEnabled(True)
-            self.ramp_btn.setEnabled(True)
-        elif state:
+
+        if not ready or state is None:
+            # 617 not configured / not in DCV / stale → can't enable, can't move.
+            self.enable_btn.setEnabled(False)
+            self.disable_btn.setEnabled(state is True)
+            self.move_btn.setEnabled(False)
+            self.jog_minus_btn.setEnabled(False)
+            self.jog_plus_btn.setEnabled(False)
+            return
+
+        if state:
             self.enable_btn.setEnabled(False)
             self.disable_btn.setEnabled(True)
-            self.ramp_btn.setEnabled(True)
+            self.move_btn.setEnabled(True)
+            self.jog_minus_btn.setEnabled(True)
+            self.jog_plus_btn.setEnabled(True)
         else:
             self.enable_btn.setEnabled(True)
             self.disable_btn.setEnabled(False)
-            self.ramp_btn.setEnabled(False)
+            # Move/Jog require output on — when the relay is open,
+            # sourcing into nothing just runs the unit into compliance.
+            self.move_btn.setEnabled(False)
+            self.jog_minus_btn.setEnabled(False)
+            self.jog_plus_btn.setEnabled(False)
 
     def _safe(self, fn, *args) -> None:
         name = getattr(fn, "__name__", repr(fn))
@@ -622,139 +1096,218 @@ class YokoPanel(QGroupBox):
             log.exception("yoko: %s failed", name)
             self.status_label.setText(f"err: {e}")
 
-    # --- worker / state plumbing --------------------------------------------
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        """Used at startup when open() failed."""
+        for w in (
+            self.target_spin,
+            self.step_spin,
+            self.speed_spin,
+            self.move_btn,
+            self.jog_minus_btn,
+            self.jog_plus_btn,
+            self.enable_btn,
+            self.disable_btn,
+        ):
+            w.setEnabled(enabled)
 
-    def _read_keithley(self) -> dict:
-        """Worker-thread: read the next 617 measurement. No Qt widgets."""
-        if self.keithley is None:
-            return {"k617_err": "no keithley"}
-        try:
-            r = self.keithley.read()
-        except _K617_ERRORS as e:
-            log.warning("keithley617 read failed: %s", e)
-            return {"k617_err": str(e)}
-        return {
-            "k617_value": r.value,
-            "k617_function": r.function,
-            "k617_unit": r.unit,
-            "k617_status": r.status,
-        }
+    # --- poll-thread payload handlers ---------------------------------------
 
     @Slot(object)
-    def _apply_keithley(self, payload: dict) -> None:
+    def _apply_yoko_state(self, payload: dict) -> None:
         if "_worker_err" in payload:
-            self.current_status_label.setText(f"poll err: {payload['_worker_err']}")
-            return
-        if "k617_err" in payload:
-            self.current_label.setText("—")
-            self.current_status_label.setText(f"617 err: {payload['k617_err']}")
-            return
-        value = payload["k617_value"]
-        unit = payload["k617_unit"]
-        function = payload["k617_function"]
-        status = payload["k617_status"]
-        self.current_label.setText(format_engineering(value, unit))
-        # Suffix function + status so an unexpected mode (e.g. operator
-        # bumped front panel from AMPS to VOLTS) is visible.
-        suffix = f"617 · {function}"
-        if status != "N":
-            suffix += " · OVERFLOW"
-        self.current_status_label.setText(suffix)
-
-    def _read_state(self) -> dict:
-        """Worker-thread: read live output. Must not touch Qt widgets."""
-        try:
-            r = self.yoko.read_output()
-        except _YOKO_ERRORS as e:
-            # Surface to console so the offending raw OD reply is visible
-            # — the on-panel label truncates. read_output() bakes the
-            # raw response into the message via repr().
-            log.warning("yoko OD read failed: %s", e)
-            return {"od_err": str(e)}
-        return {
-            "value": r.value,
-            "function": r.function,
-            "status": r.status,
-        }
-
-    @Slot(object)
-    def _apply_state(self, payload: dict) -> None:
-        if "_worker_err" in payload:
-            self.status_label.setText(f"poll err: {payload['_worker_err']}")
+            self.current_label.setText(f"yoko poll err: {payload['_worker_err']}")
             return
         if "od_err" in payload:
-            self.voltage_label.setText(f"od err: {payload['od_err']}")
+            self.current_label.setText(f"yoko OD err: {payload['od_err']}")
             return
 
         value = payload["value"]
         function = payload["function"]
         status = payload["status"]
 
-        # Seed the cache from the first OD reading so ramp_voltage has a
-        # known starting point without first issuing OD; itself.
-        if not self._cache_seeded and function == "V":
-            self.yoko.seed_voltage_cache(value)
-            self._cache_seeded = True
-
-        if function == "V":
-            self.voltage_label.setText(f"{value:+.3f} V")
-            travel_um = value * self._nm_per_volt / 1000.0
-            self.travel_label.setText(f"≈ {travel_um:+.2f} µm extension")
+        if function == "A":
+            self.current_label.setText(
+                f"Yoko sourcing {format_engineering(value, 'A')}"
+            )
+            # Implied piezo dV/dt = I / C. Small enough that the
+            # operator can sanity-check the speed setting visually.
+            dvdt = value / self._C
+            self.dvdt_label.setText(f"≈ {dvdt:+.3f} V/s on {self._C * 1e6:.1f} µF")
+            # Seed output_cache once we've got a first OD reading.
+            if not self._cache_seeded:
+                self.yoko.seed_output_cache(abs(value) > OUTPUT_ON_THRESHOLD_A)
+                self._cache_seeded = True
+                self._refresh_controls()
+                self._refresh_status_label()
         else:
-            # Current mode — surface it but don't try to map to µm.
-            self.voltage_label.setText(f"{value:+.6f} A (current mode)")
-            self.travel_label.setText("")
+            # Yoko in V mode unexpectedly (e.g. someone clicked the
+            # front-panel function key). Surface but don't crash.
+            self.current_label.setText(
+                f"Yoko in {function} mode (expected A): {value:+.3f}"
+            )
+            self.dvdt_label.setText("")
 
         if status == "E":
-            self.overload_label.setText("OVERLOAD")
-            self.overload_label.setVisible(True)
-        else:
-            self.overload_label.setText("")
-            self.overload_label.setVisible(False)
+            # Overload — surface in the status row but no widget-level
+            # banner (current is informational, not life-safety here).
+            self.current_label.setText(self.current_label.text() + " · OVERLOAD")
 
-    def _set_all_enabled(self, enabled: bool) -> None:
-        for w in (
-            self.ramp_spin,
-            self.ramp_btn,
-            self.enable_btn,
-            self.disable_btn,
-        ):
-            w.setEnabled(enabled)
-        # stop_btn stays live regardless — it's a no-op when no ramp is
-        # in flight, and we want it usable as a panic abort.
+    @Slot(object)
+    def _apply_k617_state(self, payload: dict) -> None:
+        if "_worker_err" in payload:
+            self.k617_status_label.setText(f"617 poll err: {payload['_worker_err']}")
+            return
+        if "k617_err" in payload:
+            self.voltage_label.setText("—")
+            self.k617_status_label.setText(f"617 err: {payload['k617_err']}")
+            self._refresh_controls()
+            return
+
+        value = payload["value"]
+        unit = payload["unit"]
+        function = payload["function"]
+        status = payload["status"]
+
+        if function == "DCV":
+            self.voltage_label.setText(format_engineering(value, "V"))
+            travel_um = value * self._nm_per_volt / 1000.0
+            self.travel_label.setText(f"≈ {travel_um:+.2f} µm extension")
+            suffix = f"617 · {function}"
+        else:
+            # Wrong-mode display: still show the reading but with the
+            # function suffix so it's obvious why Move/Jog are greyed.
+            self.voltage_label.setText(format_engineering(value, unit))
+            self.travel_label.setText("")
+            suffix = f"617 · {function} (need DCV for control)"
+
+        if status != "N":
+            suffix += " · OVERFLOW"
+        self.k617_status_label.setText(suffix)
+        # Function-mode flip from DCV could re-enable / disable the
+        # control buttons — refresh.
+        self._refresh_controls()
 
     # --- shutdown -----------------------------------------------------------
 
     def shutdown(self) -> None:
-        if self._ramp_worker is not None:
-            self._ramp_worker.cancel()
-        if self._ramp_thread is not None:
-            self._ramp_thread.quit()
-            self._ramp_thread.wait(2000)
-        if self._poll_worker is not None and self._poll_thread is not None:
-            self._poll_worker.stop()
-            self._poll_thread.quit()
-            if not self._poll_thread.wait(2000):
-                log.warning("yoko poll thread did not exit cleanly")
+        """Safe-shutdown protocol: leave the piezo at V ≈ 0 V, I = 0 A, relay open.
+
+        Order matters — the inline ramp-to-0 needs the watchdog thread
+        running so _latest stays fresh. Sequence:
+          1. Cancel any active Move/Jog worker (it drops I to 0).
+          2. Block here ramping V → 0 using the watchdog's _latest.
+          3. safe_disable_current — SA0 + O0.
+          4. Stop watchdog + Yoko-poll threads, close instruments.
+
+        Blocking the GUI thread is fine — the app is tearing down.
+        Worst case the ramp takes ~30 s from full deflection at 1 µA;
+        typically the operator has already clicked Disable first, in
+        which case cached_output_on is False and we skip the ramp.
+        """
+        # 1. Cancel any active worker.
+        if self._active_worker is not None:
+            self._active_worker.cancel()
+        if self._active_thread is not None:
+            self._active_thread.quit()
+            self._active_thread.wait(2000)
+        self._active_thread = None
+        self._active_worker = None
+
+        # 2. Ramp to 0 V if needed and we have 617 feedback. Skipped
+        # when output is already off, when we're tripped (operator
+        # acknowledges to recover), or when 617 isn't usable.
         if (
-            self._k617_poll_worker is not None
-            and self._k617_poll_thread is not None
+            self.yoko.is_open
+            and self.yoko.cached_output_on
+            and not self._tripped
+            and self._k617_worker is not None
         ):
-            self._k617_poll_worker.stop()
-            self._k617_poll_thread.quit()
-            if not self._k617_poll_thread.wait(2000):
-                log.warning("keithley617 poll thread did not exit cleanly")
-        if self.keithley is not None:
-            self.keithley.close()
-        # Shutdown protocol: ramp to 0 V before dropping the output
-        # relay. safe_disable is a no-op on the ramp if cache says we're
-        # already near 0 V; it always sends the final O0;. Blocking is
-        # fine here — the GUI is tearing down anyway.
+            try:
+                self._shutdown_ramp_to_zero(deadline_s=60.0)
+            except Exception as e:  # noqa: BLE001
+                log.warning("shutdown ramp-to-zero failed: %s", e)
+
+        # 3. Drop I to 0 and open the relay. Always do this if the
+        # output is still on — leaves the unit in a known safe state
+        # even if the ramp couldn't complete.
         if self.yoko.is_open and self.yoko.cached_output_on:
             try:
-                self.yoko.safe_disable(
-                    step=self._ramp_step_v, delay=self._ramp_delay_s
-                )
+                self.yoko.safe_disable_current()
             except _YOKO_ERRORS as e:
-                log.warning("yoko safe_disable failed during shutdown: %s", e)
+                log.warning("yoko safe_disable_current during shutdown: %s", e)
+
+        # 4. Stop poll threads + close instruments.
+        if self._yoko_poll_worker is not None and self._yoko_poll_thread is not None:
+            self._yoko_poll_worker.stop()
+            self._yoko_poll_thread.quit()
+            if not self._yoko_poll_thread.wait(2000):
+                log.warning("yoko poll thread did not exit cleanly")
+        if self._k617_worker is not None and self._k617_thread is not None:
+            self._k617_worker.stop()
+            self._k617_thread.quit()
+            if not self._k617_thread.wait(2000):
+                log.warning("keithley617 poll thread did not exit cleanly")
+        if self.keithley is not None:
+            try:
+                self.keithley.close()
+            except _K617_ERRORS as e:
+                log.warning("keithley617 close failed: %s", e)
         self.yoko.close()
+
+    def _shutdown_ramp_to_zero(self, *, deadline_s: float) -> None:
+        """Block-the-GUI-thread ramp to V≈0 using the watchdog's _latest.
+
+        Uses the same predictive scale-down algorithm as _MoveWorker
+        but inline on the GUI thread. The watchdog thread continues
+        writing to _latest at ~3 Hz throughout. Bails out and returns
+        on:
+          - deadline_s elapsed (something's wrong; let safe_disable
+            finish the job at whatever V we got to)
+          - stale or non-DCV 617 reading (no feedback → can't ramp
+            safely; safe_disable will open the relay)
+          - V within move_tolerance of 0 (success)
+        """
+        deadline = time.monotonic() + deadline_s
+        target = 0.0
+        # Use the default speed for shutdown, not the spinbox value —
+        # operator may have left it at the max, and shutdown isn't a
+        # context to be cute about speed.
+        speed_a = self._default_speed_a
+        dt = KEITHLEY_CONVERSION_S
+        while time.monotonic() < deadline:
+            v_now, func, age = self._latest.read()
+            if v_now is None or func != "DCV" or age > self._stale_s:
+                log.warning(
+                    "shutdown ramp: stale/missing 617 (age=%s, func=%s) — aborting",
+                    age, func,
+                )
+                break
+            error = target - v_now
+            if abs(error) < self._tolerance_v:
+                break
+            i_desired = error * self._C / dt
+            if abs(i_desired) > speed_a:
+                i_desired = speed_a if error > 0 else -speed_a
+            # Same predictive soft-limit check as the workers — we
+            # shouldn't blow past −18.5/+28.5 V during the shutdown
+            # ramp either (unlikely from a target of 0, but cheap).
+            lookahead_s = age + dt + 0.1
+            v_pred = v_now + i_desired * lookahead_s / self._C
+            soft_lo, soft_hi = self._soft_limits
+            if not soft_lo <= v_pred <= soft_hi:
+                log.warning(
+                    "shutdown ramp: predicted V_pred=%+.3f outside soft limits — bailing",
+                    v_pred,
+                )
+                break
+            try:
+                self.yoko.set_current(i_desired)
+            except _YOKO_ERRORS as e:
+                log.warning("shutdown ramp: set_current failed: %s", e)
+                break
+            time.sleep(dt)
+        # Always end at I=0, regardless of how the loop exited.
+        try:
+            self.yoko.set_current(0.0)
+        except _YOKO_ERRORS as e:
+            log.warning("shutdown ramp: final set_current(0) failed: %s", e)
