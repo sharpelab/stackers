@@ -300,14 +300,13 @@ class Yoko7651:
         """Read the live output value via ``OD;``. Non-perturbing."""
         resp = self._query("OD")
         if not resp:
-            # Talker hiccup — the first OD; after open() (and the
-            # occasional mid-session poll) returns empty: pyvisa times
-            # out waiting for the CR terminator and emits the
-            # "read string doesn't end with termination characters"
-            # UserWarning, leaving us with ''. A second OD; usually
-            # comes back clean. Log so we can spot if the rate creeps
-            # up.
-            log.info("yoko OD; empty reply, retrying once")
+            # Talker hiccup — pyvisa times out waiting for the CR
+            # terminator and emits the "read string doesn't end with
+            # termination characters" UserWarning, leaving us with ''.
+            # A second OD; consistently comes back clean. Common
+            # enough on this 7651 firmware that we don't log it — the
+            # real failure mode would be a non-empty bad reply, which
+            # the regex fall-through below raises on.
             resp = self._query("OD")
         m = _OD_RE.match(resp)
         if not m:
