@@ -501,7 +501,7 @@ class YokoPanel(QGroupBox):
         self._start_ramp_to(0.0, label="ramping to 0 V before disable…")
 
     def _start_ramp_to(self, target: float, *, label: str) -> None:
-        """Kick off a _RampWorker and disable the action buttons."""
+        """Kick off a _RampWorker; button-disable handled by refresh."""
         if self._ramp_thread is not None:
             return  # one ramp at a time
         self._ramp_thread = QThread()
@@ -512,10 +512,7 @@ class YokoPanel(QGroupBox):
         self._ramp_thread.started.connect(self._ramp_worker.run)
         self._ramp_worker.finished.connect(self._on_ramp_finished)
         self._ramp_thread.start()
-
-        self.ramp_btn.setEnabled(False)
-        self.enable_btn.setEnabled(False)
-        self.disable_btn.setEnabled(False)
+        self._refresh_output_buttons()
         self.status_label.setText(label)
 
     def _on_ramp_stop(self) -> None:
@@ -529,7 +526,7 @@ class YokoPanel(QGroupBox):
             self._ramp_thread.wait(1000)
             self._ramp_thread = None
         self._ramp_worker = None
-        self.ramp_btn.setEnabled(True)
+        # ramp_btn re-enable is handled by _refresh_output_buttons below.
 
         do_disable = self._disable_after_ramp
         self._disable_after_ramp = False
@@ -574,22 +571,36 @@ class YokoPanel(QGroupBox):
             self.status_label.setText("OUTPUT OFF")
 
     def _refresh_output_buttons(self) -> None:
-        """Sync Enable / Disable enabled state with the cached output state.
+        """Sync Enable / Disable / Ramp enabled state with current state.
 
-        Cache is None at startup (we never queried, can't query) — both
-        buttons are live. Once we command on or off, the cache reflects
-        what we last sent and the opposite-direction button greys out.
+        During a ramp (user-initiated or disable-ramp) all three action
+        buttons are disabled; STOP stays live to cancel.
+
+        Off-ramp: gate Enable/Disable by the cached output state, and
+        gate Ramp by "output is currently on" — ramping with the relay
+        open just reprograms the level without driving anything, so the
+        button is misleading when output is off.
         """
+        if self._ramp_thread is not None:
+            self.enable_btn.setEnabled(False)
+            self.disable_btn.setEnabled(False)
+            self.ramp_btn.setEnabled(False)
+            return
+
         state = self.yoko.cached_output_on
         if state is None:
+            # Initial-poll-failed case — let the operator pick.
             self.enable_btn.setEnabled(True)
             self.disable_btn.setEnabled(True)
+            self.ramp_btn.setEnabled(True)
         elif state:
             self.enable_btn.setEnabled(False)
             self.disable_btn.setEnabled(True)
+            self.ramp_btn.setEnabled(True)
         else:
             self.enable_btn.setEnabled(True)
             self.disable_btn.setEnabled(False)
+            self.ramp_btn.setEnabled(False)
 
     def _safe(self, fn, *args) -> None:
         name = getattr(fn, "__name__", repr(fn))
