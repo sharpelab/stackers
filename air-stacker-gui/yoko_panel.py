@@ -227,7 +227,6 @@ class YokoPanel(QGroupBox):
 
         # --- widgets --------------------------------------------------------
         self.status_label = QLabel("disconnected")
-        self.status_label.setVisible(False)
         self.overload_label = QLabel("")
         self.overload_label.setStyleSheet(
             "color: white; background-color: #b04040; "
@@ -247,16 +246,10 @@ class YokoPanel(QGroupBox):
         self.travel_label = QLabel("")
         self.travel_label.setStyleSheet("color: #888;")
 
-        # Set (single shot, no ramp) — for fine adjustments only. Ramp is
-        # the path for any non-trivial change.
-        self.set_spin = QDoubleSpinBox()
-        self.set_spin.setKeyboardTracking(False)
-        self.set_spin.setDecimals(3)
-        self.set_spin.setSingleStep(0.01)
-        self.set_spin.setSuffix(" V")
-        self.set_spin.setRange(voltage_limits[0], voltage_limits[1])
-        self.set_btn = QPushButton("Set")
-
+        # Ramp is the only path for changing voltage — single-shot Set has
+        # been removed because piezo callers shouldn't ever step the
+        # output, and 1 V/s ramps from the same spinbox cover the
+        # fine-adjustment case at one or two seconds of cost.
         self.ramp_spin = QDoubleSpinBox()
         self.ramp_spin.setKeyboardTracking(False)
         self.ramp_spin.setDecimals(3)
@@ -264,8 +257,16 @@ class YokoPanel(QGroupBox):
         self.ramp_spin.setSuffix(" V")
         self.ramp_spin.setRange(voltage_limits[0], voltage_limits[1])
         self.ramp_btn = QPushButton("Ramp")
-        self.ramp_stop_btn = QPushButton("Stop ramp")
-        self.ramp_stop_btn.setEnabled(False)
+        # STOP sits at top-right (status row) matching SMC100 and rotation
+        # panels. Always enabled — the handler no-ops when no ramp is in
+        # flight, so a wasted click is harmless and we don't lose clicks
+        # to a near-completed-ramp race.
+        self.stop_btn = QPushButton("STOP")
+        self.stop_btn.setStyleSheet(
+            "QPushButton { background-color: #c0392b; color: white; "
+            "font-weight: bold; padding: 2px 10px; }"
+            "QPushButton:pressed { background-color: #962d22; }"
+        )
         self.ramp_progress = QLabel("")
         self.ramp_progress.setStyleSheet("color: #888;")
 
@@ -313,15 +314,12 @@ class YokoPanel(QGroupBox):
         # unit was in.
         self._apply_state(self._read_state())
 
-        # Pre-populate the set/ramp spinboxes with the live voltage so a
-        # fat-fingered "Set" doesn't slam the piezo from the spinbox's
-        # default of 0 to wherever the user actually wanted.
+        # Pre-populate the ramp spinbox with the live voltage so a
+        # fat-fingered Ramp click doesn't sweep the piezo from the
+        # spinbox's default of 0 to wherever the user actually wanted.
         if self.yoko.cached_voltage is not None:
-            self.set_spin.blockSignals(True)
             self.ramp_spin.blockSignals(True)
-            self.set_spin.setValue(self.yoko.cached_voltage)
             self.ramp_spin.setValue(self.yoko.cached_voltage)
-            self.set_spin.blockSignals(False)
             self.ramp_spin.blockSignals(False)
 
         self._poll_thread = QThread()
@@ -337,7 +335,12 @@ class YokoPanel(QGroupBox):
     def _build_layout(self) -> None:
         outer = QVBoxLayout(self)
 
-        outer.addWidget(self.status_label)
+        # Top status row — connection text on the left, STOP on the
+        # right. Matches the SMC100 / rotation panel layouts.
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, stretch=1)
+        status_row.addWidget(self.stop_btn)
+        outer.addLayout(status_row)
         outer.addWidget(self.overload_label)
         outer.addWidget(self.id_label)
 
@@ -367,17 +370,10 @@ class YokoPanel(QGroupBox):
         sep3.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep3)
 
-        set_row = QHBoxLayout()
-        set_row.addWidget(QLabel("Set:"))
-        set_row.addWidget(self.set_spin, stretch=1)
-        set_row.addWidget(self.set_btn)
-        outer.addLayout(set_row)
-
         ramp_row = QHBoxLayout()
         ramp_row.addWidget(QLabel("Ramp to:"))
         ramp_row.addWidget(self.ramp_spin, stretch=1)
         ramp_row.addWidget(self.ramp_btn)
-        ramp_row.addWidget(self.ramp_stop_btn)
         outer.addLayout(ramp_row)
         outer.addWidget(self.ramp_progress)
 
@@ -389,16 +385,12 @@ class YokoPanel(QGroupBox):
         outer.addStretch(1)
 
     def _wire_signals(self) -> None:
-        self.set_btn.clicked.connect(self._on_set)
         self.ramp_btn.clicked.connect(self._on_ramp)
-        self.ramp_stop_btn.clicked.connect(self._on_ramp_stop)
+        self.stop_btn.clicked.connect(self._on_ramp_stop)
         self.output_check.toggled.connect(self._on_output_toggled)
         self.reset_btn.clicked.connect(self._on_reset)
 
     # --- click handlers (GUI thread) ----------------------------------------
-
-    def _on_set(self) -> None:
-        self._safe(self.yoko.set_voltage, self.set_spin.value())
 
     def _on_ramp(self) -> None:
         if self._ramp_thread is not None:
@@ -419,7 +411,6 @@ class YokoPanel(QGroupBox):
         self._ramp_thread.start()
 
         self.ramp_btn.setEnabled(False)
-        self.ramp_stop_btn.setEnabled(True)
         self.ramp_progress.setText(f"ramping → {target:.3f} V…")
 
     def _on_ramp_stop(self) -> None:
@@ -434,7 +425,6 @@ class YokoPanel(QGroupBox):
             self._ramp_thread = None
         self._ramp_worker = None
         self.ramp_btn.setEnabled(True)
-        self.ramp_stop_btn.setEnabled(False)
 
         if payload.get("ok"):
             self.ramp_progress.setText(f"ramp → {payload['final']:.3f} V done")
@@ -553,15 +543,14 @@ class YokoPanel(QGroupBox):
 
     def _set_all_enabled(self, enabled: bool) -> None:
         for w in (
-            self.set_spin,
-            self.set_btn,
             self.ramp_spin,
             self.ramp_btn,
             self.output_check,
             self.reset_btn,
         ):
             w.setEnabled(enabled)
-        # ramp_stop_btn stays disabled until a ramp is in flight.
+        # stop_btn stays live regardless — it's a no-op when no ramp is
+        # in flight, and we want it usable as a panic abort.
 
     # --- shutdown -----------------------------------------------------------
 
