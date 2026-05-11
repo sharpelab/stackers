@@ -37,9 +37,9 @@ default_visible = false
 # on Windows.
 backend = "qt"
 
-# Last window geometry — written on close, restored on open. Operators
-# can leave this commented out; the GUI writes it back automatically.
-# window_geometry = { x = 1920, y = 100, width = 960, height = 540 }
+# Per-machine state (window geometry, user-created camera/image presets)
+# lives in the untracked sibling file settings.toml, not here. See
+# .gitignore.
 
 # CONEX-CC axes. Each entry is one controller on its own COM port (address 1 by convention).
 # Axis A on COM3 is currently disconnected — re-add a [[axis]] entry when it's wired up:

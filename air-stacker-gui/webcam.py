@@ -36,9 +36,12 @@ PIXEL_FORMAT_MAP: dict[str, QVideoFrameFormat.PixelFormat] = {
 
 @dataclass(frozen=True)
 class WebcamConfig:
-    """Parsed `[webcam]` section of config.toml.
+    """Parsed webcam config.
 
-    Use `from_toml(section)` to build one with defaults filled in.
+    Project-level keys (device match, capture format, defaults) come from
+    `[webcam]` in config.toml. Per-machine window geometry comes from
+    `[gui_state.webcam]` in settings.toml. Use `from_toml(config_section,
+    settings_section)` to build a complete config; either may be None.
     """
 
     enabled: bool
@@ -53,14 +56,20 @@ class WebcamConfig:
     window_geometry: tuple[int, int, int, int] | None  # (x, y, w, h)
 
     @classmethod
-    def from_toml(cls, section) -> WebcamConfig:
-        """Build a WebcamConfig from a tomlkit section (or any mapping).
+    def from_toml(cls, config_section, settings_section=None) -> WebcamConfig:
+        """Build a WebcamConfig from project config + per-machine settings.
+
+        config_section: the `[webcam]` table from config.toml (or None).
+        settings_section: the `[gui_state.webcam]` table from settings.toml
+            (or None) — currently only `window_geometry` is consumed.
 
         Missing keys fall back to sensible defaults for the Anker C200.
         """
-        if section is None:
-            section = {}
-        geom = section.get("window_geometry")
+        if config_section is None:
+            config_section = {}
+        if settings_section is None:
+            settings_section = {}
+        geom = settings_section.get("window_geometry")
         geom_tuple: tuple[int, int, int, int] | None = None
         if geom is not None:
             try:
@@ -69,7 +78,8 @@ class WebcamConfig:
                     int(geom["width"]), int(geom["height"]),
                 )
             except (KeyError, TypeError, ValueError) as e:
-                log.warning("webcam.window_geometry malformed: %s", e)
+                log.warning("gui_state.webcam.window_geometry malformed: %s", e)
+        section = config_section
         return cls(
             enabled=bool(section.get("enabled", True)),
             device_description=str(section.get("device_description", "Anker PowerConf C200")),

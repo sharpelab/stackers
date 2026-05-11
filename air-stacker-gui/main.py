@@ -60,7 +60,10 @@ from yoko_panel import YokoPanel
 import tomlkit
 
 CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
-PRESETS_PATH = Path(__file__).resolve().parent / "presets.toml"
+# Per-machine GUI state (user presets, window geometries). Untracked — see
+# .gitignore. Lives next to config.toml so the GUI doesn't need a separate
+# config-dir convention; contents diverge per checkout (lab PC vs laptops).
+SETTINGS_PATH = Path(__file__).resolve().parent / "settings.toml"
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "icons" / "air_stacker.ico"
 
 log = logging.getLogger("airstacker")
@@ -85,6 +88,15 @@ def load_config() -> dict:
     if not CONFIG_PATH.exists():
         raise FileNotFoundError(f"missing config: {CONFIG_PATH}")
     return tomlkit.parse(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def load_settings() -> dict:
+    """Read settings.toml. Returns an empty dict if the file doesn't exist
+    yet — fresh checkouts have no local state until the GUI writes some.
+    """
+    if not SETTINGS_PATH.exists():
+        return {}
+    return tomlkit.parse(SETTINGS_PATH.read_text(encoding="utf-8"))
 
 
 def _node_float_get(nm, name: str) -> float | None:
@@ -343,7 +355,7 @@ def _coerce_pair(v) -> tuple[int, int]:
 
 
 class ImagePresetStore:
-    """Round-trips user-created [[image_preset]] entries to/from presets.toml.
+    """Round-trips user-created [[image_preset]] entries to/from settings.toml.
 
     "Default" is hardcoded in the panel and never stored — only user
     presets live in the file. Saves rewrite the image_preset array-of-tables
@@ -409,7 +421,7 @@ class ImagePresetStore:
 
 
 class CameraPresetStore:
-    """Round-trips user-created [[camera_preset]] entries to/from presets.toml.
+    """Round-trips user-created [[camera_preset]] entries to/from settings.toml.
 
     "Default" is hardcoded (derived from OUR_DEFAULTS + [camera] overrides)
     and never stored — only user presets live in the file. Saves rewrite
@@ -2900,9 +2912,16 @@ class CameraWindow(QMainWindow):
         self.adjustments = ImageAdjustments()
 
         config = load_config()
+        settings = load_settings()
         camera_cfg = config.get("camera", {})
         device_index = int(camera_cfg.get("device_index", 0))
-        self._webcam_cfg = WebcamConfig.from_toml(config.get("webcam"))
+        # WebcamConfig draws project-level keys (device, format, defaults)
+        # from config.toml's [webcam] section and per-machine window geometry
+        # from settings.toml's [gui_state.webcam] section.
+        self._webcam_cfg = WebcamConfig.from_toml(
+            config.get("webcam"),
+            settings.get("gui_state", {}).get("webcam"),
+        )
         self._webcam_window: WebcamWindow | None = None
 
         self._spin_system = PySpin.System.GetInstance()
@@ -3165,22 +3184,27 @@ class CameraWindow(QMainWindow):
         self.status_bar.set_webcam_checked(False)
 
     def _persist_webcam_geometry(self, geometry: tuple[int, int, int, int]) -> None:
-        """Write the webcam window's last (x, y, w, h) to config.toml.
+        """Write the webcam window's last (x, y, w, h) to settings.toml under
+        `[gui_state.webcam] window_geometry`.
 
-        Best-effort — failures log but don't propagate. tomlkit preserves
-        surrounding comments and formatting.
+        settings.toml is per-machine state (untracked); the GUI creates it on
+        first write. Best-effort — failures log but don't propagate.
         """
         try:
-            doc = tomlkit.parse(CONFIG_PATH.read_text(encoding="utf-8"))
-            section = doc.setdefault("webcam", tomlkit.table())
+            if SETTINGS_PATH.exists():
+                doc = tomlkit.parse(SETTINGS_PATH.read_text(encoding="utf-8"))
+            else:
+                doc = tomlkit.document()
+            gui_state = doc.setdefault("gui_state", tomlkit.table())
+            webcam = gui_state.setdefault("webcam", tomlkit.table())
             geom_table = tomlkit.inline_table()
             geom_table.update({
                 "x": geometry[0], "y": geometry[1],
                 "width": geometry[2], "height": geometry[3],
             })
-            section["window_geometry"] = geom_table
-            CONFIG_PATH.write_text(tomlkit.dumps(doc), encoding="utf-8")
-        except Exception as e:  # noqa: BLE001 — config write is best-effort
+            webcam["window_geometry"] = geom_table
+            SETTINGS_PATH.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — settings write is best-effort
             log.warning("could not persist webcam geometry: %s", e)
 
     def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
@@ -3200,11 +3224,11 @@ class CameraWindow(QMainWindow):
         layout.addWidget(recording)
 
         self.adjustments_panel = ImageAdjustmentsPanel(
-            self.adjustments, ImagePresetStore(PRESETS_PATH)
+            self.adjustments, ImagePresetStore(SETTINGS_PATH)
         )
 
         self.camera_options_panel = CameraOptionsPanel(
-            self.cam, camera_cfg, CameraPresetStore(PRESETS_PATH)
+            self.cam, camera_cfg, CameraPresetStore(SETTINGS_PATH)
         )
 
         layout.addWidget(self.camera_options_panel)
