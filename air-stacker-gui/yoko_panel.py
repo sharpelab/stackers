@@ -36,10 +36,9 @@ from __future__ import annotations
 import logging
 import threading
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, QThread, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
-    QCheckBox,
     QDoubleSpinBox,
     QFrame,
     QGroupBox,
@@ -270,24 +269,18 @@ class YokoPanel(QGroupBox):
         self.ramp_progress = QLabel("")
         self.ramp_progress.setStyleSheet("color: #888;")
 
-        # Output state — the most common point of operator confusion. The
-        # protocol is write-only so we never know the unit's true state at
-        # startup; the cache shows what *we* last set, not what's live on
-        # the binding posts. The banner makes the implication ("Set/Ramp
-        # programs but doesn't drive when off") visible without staring at
-        # a checkbox at the bottom of the panel.
-        self.output_check = QCheckBox("Output enabled")
-        self.output_banner = QLabel()
-        self.output_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
-
-        # Reinit — RC; — equivalent to a software reset of the unit's
-        # runtime state (output OFF, mode reset, programmed level cleared).
-        # Doesn't touch flash. "Reinit" is less ambiguous than "Reset".
-        self.reset_btn = QPushButton("Reinit (RC)")
-        self.reset_btn.setToolTip(
-            "Send RC; — full setting initialization. Turns output OFF, "
-            "resets mode, clears the programmed voltage. Doesn't touch "
-            "flash. Use only as a panic / start-over button."
+        # Output state — Enable / Disable buttons. Disable always ramps
+        # to 0 first (via the existing ramp worker) before dropping the
+        # relay, so the operator path uses the shutdown protocol by
+        # default. The two-button design also acts as a state indicator:
+        # the inactive direction is disabled, so the live button shows
+        # what we last commanded. Cache is None at startup; we show both
+        # live until the operator's first action sets the cache.
+        self.enable_btn = QPushButton("Enable")
+        self.disable_btn = QPushButton("Disable")
+        self.disable_btn.setToolTip(
+            "Ramp voltage to 0 V, then send O0. Always uses the shutdown "
+            "protocol — never slams the relay open at non-zero V."
         )
 
         self._build_layout()
@@ -297,6 +290,9 @@ class YokoPanel(QGroupBox):
         self._poll_thread: QThread | None = None
         self._ramp_worker: _RampWorker | None = None
         self._ramp_thread: QThread | None = None
+        # Set when Disable kicks off a ramp-to-0; consumed by
+        # _on_ramp_finished to chain set_output(False) on success.
+        self._disable_after_ramp = False
         self._cache_seeded = False
 
         try:
@@ -349,13 +345,17 @@ class YokoPanel(QGroupBox):
         sep1.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep1)
 
-        # Output state up top — the protocol is write-only so the panel
-        # never knows the live state, only what we last set. The banner
-        # surfaces that fact loudly. _refresh_output_banner keeps it in
-        # sync with the cache.
-        outer.addWidget(self.output_banner)
-        outer.addWidget(self.output_check)
-        self._refresh_output_banner()
+        # Output state — Enable / Disable buttons. The button-enabled
+        # state mirrors the cache: when output is on, Enable is greyed
+        # out; when off, Disable is greyed out; when unknown (first
+        # connect, no command yet), both are live so the operator can
+        # commit to either direction.
+        output_row = QHBoxLayout()
+        output_row.addWidget(self.enable_btn)
+        output_row.addWidget(self.disable_btn)
+        output_row.addStretch(1)
+        outer.addLayout(output_row)
+        self._refresh_output_buttons()
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -377,30 +377,46 @@ class YokoPanel(QGroupBox):
         outer.addLayout(ramp_row)
         outer.addWidget(self.ramp_progress)
 
-        action_row = QHBoxLayout()
-        action_row.addStretch(1)
-        action_row.addWidget(self.reset_btn)
-        outer.addLayout(action_row)
-
         outer.addStretch(1)
 
     def _wire_signals(self) -> None:
         self.ramp_btn.clicked.connect(self._on_ramp)
         self.stop_btn.clicked.connect(self._on_ramp_stop)
-        self.output_check.toggled.connect(self._on_output_toggled)
-        self.reset_btn.clicked.connect(self._on_reset)
+        self.enable_btn.clicked.connect(self._on_enable)
+        self.disable_btn.clicked.connect(self._on_disable)
 
     # --- click handlers (GUI thread) ----------------------------------------
 
     def _on_ramp(self) -> None:
-        if self._ramp_thread is not None:
-            return  # one ramp at a time
         target = self.ramp_spin.value()
         lo, hi = self._voltage_limits
         if not lo <= target <= hi:
             self.status_label.setText(f"ramp target {target} V outside ({lo}, {hi})")
             return
+        self._start_ramp_to(target, label=f"ramping → {target:.3f} V…")
 
+    def _on_enable(self) -> None:
+        self._safe(self.yoko.set_output, True)
+        self._refresh_output_buttons()
+
+    def _on_disable(self) -> None:
+        if self._ramp_thread is not None:
+            return  # already ramping; ignore
+        v = self.yoko.cached_voltage
+        if v is None or abs(v) < 1e-4:
+            # Already at zero (or unknown) — drop the relay directly,
+            # no ramp needed.
+            self._safe(self.yoko.set_output, False)
+            self._refresh_output_buttons()
+            return
+        # Non-zero — ramp to 0 in worker, then disable on finish.
+        self._disable_after_ramp = True
+        self._start_ramp_to(0.0, label="ramping → 0 V before disable…")
+
+    def _start_ramp_to(self, target: float, *, label: str) -> None:
+        """Kick off a _RampWorker and disable the action buttons."""
+        if self._ramp_thread is not None:
+            return  # one ramp at a time
         self._ramp_thread = QThread()
         self._ramp_worker = _RampWorker(
             self.yoko, target, self._ramp_step_v, self._ramp_delay_s
@@ -411,7 +427,9 @@ class YokoPanel(QGroupBox):
         self._ramp_thread.start()
 
         self.ramp_btn.setEnabled(False)
-        self.ramp_progress.setText(f"ramping → {target:.3f} V…")
+        self.enable_btn.setEnabled(False)
+        self.disable_btn.setEnabled(False)
+        self.ramp_progress.setText(label)
 
     def _on_ramp_stop(self) -> None:
         if self._ramp_worker is not None:
@@ -426,58 +444,43 @@ class YokoPanel(QGroupBox):
         self._ramp_worker = None
         self.ramp_btn.setEnabled(True)
 
+        do_disable = self._disable_after_ramp
+        self._disable_after_ramp = False
+
         if payload.get("ok"):
-            self.ramp_progress.setText(f"ramp → {payload['final']:.3f} V done")
+            if do_disable:
+                self._safe(self.yoko.set_output, False)
+                self.ramp_progress.setText("output disabled (ramped to 0 first)")
+            else:
+                self.ramp_progress.setText(f"ramp → {payload['final']:.3f} V done")
         elif payload.get("cancelled"):
+            # User aborted via STOP. Respect that — don't auto-disable
+            # even if we were heading toward a disable.
             self.ramp_progress.setText(
                 f"ramp cancelled at {payload['stopped_at']:.3f} V"
             )
         elif "err" in payload:
             self.ramp_progress.setText(f"ramp err: {payload['err']}")
 
-    def _on_output_toggled(self, checked: bool) -> None:
-        self._safe(self.yoko.set_output, checked)
-        self._refresh_output_banner()
+        self._refresh_output_buttons()
 
-    def _on_reset(self) -> None:
-        self._safe(self.yoko.reset)
-        # RC; turns the unit's output OFF and clears caches. Reflect that
-        # in the checkbox + banner; we re-show as "unknown" since the
-        # cache is now blown away.
-        self.output_check.blockSignals(True)
-        self.output_check.setChecked(False)
-        self.output_check.blockSignals(False)
-        self._refresh_output_banner()
+    def _refresh_output_buttons(self) -> None:
+        """Sync Enable / Disable enabled state with the cached output state.
 
-    def _refresh_output_banner(self) -> None:
-        """Update the output-state banner from the driver's cache.
-
-        The protocol is write-only for output state — the cache reflects
-        what *we* last set, not what's electrically live. At startup the
-        cache is None ("unknown"); after the user toggles the checkbox
-        it's True/False.
+        Cache is None at startup (we never queried, can't query) — both
+        buttons are live. Once we command on or off, the cache reflects
+        what we last sent and the opposite-direction button greys out.
         """
         state = self.yoko.cached_output_on
         if state is None:
-            self.output_banner.setText("OUTPUT STATE UNKNOWN — toggle to set")
-            self.output_banner.setStyleSheet(
-                "color: white; background-color: #888; "
-                "font-weight: bold; padding: 4px; "
-            )
+            self.enable_btn.setEnabled(True)
+            self.disable_btn.setEnabled(True)
         elif state:
-            self.output_banner.setText("OUTPUT ON")
-            self.output_banner.setStyleSheet(
-                "color: white; background-color: #2d8a4a; "
-                "font-weight: bold; padding: 4px; "
-            )
+            self.enable_btn.setEnabled(False)
+            self.disable_btn.setEnabled(True)
         else:
-            self.output_banner.setText(
-                "OUTPUT OFF — Set/Ramp programs but does not drive"
-            )
-            self.output_banner.setStyleSheet(
-                "color: white; background-color: #b04040; "
-                "font-weight: bold; padding: 4px; "
-            )
+            self.enable_btn.setEnabled(True)
+            self.disable_btn.setEnabled(False)
 
     def _safe(self, fn, *args) -> None:
         name = getattr(fn, "__name__", repr(fn))
@@ -545,8 +548,8 @@ class YokoPanel(QGroupBox):
         for w in (
             self.ramp_spin,
             self.ramp_btn,
-            self.output_check,
-            self.reset_btn,
+            self.enable_btn,
+            self.disable_btn,
         ):
             w.setEnabled(enabled)
         # stop_btn stays live regardless — it's a no-op when no ramp is
