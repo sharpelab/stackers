@@ -139,6 +139,14 @@ move_stale_ms = 1000
 # this block to hide the 617 readout in the Yoko panel. See
 # docs/air-stacker-pc.md "Voltage readback — Keithley 617" for the
 # wiring.
+#
+# poll_interval_ms = 0 means "as fast as the 617 emits". The unit
+# talks autonomously at its conversion rate (~3 Hz / 333 ms); each
+# inst.read() blocks for the next one. Polling slower than this
+# means we dequeue *older* buffered readings, so every move/jog
+# sees a stale _latest — bad. Keep at 0 unless GPIB bus contention
+# with the Yoko's OD; query starts to matter (it won't at these
+# rates).
 [yoko.keithley617]
 resource = "GPIB0::29::INSTR"
-poll_interval_ms = 1000
+poll_interval_ms = 0

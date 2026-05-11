@@ -540,13 +540,14 @@ class YokoPanel(QGroupBox):
         k617_cfg = cfg.get("keithley617")
         if k617_cfg:
             self.keithley = Keithley617(resource=k617_cfg["resource"])
-            self._k617_poll_s = (
-                int(k617_cfg.get("poll_interval_ms", int(KEITHLEY_CONVERSION_S * 1000)))
-                / 1000.0
-            )
+            # Default: poll as fast as the 617 emits (~3 Hz). Slower
+            # polling causes the unit's talker buffer to fill, so each
+            # read() returns an older reading — _latest goes stale and
+            # workers bail. See config.toml comment.
+            self._k617_poll_s = int(k617_cfg.get("poll_interval_ms", 0)) / 1000.0
         else:
             self.keithley = None
-            self._k617_poll_s = KEITHLEY_CONVERSION_S
+            self._k617_poll_s = 0.0
 
         # --- state ----------------------------------------------------------
         self._latest = _LatestReading()
