@@ -50,10 +50,14 @@ resource = "GPIB0::15::INSTR"
 voltage_limits = [-20.0, 30.0]
 nm_per_volt = 933.33
 poll_interval_ms = 1000
-# Ramp at 0.1 V / 20 ms = 5 V/s. Hardware-side current limit on the 7651
-# may slew slower than this; software ramp just caps at the unit's rate.
-ramp_step_v = 0.1
-ramp_delay_ms = 20
+# Ramp at 0.05 V / 10 ms = 5 V/s @ 100 Hz updates. Smaller steps keep
+# the per-step piezo charging transient under the 617's 20 mA range
+# ceiling (Ipeak ≈ C·ΔV / t_slew ≈ 1.7 µF · 0.05 V / ~10 µs ≈ 8 mA) and
+# stay away from the NPM140's 670 Hz mechanical resonance. Bump
+# ramp_step_v to 0.1 V if 617 OLs become acceptable and you want
+# faster average travel.
+ramp_step_v = 0.05
+ramp_delay_ms = 10
 
 # Keithley 617 electrometer in series with the piezo (charging /
 # leakage current readback). Optional — drop this block to hide the

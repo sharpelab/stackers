@@ -57,22 +57,23 @@ log = logging.getLogger("airstacker.yoko")
 # = 933.33 nm/V. See docs/air-stacker-pc.md.
 DEFAULT_NM_PER_VOLT = 140_000.0 / 150.0  # ≈ 933.33
 
-# Default ramp parameters — 0.1 V steps every 20 ms = 5 V/s. The piezo's
-# resonant frequency is 670 Hz (period 1.5 ms), so 20 ms per step is
-# ~13× the period — plenty of settling time, no risk of mechanical ringing.
-# yoko.py.ramp_voltage()'s own defaults are gentler (1 V/s); the panel
-# uses the faster pace because that's what the operator actually wants
-# at the GUI. Override per-deployment via [yoko] in config.toml.
+# Default ramp parameters — 0.05 V steps every 10 ms = 5 V/s, 100 Hz
+# cadence. Per-step charge is 1.7 µF · 0.05 V = 85 nC, giving an
+# instantaneous Yoko output current of ~8 mA during the slew between
+# steps (well under the Keithley 617's 20 mA ceiling). The 100 Hz
+# cadence also keeps each step's ΔV/dt away from the NPM140's 670 Hz
+# mechanical resonance. Override per-deployment via [yoko] in
+# config.toml; smaller steps trade speed for cleaner current traces,
+# larger steps trade clean traces for faster average travel.
 #
-# Caveat: the 7651 is also current-limited (Albert sets the output range
-# / current cap deliberately to protect the piezo). The actual on-the-wire
-# slew rate is min(software ramp rate, I_limit / C_piezo). If the unit is
-# slewing slower than our software ramp, the ramp_progress label will say
-# "done" before OD actually reaches the target — you'll see OD continue
-# climbing for a while after. If that becomes annoying, either raise the
-# current limit on the unit or add OD-settle-detection to _on_ramp_finished.
-DEFAULT_RAMP_STEP_V = 0.1
-DEFAULT_RAMP_DELAY_MS = 20
+# Caveat: the 7651's hardware slew rate is the real ceiling. If GPIB
+# write overhead pushes the effective cadence below 100 Hz, the
+# software ramp paces itself to whatever cycle time it actually
+# achieves; the unit follows along. If the ramp_progress label says
+# "done" before the piezo settles, raise the Yoko's current limit on
+# the unit or add OD-settle detection to _on_ramp_finished.
+DEFAULT_RAMP_STEP_V = 0.05
+DEFAULT_RAMP_DELAY_MS = 10
 
 
 class _PollWorker(QObject):
