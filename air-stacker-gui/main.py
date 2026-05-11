@@ -1501,12 +1501,14 @@ class ConexAxisPanel(QGroupBox):
         try:
             payload["pos"] = self.axis.position()
         except Exception as e:  # noqa: BLE001
+            log.warning("%s position read failed: %s", self.title(), e)
             payload["pos_err"] = str(e)
         try:
             sc, ec = self.axis.state()
             payload["state_code"] = sc
             payload["error_code"] = ec
         except Exception as e:  # noqa: BLE001
+            log.warning("%s state read failed: %s", self.title(), e)
             payload["state_err"] = str(e)
         return payload
 
@@ -2788,23 +2790,25 @@ class HeaterPanel(QGroupBox):
         try:
             payload["pv"] = self.heater.process_value()
         except Exception as e:  # noqa: BLE001
+            log.warning("heater PV read failed: %s", e)
             payload["pv_err"] = str(e)
         try:
             payload["sp"] = self.heater.setpoint()
-        except Exception:  # noqa: BLE001 — keep going
-            pass
+        except Exception as e:  # noqa: BLE001 — keep going
+            log.warning("heater setpoint read failed: %s", e)
         try:
             payload["state"] = self.heater.system_state()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            log.warning("heater state read failed: %s", e)
         try:
             payload["out"] = self.heater.output_percent()
         except Exception as e:  # noqa: BLE001
+            log.warning("heater output read failed: %s", e)
             payload["out_err"] = str(e)
         try:
             payload["out_hi"] = self.heater.output_limit_high()
-        except Exception:  # noqa: BLE001 — keep going
-            pass
+        except Exception as e:  # noqa: BLE001 — keep going
+            log.warning("heater output_limit_high read failed: %s", e)
         return payload
 
     _STATUS_COLORS = {

@@ -455,17 +455,19 @@ class SMC100Panel(QGroupBox):
         try:
             payload["pos"] = self.axis.position()
         except Exception as e:  # noqa: BLE001
+            log.warning("smc100 position read failed: %s", e)
             payload["pos_err"] = str(e)
         try:
             sc, ec = self.axis.state()
             payload["state_code"] = sc
             payload["error_code"] = ec
         except Exception as e:  # noqa: BLE001
+            log.warning("smc100 state read failed: %s", e)
             payload["state_err"] = str(e)
         if payload.get("state_code") in MOVING_STATES:
             try:
                 payload["setpoint"] = self.axis.setpoint()
-            except Exception:  # noqa: BLE001 — non-fatal
+            except Exception:  # noqa: BLE001 — non-fatal, no log
                 pass
         return payload
 
