@@ -9,6 +9,8 @@ Two sections:
 
 Read-only — does not change camera settings or touch the FLIR camera.
 """
+import importlib.util
+
 import cv2
 
 print("=== cv2 build info ===")
@@ -61,26 +63,14 @@ for backend_id, backend_name in [(cv2.CAP_DSHOW, "DSHOW"), (cv2.CAP_MSMF, "MSMF"
     cap.release()
 
 print("\n=== QtMultimedia availability ===")
-# These imports look unused to a static linter — that's the point. Their
-# importability IS what the probe is checking. Hence `noqa: F401`.
-try:
-    from PySide6 import QtMultimedia  # noqa: F401
+if importlib.util.find_spec("PySide6.QtMultimedia") is None:
+    print("  PySide6.QtMultimedia NOT importable")
+else:
     print("  PySide6.QtMultimedia importable: yes")
-    from PySide6.QtMultimedia import (  # noqa: F401
-        QCamera,
-        QCameraDevice,
-        QImageCapture,
-        QMediaCaptureSession,
-        QMediaDevices,
-        QMediaRecorder,
-        QVideoSink,
-    )
-    print(
-        "  Core classes importable: QMediaDevices, QCamera, QCameraDevice, "
-        "QMediaCaptureSession, QVideoSink, QImageCapture, QMediaRecorder"
-    )
-    # Need a QCoreApplication for QMediaDevices to enumerate
+    # Real imports for the enumeration code below — these are actually used.
     from PySide6.QtCore import QCoreApplication
+    from PySide6.QtMultimedia import QMediaDevices
+
     app = QCoreApplication.instance() or QCoreApplication([])
     devices = QMediaDevices.videoInputs()
     print(f"  Video inputs ({len(devices)}):")
@@ -99,10 +89,8 @@ try:
                 continue
             seen.add(key)
             print(f"      {res.width()}x{res.height():4d}  {pf:30s}  {fps_min:.1f}..{fps_max:.1f}fps")
-except ImportError as e:
-    print(f"  PySide6.QtMultimedia NOT importable: {e}")
-try:
-    from PySide6 import QtMultimediaWidgets  # noqa: F401
+
+if importlib.util.find_spec("PySide6.QtMultimediaWidgets") is None:
+    print("  PySide6.QtMultimediaWidgets NOT importable")
+else:
     print("  PySide6.QtMultimediaWidgets importable: yes (QVideoWidget available)")
-except ImportError as e:
-    print(f"  PySide6.QtMultimediaWidgets NOT importable: {e}")

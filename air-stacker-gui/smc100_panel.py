@@ -46,6 +46,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
+import serial
+
 from smc100 import (
     DISABLE_STATES,
     JOGGING_STATES,
@@ -59,6 +61,11 @@ from smc100 import (
 )
 
 log = logging.getLogger("airstacker.smc100")
+
+# Exception tuple for narrowing the hardware-resilience try/except blocks.
+# smc100.py lets pyserial errors propagate (it doesn't wrap), so callers
+# must catch both SMC100Error and serial.SerialException.
+_SMC100_ERRORS = (SMC100Error, serial.SerialException)
 
 # Bits that should turn the status line red. Anything except a clean 0x0000
 # reads as a fault we want the operator to notice; specifically, a hit on
@@ -225,7 +232,7 @@ class SMC100Panel(QGroupBox):
 
         try:
             self.axis.open()
-        except Exception as e:  # noqa: BLE001
+        except _SMC100_ERRORS as e:
             self.status_label.setText(f"open failed: {e}")
             self._set_all_motion_enabled(False)
             return
@@ -434,7 +441,7 @@ class SMC100Panel(QGroupBox):
         try:
             self.axis.disable_keypad()
             self.axis.leave_jog()
-        except Exception as e:  # noqa: BLE001
+        except _SMC100_ERRORS as e:
             log.exception("smc100: leave-jog failed")
             self.status_label.setText(f"leave jog err: {e}")
 
@@ -443,7 +450,7 @@ class SMC100Panel(QGroupBox):
         log.info("smc100: %s(%s)", name, args if args else "")
         try:
             fn(*args)
-        except Exception as e:  # noqa: BLE001
+        except _SMC100_ERRORS as e:
             log.exception("smc100: %s failed", name)
             self.status_label.setText(f"err: {e}")
 
@@ -454,21 +461,21 @@ class SMC100Panel(QGroupBox):
         payload: dict = {}
         try:
             payload["pos"] = self.axis.position()
-        except Exception as e:  # noqa: BLE001
+        except _SMC100_ERRORS as e:
             log.warning("smc100 position read failed: %s", e)
             payload["pos_err"] = str(e)
         try:
             sc, ec = self.axis.state()
             payload["state_code"] = sc
             payload["error_code"] = ec
-        except Exception as e:  # noqa: BLE001
+        except _SMC100_ERRORS as e:
             log.warning("smc100 state read failed: %s", e)
             payload["state_err"] = str(e)
         if payload.get("state_code") in MOVING_STATES:
             try:
                 payload["setpoint"] = self.axis.setpoint()
-            except Exception:  # noqa: BLE001 — non-fatal, no log
-                pass
+            except _SMC100_ERRORS:
+                pass  # non-fatal, no log
         return payload
 
     @Slot(object)

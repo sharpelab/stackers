@@ -48,8 +48,16 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from keithley617 import Keithley617, format_engineering
+import pyvisa.errors
+
+from keithley617 import Keithley617, Keithley617Error, format_engineering
 from yoko import VOLTAGE_RANGE_V, Yoko7651, YokoError
+
+# Exception tuples for narrowing the hardware-resilience try/except blocks.
+# yoko.py and keithley617.py let pyvisa errors propagate (they don't wrap),
+# so callers must catch both their domain error AND pyvisa.errors.Error.
+_YOKO_ERRORS = (YokoError, pyvisa.errors.Error)
+_K617_ERRORS = (Keithley617Error, pyvisa.errors.Error)
 
 log = logging.getLogger("airstacker.yoko")
 
@@ -175,7 +183,7 @@ class _RampWorker(QObject):
                     self.finished.emit({"cancelled": True, "stopped_at": cur})
                     return
             self.finished.emit({"ok": True, "final": cur})
-        except Exception as e:  # noqa: BLE001
+        except _YOKO_ERRORS as e:
             self.finished.emit({"err": str(e)})
 
 
@@ -320,7 +328,7 @@ class YokoPanel(QGroupBox):
 
         try:
             self.yoko.open()
-        except Exception as e:  # noqa: BLE001
+        except _YOKO_ERRORS as e:
             self.status_label.setText(f"open failed: {e}")
             self._set_all_enabled(False)
             return
@@ -370,7 +378,7 @@ class YokoPanel(QGroupBox):
         if self.keithley is not None:
             try:
                 self.keithley.open()
-            except Exception as e:  # noqa: BLE001
+            except _K617_ERRORS as e:
                 log.warning("keithley617 open failed: %s", e)
                 self.current_status_label.setText(f"keithley open failed: {e}")
                 self.current_status_label.setVisible(True)
@@ -610,7 +618,7 @@ class YokoPanel(QGroupBox):
         log.info("yoko: %s(%s)", name, args if args else "")
         try:
             fn(*args)
-        except Exception as e:  # noqa: BLE001
+        except _YOKO_ERRORS as e:
             log.exception("yoko: %s failed", name)
             self.status_label.setText(f"err: {e}")
 
@@ -622,7 +630,7 @@ class YokoPanel(QGroupBox):
             return {"k617_err": "no keithley"}
         try:
             r = self.keithley.read()
-        except Exception as e:  # noqa: BLE001
+        except _K617_ERRORS as e:
             log.warning("keithley617 read failed: %s", e)
             return {"k617_err": str(e)}
         return {
@@ -657,7 +665,7 @@ class YokoPanel(QGroupBox):
         """Worker-thread: read live output. Must not touch Qt widgets."""
         try:
             r = self.yoko.read_output()
-        except Exception as e:  # noqa: BLE001
+        except _YOKO_ERRORS as e:
             # Surface to console so the offending raw OD reply is visible
             # — the on-panel label truncates. read_output() bakes the
             # raw response into the message via repr().
@@ -747,6 +755,6 @@ class YokoPanel(QGroupBox):
                 self.yoko.safe_disable(
                     step=self._ramp_step_v, delay=self._ramp_delay_s
                 )
-            except Exception as e:  # noqa: BLE001
+            except _YOKO_ERRORS as e:
                 log.warning("yoko safe_disable failed during shutdown: %s", e)
         self.yoko.close()
