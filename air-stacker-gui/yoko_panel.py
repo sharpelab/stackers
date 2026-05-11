@@ -279,6 +279,12 @@ class _MoveWorker(QObject):
     """
 
     finished = Signal(object)
+    # Per-iteration diagnostic emit — payload is a flat dict (see run()
+    # for keys). Connected to the panel's _on_move_diag slot so the
+    # operator can see what the loop is deciding in real time. Same
+    # data is also logged at INFO so a post-mortem from the log file
+    # is possible without screen-recording.
+    diag = Signal(object)
 
     def __init__(
         self,
@@ -315,7 +321,9 @@ class _MoveWorker(QObject):
         v_last: float | None = None
         try:
             dt = KEITHLEY_CONVERSION_S
+            iter_n = 0
             while not self._cancel.is_set():
+                iter_n += 1
                 v_now, func, age = self._latest.read()
                 if v_now is None:
                     raise RuntimeError("no 617 reading available")
@@ -341,14 +349,29 @@ class _MoveWorker(QObject):
                 v_last = v_real_now
                 error = self._target - v_real_now
                 if abs(error) < self._tolerance:
+                    log.info(
+                        "move iter %d: TARGET HIT  v_real=%+.4f  err=%+.4f  "
+                        "(tolerance=%.3f)",
+                        iter_n, v_real_now, error, self._tolerance,
+                    )
+                    self.diag.emit({
+                        "iter": iter_n, "phase": "done",
+                        "target": self._target, "v_latest": v_now, "age_ms": age * 1000,
+                        "i_prev_uA": self._i_commanded * 1e6,
+                        "v_real": v_real_now, "error": error,
+                        "i_des_uA": 0.0, "clipped": False, "v_pred": v_real_now,
+                    })
                     break
                 # Predictive: I that lands V_real at target in one dt.
                 # Clipped to ±speed_a so the user-set speed ceiling
                 # holds. With C ±20 %, residual error per cycle is
                 # bounded by ±20 % of the cycle's commanded ΔV.
-                i_desired = error * self._C / dt
-                if abs(i_desired) > self._speed_a:
+                i_unclipped = error * self._C / dt
+                clipped = abs(i_unclipped) > self._speed_a
+                if clipped:
                     i_desired = self._speed_a if error > 0 else -self._speed_a
+                else:
+                    i_desired = i_unclipped
                 # Predictive soft-limit check: where will V_real be at
                 # the next sample? Past i_commanded over age (already
                 # in flight) plus i_desired over dt + slack. Without
@@ -359,6 +382,22 @@ class _MoveWorker(QObject):
                 v_pred = v_now + (
                     self._i_commanded * age + i_desired * (dt + slack)
                 ) / self._C
+                log.info(
+                    "move iter %d: target=%+.3f  v_latest=%+.4f  age=%.0fms  "
+                    "i_prev=%+.3fµA  v_real=%+.4f  err=%+.4f  "
+                    "i_des=%+.3fµA%s  v_pred=%+.4f",
+                    iter_n, self._target, v_now, age * 1000,
+                    self._i_commanded * 1e6, v_real_now, error,
+                    i_desired * 1e6, " CLIP" if clipped else "", v_pred,
+                )
+                self.diag.emit({
+                    "iter": iter_n, "phase": "coarse" if clipped else "fine",
+                    "target": self._target, "v_latest": v_now, "age_ms": age * 1000,
+                    "i_prev_uA": self._i_commanded * 1e6,
+                    "v_real": v_real_now, "error": error,
+                    "i_des_uA": i_desired * 1e6, "clipped": clipped,
+                    "v_pred": v_pred,
+                })
                 if not self._soft_lo <= v_pred <= self._soft_hi:
                     self._yoko.set_current(0.0)
                     self._i_commanded = 0.0
@@ -399,6 +438,7 @@ class _JogWorker(QObject):
     """
 
     finished = Signal(object)
+    diag = Signal(object)
 
     def __init__(
         self,
@@ -429,11 +469,17 @@ class _JogWorker(QObject):
         try:
             i_signed = self._direction * self._speed_a
             self._yoko.set_current(i_signed)
+            log.info(
+                "jog start: dir=%+d  speed=%+.3fµA  soft=[%+.2f, %+.2f]V",
+                self._direction, i_signed * 1e6, self._soft_lo, self._soft_hi,
+            )
             # Poll faster than the 617's native rate — the watchdog
             # writes _latest at ~3 Hz, but we want to respond to
             # release quickly. The cancel wait is the rate limiter.
             poll_s = 0.1
+            iter_n = 0
             while not self._cancel.is_set():
+                iter_n += 1
                 v_now, func, age = self._latest.read()
                 if v_now is None:
                     raise RuntimeError("no 617 reading available")
@@ -455,7 +501,21 @@ class _JogWorker(QObject):
                 hit_lo = self._direction < 0 and (
                     v_now <= self._soft_lo or v_pred <= self._soft_lo
                 )
+                # Diag every ~3 iters (~300 ms) so the panel display
+                # doesn't get hammered — jog runs at 10 Hz polling.
+                if iter_n % 3 == 1 or hit_hi or hit_lo:
+                    self.diag.emit({
+                        "iter": iter_n, "phase": "jog",
+                        "v_latest": v_now, "age_ms": age * 1000,
+                        "i_des_uA": i_signed * 1e6, "v_pred": v_pred,
+                        "stopping": hit_hi or hit_lo,
+                    })
                 if hit_hi or hit_lo:
+                    log.info(
+                        "jog soft-limit hit: dir=%+d  v_latest=%+.4f  "
+                        "v_pred=%+.4f  age=%.0fms",
+                        self._direction, v_now, v_pred, age * 1000,
+                    )
                     break
                 if self._cancel.wait(poll_s):
                     break
@@ -605,6 +665,18 @@ class YokoPanel(QGroupBox):
         # 617 mode + status — surfaces a front-panel function-knob bump.
         self.k617_status_label = QLabel("")
         self.k617_status_label.setStyleSheet("color: #888;")
+
+        # Move/Jog diagnostic line — updates each loop iteration from
+        # the worker's diag signal. Shows what the closed-loop control
+        # is actually deciding. Stays at the last value after the move
+        # ends so post-mortem visual inspection is possible. Empty
+        # until the first move runs.
+        self.move_diag_label = QLabel("")
+        diag_font = QFont(self.move_diag_label.font())
+        diag_font.setStyleHint(QFont.StyleHint.Monospace)
+        diag_font.setFamily("monospace")
+        self.move_diag_label.setFont(diag_font)
+        self.move_diag_label.setStyleSheet("color: #666; font-size: 10pt;")
 
         # Target spinbox + Move button.
         self.target_spin = QDoubleSpinBox()
@@ -758,6 +830,7 @@ class YokoPanel(QGroupBox):
         outer.addWidget(self.current_label)
         outer.addWidget(self.dvdt_label)
         outer.addWidget(self.k617_status_label)
+        outer.addWidget(self.move_diag_label)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -958,10 +1031,17 @@ class YokoPanel(QGroupBox):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_active_finished)
+        worker.diag.connect(self._on_worker_diag)
         self._active_worker = worker
         self._active_thread = thread
         thread.start()
         self.status_label.setText(label)
+        log.info(
+            "move start: target=%+.3fV  speed=%+.3fµA  C=%.2fµF  "
+            "tol=%.3fV  soft=[%+.2f, %+.2f]",
+            target_v, self._speed_a() * 1e6, self._C * 1e6,
+            self._tolerance_v, *self._soft_limits,
+        )
         self._refresh_controls()
 
     def _start_jog(self, direction: int) -> None:
@@ -980,11 +1060,43 @@ class YokoPanel(QGroupBox):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._on_active_finished)
+        worker.diag.connect(self._on_worker_diag)
         self._active_worker = worker
         self._active_thread = thread
         thread.start()
         self.status_label.setText(f"jog continuous {direction:+d}…")
         self._refresh_controls()
+
+    @Slot(object)
+    def _on_worker_diag(self, info: dict) -> None:
+        """Render the worker's per-iteration diagnostic info on the panel.
+
+        Stays at the last reported state after the worker finishes, so
+        the operator can scroll back and read the final iteration's
+        numbers without needing the log file.
+        """
+        phase = info.get("phase", "?")
+        v_real = info.get("v_real")
+        target = info.get("target")
+        err = info.get("error")
+        i_des = info.get("i_des_uA")
+        age = info.get("age_ms")
+        clipped = info.get("clipped")
+        if phase == "jog":
+            self.move_diag_label.setText(
+                f"jog #{info['iter']:>3}  v={info['v_latest']:+.4f}V  "
+                f"age={age:>4.0f}ms  i={i_des:+.2f}µA  "
+                f"v_pred={info['v_pred']:+.3f}"
+                + ("  STOPPING" if info.get("stopping") else "")
+            )
+        else:
+            clip_marker = " CLIP" if clipped else ""
+            self.move_diag_label.setText(
+                f"move #{info['iter']:>3} [{phase}]  v_real={v_real:+.4f}V  "
+                f"target={target:+.3f}  err={err:+.4f}V  "
+                f"age={age:>4.0f}ms  i_prev={info['i_prev_uA']:+.2f}µA  "
+                f"i_des={i_des:+.2f}µA{clip_marker}  v_pred={info['v_pred']:+.3f}"
+            )
 
     @Slot(object)
     def _on_active_finished(self, payload: dict) -> None:
