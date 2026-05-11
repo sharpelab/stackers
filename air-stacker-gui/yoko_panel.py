@@ -303,9 +303,9 @@ class YokoPanel(QGroupBox):
             "protocol — never slams the relay open at non-zero V."
         )
 
-        self._build_layout()
-        self._wire_signals()
-
+        # Worker / thread state — must be initialized BEFORE _build_layout
+        # because _build_layout calls _refresh_output_buttons which reads
+        # self._ramp_thread to decide button-enable state.
         self._poll_worker: _PollWorker | None = None
         self._poll_thread: QThread | None = None
         self._ramp_worker: _RampWorker | None = None
@@ -314,6 +314,9 @@ class YokoPanel(QGroupBox):
         # _on_ramp_finished to chain set_output(False) on success.
         self._disable_after_ramp = False
         self._cache_seeded = False
+
+        self._build_layout()
+        self._wire_signals()
 
         try:
             self.yoko.open()
