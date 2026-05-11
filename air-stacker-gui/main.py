@@ -3400,15 +3400,11 @@ class CameraWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Z-axis controls go up top — most-touched controls on this rig.
-        # SMC100 is coarse Z (mm scale), Yoko drives the NPM140 piezo for
-        # fine Z (µm scale). Followed by rotation stage(s), then heater.
-        if smc100_cfg:
-            self.smc100_panel = SMC100Panel(smc100_cfg)
-            layout.addWidget(self.smc100_panel)
-        if yoko_cfg:
-            self.yoko_panel = YokoPanel(yoko_cfg)
-            layout.addWidget(self.yoko_panel)
+        # Ordering principle: top-to-bottom by order-of-use during a
+        # stacking run. Rotation stage(s) come first (orient the sample),
+        # then heater (bring up to temp), then coarse Z (SMC100, mm scale,
+        # rough approach), then fine Z (Yoko/NPM140 piezo, µm scale, final
+        # touch-down) at the bottom.
         for cfg in axes_cfg:
             ap = ConexAxisPanel(cfg)
             self.axis_panels.append(ap)
@@ -3416,6 +3412,12 @@ class CameraWindow(QMainWindow):
         if heater_cfg:
             self.heater_panel = HeaterPanel(heater_cfg)
             layout.addWidget(self.heater_panel)
+        if smc100_cfg:
+            self.smc100_panel = SMC100Panel(smc100_cfg)
+            layout.addWidget(self.smc100_panel)
+        if yoko_cfg:
+            self.yoko_panel = YokoPanel(yoko_cfg)
+            layout.addWidget(self.yoko_panel)
         layout.addStretch(1)
         return panel
 
