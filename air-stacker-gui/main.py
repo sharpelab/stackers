@@ -15,7 +15,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import PySpin
-from PySide6.QtCore import QObject, QRect, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -744,6 +744,18 @@ class _CameraGLWindow(QOpenGLWindow):
         self._paint_cycle_total = 0.0
         self._paint_cycle_max = 0.0
 
+        # Drawing overlay. Strokes are stored as lists of points in
+        # normalized camera-image coords (0..1, 0..1) so they re-render
+        # correctly across window resizes and binning swaps within the
+        # same image-aspect family. `_target_rect` caches the current
+        # camera-content rect (refreshed every paintGL) so mouse handlers
+        # can map widget coords → normalized without re-running the
+        # letterbox math.
+        self._strokes: list[list[QPointF]] = []
+        self._active_stroke: list[QPointF] | None = None
+        self._drawing_enabled = False
+        self._target_rect: QRectF | None = None
+
     def set_frame(self, frame_ref: np.ndarray) -> None:
         self._frame_ref = frame_ref
         self._frame_dirty = True
@@ -753,6 +765,81 @@ class _CameraGLWindow(QOpenGLWindow):
         self._frame_ref = None
         self._frame_dirty = False
         self.update()
+
+    def set_drawing_enabled(self, enabled: bool) -> None:
+        """Toggle freehand-draw mode. Switches the cursor to a crosshair
+        when on, default when off. An in-progress stroke is dropped when
+        drawing is turned off mid-drag (the operator can't see the cursor
+        anymore, so finishing the stroke would be surprising)."""
+        self._drawing_enabled = enabled
+        if enabled:
+            self.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self.unsetCursor()
+            if self._active_stroke is not None:
+                self._active_stroke = None
+                self.update()
+
+    def clear_strokes(self) -> None:
+        """Drop all finalized + in-progress strokes."""
+        had_anything = bool(self._strokes) or self._active_stroke is not None
+        self._strokes = []
+        self._active_stroke = None
+        if had_anything:
+            self.update()
+
+    def _pos_to_normalized(self, pos: QPointF) -> QPointF | None:
+        """Map widget coords → (nx, ny) in [0..1] of camera-image space.
+
+        Returns None when the position falls in the letterbox bars or
+        before the first paintGL has computed `_target_rect`.
+        """
+        rect = self._target_rect
+        if rect is None or rect.width() <= 0 or rect.height() <= 0:
+            return None
+        if not rect.contains(pos):
+            return None
+        nx = (pos.x() - rect.x()) / rect.width()
+        ny = (pos.y() - rect.y()) / rect.height()
+        return QPointF(nx, ny)
+
+    def mousePressEvent(self, event) -> None:
+        if (
+            self._drawing_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            n = self._pos_to_normalized(event.position())
+            if n is not None:
+                self._active_stroke = [n]
+                self.update()
+                event.accept()
+                return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._active_stroke is not None:
+            n = self._pos_to_normalized(event.position())
+            if n is not None:
+                self._active_stroke.append(n)
+                self.update()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (
+            self._active_stroke is not None
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            # Single-point "strokes" (a click with no drag) still get
+            # stored — they render as a dot and look like a deliberate
+            # mark to the operator.
+            self._strokes.append(self._active_stroke)
+            self._active_stroke = None
+            self.update()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def initializeGL(self) -> None:
         log.info(
@@ -820,6 +907,7 @@ class _CameraGLWindow(QOpenGLWindow):
             x = (tw - dw) // 2
             y = (th - dh) // 2
             target = QRectF(x, y, dw, dh)
+            self._target_rect = target
             viewport = QRect(0, 0, tw, th)
             transform = QOpenGLTextureBlitter.targetTransform(target, viewport)
             self._blitter.bind()
@@ -829,6 +917,7 @@ class _CameraGLWindow(QOpenGLWindow):
                 QOpenGLTextureBlitter.Origin.OriginTopLeft,
             )
             self._blitter.release()
+            self._paint_overlay(target)
         elapsed = time.perf_counter() - t0
         self._paint_total += elapsed
         self._paint_max = max(self._paint_max, elapsed)
@@ -849,6 +938,51 @@ class _CameraGLWindow(QOpenGLWindow):
             self._paint_count = 0
             self._paint_cycle_total = 0.0
             self._paint_cycle_max = 0.0
+
+    def _paint_overlay(self, target: QRectF) -> None:
+        """Draw the freehand strokes on top of the camera blit.
+
+        Early-outs when there's nothing to paint, so when drawing mode is
+        off and no strokes exist we add zero per-frame cost. QPainter on
+        a QOpenGLWindow uses the GL paint engine and co-exists with the
+        texture blitter as long as the blitter has already released.
+        """
+        if not self._strokes and self._active_stroke is None:
+            return
+        # Pen width in display pixels: 0.2% of the displayed camera-rect
+        # width. Scales with the rect rather than the source frame so the
+        # visual weight stays consistent across binning + window resizes.
+        pen_w = max(1.0, 0.002 * target.width())
+        painter = QPainter(self)
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setClipRect(target)
+            pen = QPen(QColor(255, 0, 0))
+            pen.setWidthF(pen_w)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+            tx, ty, tw, th = target.x(), target.y(), target.width(), target.height()
+
+            def to_widget(p: QPointF) -> QPointF:
+                return QPointF(tx + p.x() * tw, ty + p.y() * th)
+
+            for stroke in self._strokes:
+                self._draw_stroke(painter, stroke, to_widget)
+            if self._active_stroke is not None:
+                self._draw_stroke(painter, self._active_stroke, to_widget)
+        finally:
+            painter.end()
+
+    @staticmethod
+    def _draw_stroke(painter: QPainter, stroke: list[QPointF], to_widget) -> None:
+        if not stroke:
+            return
+        if len(stroke) == 1:
+            painter.drawPoint(to_widget(stroke[0]))
+            return
+        pts = [to_widget(p) for p in stroke]
+        painter.drawPolyline(pts)
 
 
 class CameraDisplay(QWidget):
@@ -882,6 +1016,12 @@ class CameraDisplay(QWidget):
 
     def clear_frame(self) -> None:
         self._gl_window.clear_frame()
+
+    def set_drawing_enabled(self, enabled: bool) -> None:
+        self._gl_window.set_drawing_enabled(enabled)
+
+    def clear_strokes(self) -> None:
+        self._gl_window.clear_strokes()
 
     def setText(self, text: str) -> None:
         self.text_label.setText(text)
@@ -2975,6 +3115,12 @@ class CameraWindow(QMainWindow):
             self.status_bar.webcam_button.setEnabled(False)
             self.status_bar.webcam_button.setToolTip("disabled in config.toml [webcam]")
 
+        # Drawing overlay: pencil toggles freehand-draw mode on the FLIR
+        # GL surface; trash clears strokes. Strokes live in the GL window
+        # (normalized camera-image coords); see _CameraGLWindow.
+        self.status_bar.pencil_toggled.connect(self.label.set_drawing_enabled)
+        self.status_bar.clear_drawing_clicked.connect(self.label.clear_strokes)
+
         # Pipeline state — workers and mailboxes are recreated every time
         # acquisition (re)starts, e.g. on a binning swap.
         self.acq_mailbox: FrameMailbox | None = None
@@ -3147,6 +3293,12 @@ class CameraWindow(QMainWindow):
         self._frame_times.clear()
         self.status_bar.set_fps(None)
         self.status_bar.set_sharpness(None)
+        # Drop strokes on binning swap. Stored coords are normalized to
+        # the camera-image rect, so they'd technically re-render fine,
+        # but the operator's reference points (a circled flake at full
+        # res) usually mean nothing under the new field of view. Drawing
+        # mode itself stays as-is — the toggle button isn't touched.
+        self.label.clear_strokes()
         self._spawn_workers()
         applied = _node_int_get(nm, "BinningVertical") or value
         if self.camera_options_panel is not None:

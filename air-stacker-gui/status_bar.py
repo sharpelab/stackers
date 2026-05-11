@@ -16,6 +16,8 @@ class StatusBar(QFrame):
     """Thin horizontal strip: left-anchored slots, trailing stretch, right-anchored slots."""
 
     webcam_toggled = Signal(bool)
+    pencil_toggled = Signal(bool)
+    clear_drawing_clicked = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -39,6 +41,17 @@ class StatusBar(QFrame):
         self.webcam_button.setFlat(True)
         self.webcam_button.toggled.connect(self.webcam_toggled.emit)
         self.add_right_slot(self.webcam_button)
+
+        self.pencil_button = QPushButton("✎ Draw")
+        self.pencil_button.setCheckable(True)
+        self.pencil_button.setFlat(True)
+        self.pencil_button.toggled.connect(self.pencil_toggled.emit)
+        self.add_right_slot(self.pencil_button)
+
+        self.clear_drawing_button = QPushButton("🗑 Clear")
+        self.clear_drawing_button.setFlat(True)
+        self.clear_drawing_button.clicked.connect(self.clear_drawing_clicked.emit)
+        self.add_right_slot(self.clear_drawing_button)
 
     def add_slot(self, widget: QLabel) -> None:
         """Insert a widget as a new left-anchored slot.
