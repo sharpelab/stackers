@@ -412,25 +412,38 @@ class Yoko7651:
         self._output_cache = False  # DCL drops the relay open
 
     def safe_disable(self, step: float = 0.1, delay: float = 0.05) -> None:
-        """Shutdown protocol — ramp voltage to 0, then ``O0;``.
+        """Disable protocol — ramp to 0 V (if needed), ``SA0;``, then ``O0;``.
 
-        Always use this in preference to a bare ``set_output(False)`` when
-        the unit is at non-zero voltage and driving a piezo. Slamming
-        ``O0`` while sitting at V≠0 V drops the full programmed voltage
-        across the (capacitive) NPM140 in one step when the relay opens,
-        which risks mechanical ringing (resonance at 670 Hz) and isn't
-        kind to piezo life.
+        Enforces the invariant that the relay (``O1;`` / ``O0;``) is only
+        commanded when programmed voltage is 0 V. The optional ramp
+        protects the piezo on the way down when the output is driving
+        non-zero; the explicit ``SA0`` right before ``O0`` is the
+        invariant guard (covers cache-says-we're-at-0 paths too).
 
-        Blocks until done (the ramp is synchronous). Call from a worker
-        thread if you don't want to freeze the GUI.
-
-        No-ops the ramp if the cache says we're already at ~0 V or in
-        current mode; still always sends the final ``O0;``.
+        Blocks until done. Call from a worker thread to avoid freezing
+        the GUI on a long ramp.
         """
         v = self._voltage_cache
         if self._mode_cache == "V" and v is not None and abs(v) > 1e-4:
             self.ramp_voltage(0.0, step=step, delay=delay)
+        # Explicit SA0 right before O0 — enforces the relay-only-at-0
+        # invariant even when the cache says we're already at 0. Safe
+        # to repeat after a ramp_voltage(0.0) whose last step also set 0.
+        self.set_voltage(0.0)
         self.set_output(False)
+
+    def safe_enable(self) -> None:
+        """Engage protocol — ``SA0;`` then ``O1;``.
+
+        Same invariant as :meth:`safe_disable`: the relay is only
+        commanded when programmed voltage is 0 V. ``SA0`` with the
+        relay open is piezo-safe (just reprograms the internal level),
+        and engaging at 0 V means the relay closes onto 0 V — no jump
+        on the binding posts. The operator then ramps from 0 to their
+        target with :meth:`ramp_voltage`.
+        """
+        self.set_voltage(0.0)
+        self.set_output(True)
 
     # --- caches -------------------------------------------------------------
 

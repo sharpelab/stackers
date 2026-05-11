@@ -467,7 +467,10 @@ class YokoPanel(QGroupBox):
         self._start_ramp_to(target, label=f"ramping to {target:+.3f} V…")
 
     def _on_enable(self) -> None:
-        self._safe(self.yoko.set_output, True)
+        # Invariant: relay (O1/O0) is only commanded when programmed V
+        # is 0. safe_enable sends SA0 then O1 — relay closes onto 0 V,
+        # operator ramps from 0 to wherever afterwards.
+        self._safe(self.yoko.safe_enable)
         self._refresh_output_buttons()
         self._refresh_status_label()
 
@@ -476,13 +479,15 @@ class YokoPanel(QGroupBox):
             return  # already ramping; ignore
         v = self.yoko.cached_voltage
         if v is None or abs(v) < 1e-4:
-            # Already at zero (or unknown) — drop the relay directly,
-            # no ramp needed.
-            self._safe(self.yoko.set_output, False)
+            # Already at 0 V (or cache empty) — safe_disable will skip
+            # the inner ramp and just do SA0; O0; which keeps the
+            # invariant explicit.
+            self._safe(self.yoko.safe_disable)
             self._refresh_output_buttons()
             self._refresh_status_label()
             return
-        # Non-zero — ramp to 0 in worker, then disable on finish.
+        # Non-zero — ramp to 0 in worker, then SA0 + O0 in the finished
+        # handler (still via safe_disable for consistency).
         self._disable_after_ramp = True
         self._start_ramp_to(0.0, label="ramping to 0 V before disable…")
 
@@ -522,7 +527,10 @@ class YokoPanel(QGroupBox):
 
         if payload.get("ok"):
             if do_disable:
-                self._safe(self.yoko.set_output, False)
+                # safe_disable here will skip the inner ramp (cache is
+                # already at 0 from the ramp we just finished) and
+                # send SA0 + O0 — invariant preserved.
+                self._safe(self.yoko.safe_disable)
             # In either case, refresh the static state below.
             transient = None
         elif payload.get("cancelled"):
