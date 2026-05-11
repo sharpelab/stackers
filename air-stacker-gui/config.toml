@@ -122,6 +122,15 @@ jog_step_v = 0.1
 # accurate but risks oscillating around target.
 move_tolerance_v = 0.05
 
+# Closed-loop conservatism. The Move worker aims to converge `error`
+# to 0 over `approach_factor` 617-conversion cycles instead of one.
+# The 617's 333 ms integrating ADC + the NPM140's ±20 % C tolerance
+# make an aggressive (k=1) one-shot solver overshoot consistently;
+# k=2 halves the corrective I and gives the loop margin to absorb the
+# model error. k=3-4 if k=2 still overshoots; k=1 reverts to the
+# original aggressive behavior.
+approach_factor = 2.0
+
 # Safety margin (in V) between the Move spinbox bounds and the
 # hard voltage_limits. Soft trip = voltage_limits ± this. Sized to
 # cover worst-case overshoot at max_speed_a (~0.8 V at 20 µA with

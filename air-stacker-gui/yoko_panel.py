@@ -72,6 +72,11 @@ DEFAULT_JOG_STEP_V = 0.1
 DEFAULT_TOLERANCE_V = 0.05
 DEFAULT_SAFETY_MARGIN_V = 1.5
 DEFAULT_STALE_MS = 1000
+# Closed-loop under-damping factor. Worker aims to converge `error` to
+# zero over `approach_factor` cycles instead of one. k > 1 gives the
+# loop margin to absorb the 617's integrating-ADC bias + the NPM140's
+# ±20 % C tolerance without overshoot. See config.toml.
+DEFAULT_APPROACH_FACTOR = 2.0
 
 # 617 analog-front-end integration window. Sets the floor on closed-
 # loop period — anything faster is theatre. Quoted in the 617's quick-
@@ -296,6 +301,7 @@ class _MoveWorker(QObject):
         capacitance_f: float,
         soft_limits: tuple[float, float],
         stale_s: float,
+        approach_factor: float = DEFAULT_APPROACH_FACTOR,
     ) -> None:
         super().__init__()
         self._yoko = yoko
@@ -306,6 +312,7 @@ class _MoveWorker(QObject):
         self._C = capacitance_f
         self._soft_lo, self._soft_hi = soft_limits
         self._stale_s = stale_s
+        self._approach_factor = max(1.0, approach_factor)
         self._cancel = threading.Event()
         # Tracks the current we've commanded since the last 617 sample.
         # The piezo has been integrating this since the sample was
@@ -333,14 +340,19 @@ class _MoveWorker(QObject):
                     )
                 if func != "DCV":
                     raise RuntimeError(f"617 not in DCV (got {func})")
-                # Where is V *right now*? The _latest sample is `age`
-                # old; we've been sourcing _i_commanded for that long,
-                # so the piezo has integrated I·age/C of charge since.
-                # Using v_real_now (not v_now) for the error makes the
-                # predictive scale-down land on target instead of
-                # overshooting by ~(i_prev·age)/C — which at 5 µA and
-                # the 617's 333 ms staleness is roughly 1 V.
-                v_real_now = v_now + self._i_commanded * age / self._C
+                # Where is V *right now*?
+                # Two lag sources to compensate for:
+                #   1. `age` — time since _latest got the reading from
+                #      the 617's talker.
+                #   2. dt/2 — the 617's integrating ADC reports V
+                #      averaged over its conversion window, so the
+                #      reading reflects V at the window's midpoint,
+                #      not its end. That's an extra ~166 ms past `age`.
+                # Both windows had _i_commanded flowing through the
+                # piezo, so V has been changing at i_commanded/C through
+                # the combined (age + dt/2) interval.
+                effective_age = age + dt / 2.0
+                v_real_now = v_now + self._i_commanded * effective_age / self._C
                 if not self._soft_lo <= v_real_now <= self._soft_hi:
                     raise RuntimeError(
                         f"V {v_real_now:+.3f} outside soft limits "
@@ -357,46 +369,52 @@ class _MoveWorker(QObject):
                     self.diag.emit({
                         "iter": iter_n, "phase": "done",
                         "target": self._target, "v_latest": v_now, "age_ms": age * 1000,
+                        "eff_age_ms": effective_age * 1000,
                         "i_prev_uA": self._i_commanded * 1e6,
                         "v_real": v_real_now, "error": error,
                         "i_des_uA": 0.0, "clipped": False, "v_pred": v_real_now,
+                        "k": self._approach_factor,
                     })
                     break
-                # Predictive: I that lands V_real at target in one dt.
-                # Clipped to ±speed_a so the user-set speed ceiling
-                # holds. With C ±20 %, residual error per cycle is
-                # bounded by ±20 % of the cycle's commanded ΔV.
-                i_unclipped = error * self._C / dt
+                # Predictive under-damped: aim to drive V_real to
+                # target over `approach_factor` cycles, not one. With
+                # k=2.0 (default), each iteration commits half the
+                # error's worth of current — gives the loop margin to
+                # absorb both the C-tolerance error (~±20 %) and any
+                # residual conversion-time bias. k=1.0 reverts to the
+                # one-shot solver (more aggressive, more overshoot).
+                # Clipped to ±speed_a so the user-set ceiling holds.
+                i_unclipped = error * self._C / (self._approach_factor * dt)
                 clipped = abs(i_unclipped) > self._speed_a
                 if clipped:
                     i_desired = self._speed_a if error > 0 else -self._speed_a
                 else:
                     i_desired = i_unclipped
                 # Predictive soft-limit check: where will V_real be at
-                # the next sample? Past i_commanded over age (already
-                # in flight) plus i_desired over dt + slack. Without
-                # this, Move/Jog at max speed can cross the soft limit
-                # by several volts between worker decisions before the
-                # watchdog's hard trip catches it.
+                # the next sample? Past i_commanded over effective_age
+                # (already in flight) plus i_desired over dt + slack.
                 slack = 0.1
                 v_pred = v_now + (
-                    self._i_commanded * age + i_desired * (dt + slack)
+                    self._i_commanded * effective_age + i_desired * (dt + slack)
                 ) / self._C
                 log.info(
                     "move iter %d: target=%+.3f  v_latest=%+.4f  age=%.0fms  "
-                    "i_prev=%+.3fµA  v_real=%+.4f  err=%+.4f  "
-                    "i_des=%+.3fµA%s  v_pred=%+.4f",
-                    iter_n, self._target, v_now, age * 1000,
+                    "eff_age=%.0fms  i_prev=%+.3fµA  v_real=%+.4f  err=%+.4f  "
+                    "i_des=%+.3fµA%s  v_pred=%+.4f  k=%.1f",
+                    iter_n, self._target, v_now, age * 1000, effective_age * 1000,
                     self._i_commanded * 1e6, v_real_now, error,
                     i_desired * 1e6, " CLIP" if clipped else "", v_pred,
+                    self._approach_factor,
                 )
                 self.diag.emit({
                     "iter": iter_n, "phase": "coarse" if clipped else "fine",
                     "target": self._target, "v_latest": v_now, "age_ms": age * 1000,
+                    "eff_age_ms": effective_age * 1000,
                     "i_prev_uA": self._i_commanded * 1e6,
                     "v_real": v_real_now, "error": error,
                     "i_des_uA": i_desired * 1e6, "clipped": clipped,
                     "v_pred": v_pred,
+                    "k": self._approach_factor,
                 })
                 if not self._soft_lo <= v_pred <= self._soft_hi:
                     self._yoko.set_current(0.0)
@@ -553,6 +571,9 @@ class YokoPanel(QGroupBox):
         self._tolerance_v = float(cfg.get("move_tolerance_v", DEFAULT_TOLERANCE_V))
         self._margin_v = float(cfg.get("safety_margin_v", DEFAULT_SAFETY_MARGIN_V))
         self._stale_s = int(cfg.get("move_stale_ms", DEFAULT_STALE_MS)) / 1000.0
+        self._approach_factor = float(
+            cfg.get("approach_factor", DEFAULT_APPROACH_FACTOR)
+        )
 
         v_raw = cfg.get("voltage_limits")
         if v_raw is None:
@@ -1026,6 +1047,7 @@ class YokoPanel(QGroupBox):
             self._C,
             self._soft_limits,
             self._stale_s,
+            approach_factor=self._approach_factor,
         )
         thread = QThread()
         worker.moveToThread(thread)
@@ -1038,9 +1060,9 @@ class YokoPanel(QGroupBox):
         self.status_label.setText(label)
         log.info(
             "move start: target=%+.3fV  speed=%+.3fµA  C=%.2fµF  "
-            "tol=%.3fV  soft=[%+.2f, %+.2f]",
+            "tol=%.3fV  soft=[%+.2f, %+.2f]  k=%.1f",
             target_v, self._speed_a() * 1e6, self._C * 1e6,
-            self._tolerance_v, *self._soft_limits,
+            self._tolerance_v, *self._soft_limits, self._approach_factor,
         )
         self._refresh_controls()
 
@@ -1423,18 +1445,23 @@ class YokoPanel(QGroupBox):
                     age, func,
                 )
                 break
-            # Compensate sample staleness for the current we've been
-            # sourcing since (mirrors _MoveWorker; without it the
-            # final approach overshoots by ~i·age/C).
-            v_real_now = v_now + i_commanded * age / self._C
+            # Compensate sample staleness + 617 integration midpoint
+            # (mirrors _MoveWorker; without these the final approach
+            # overshoots by ~i·(age + dt/2)/C).
+            effective_age = age + dt / 2.0
+            v_real_now = v_now + i_commanded * effective_age / self._C
             error = target - v_real_now
             if abs(error) < self._tolerance_v:
                 break
-            i_desired = error * self._C / dt
+            # Under-damped: same approach_factor as Move so shutdown
+            # has the same gentle settling behavior.
+            i_desired = error * self._C / (self._approach_factor * dt)
             if abs(i_desired) > speed_a:
                 i_desired = speed_a if error > 0 else -speed_a
             slack = 0.1
-            v_pred = v_now + (i_commanded * age + i_desired * (dt + slack)) / self._C
+            v_pred = v_now + (
+                i_commanded * effective_age + i_desired * (dt + slack)
+            ) / self._C
             if not soft_lo <= v_pred <= soft_hi:
                 log.warning(
                     "shutdown ramp: predicted V_pred=%+.3f outside soft limits — bailing",
