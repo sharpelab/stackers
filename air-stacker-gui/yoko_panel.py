@@ -210,14 +210,21 @@ class _KeithleyWatchdogWorker(QObject):
                     "unit": r.unit,
                     "status": r.status,
                 }
-                # Only stash + trip-check when 617 is in DCV. Other
-                # functions (DCA from a stale rig config, OHM, …) leave
-                # us blind to piezo voltage; the panel's Enable button
-                # is gated on function == DCV so we never source into
-                # an unknown V.
-                if r.function == "DCV" and not self._tripped:
+                # Stash _latest whenever the 617 is in DCV — we always
+                # want workers to see fresh data the moment the user
+                # Acknowledges a trip. Other functions (DCA from a
+                # stale rig config, OHM, …) leave us blind to piezo
+                # voltage; the panel's Enable button is gated on
+                # function == DCV so we never source into an unknown V.
+                # Trip-firing is separately gated on `not self._tripped`
+                # so a latched trip doesn't re-fire on every reading
+                # while V is still past the hard limit.
+                if r.function == "DCV":
                     self._latest.write(r.value, r.function)
-                    if r.value < self._hard_lo or r.value > self._hard_hi:
+                    if (
+                        not self._tripped
+                        and (r.value < self._hard_lo or r.value > self._hard_hi)
+                    ):
                         self._fire_trip(
                             f"V {r.value:+.3f} outside hard limits "
                             f"[{self._hard_lo:+.2f}, {self._hard_hi:+.2f}] V"
@@ -294,6 +301,11 @@ class _MoveWorker(QObject):
         self._soft_lo, self._soft_hi = soft_limits
         self._stale_s = stale_s
         self._cancel = threading.Event()
+        # Tracks the current we've commanded since the last 617 sample.
+        # The piezo has been integrating this since the sample was
+        # taken — without compensating for it, the predictive scale-
+        # down systematically overshoots at the coarse→fine handoff.
+        self._i_commanded = 0.0
 
     def cancel(self) -> None:
         self._cancel.set()
@@ -313,42 +325,55 @@ class _MoveWorker(QObject):
                     )
                 if func != "DCV":
                     raise RuntimeError(f"617 not in DCV (got {func})")
-                if not self._soft_lo <= v_now <= self._soft_hi:
+                # Where is V *right now*? The _latest sample is `age`
+                # old; we've been sourcing _i_commanded for that long,
+                # so the piezo has integrated I·age/C of charge since.
+                # Using v_real_now (not v_now) for the error makes the
+                # predictive scale-down land on target instead of
+                # overshooting by ~(i_prev·age)/C — which at 5 µA and
+                # the 617's 333 ms staleness is roughly 1 V.
+                v_real_now = v_now + self._i_commanded * age / self._C
+                if not self._soft_lo <= v_real_now <= self._soft_hi:
                     raise RuntimeError(
-                        f"V {v_now:+.3f} outside soft limits "
+                        f"V {v_real_now:+.3f} outside soft limits "
                         f"[{self._soft_lo:+.2f}, {self._soft_hi:+.2f}]"
                     )
-                v_last = v_now
-                error = self._target - v_now
+                v_last = v_real_now
+                error = self._target - v_real_now
                 if abs(error) < self._tolerance:
                     break
-                # Predictive: I that lands us at target in one cycle.
-                # Clipped to ±speed_a so the user-set speed ceiling holds.
+                # Predictive: I that lands V_real at target in one dt.
+                # Clipped to ±speed_a so the user-set speed ceiling
+                # holds. With C ±20 %, residual error per cycle is
+                # bounded by ±20 % of the cycle's commanded ΔV.
                 i_desired = error * self._C / dt
                 if abs(i_desired) > self._speed_a:
                     i_desired = self._speed_a if error > 0 else -self._speed_a
-                # Predictive soft-limit check: would V be outside the
-                # soft window by the time we sample next? `age` covers
-                # the staleness of v_now (617 conversion is ~333 ms),
-                # `dt` covers this loop's wait, +0.1 s slack. Without
-                # this, fast Move/Jog at max speed can cross the soft
-                # limit by ~5 V at 20 µA between worker decisions and
-                # rely on the watchdog's hard trip — which damages the
-                # piezo before catching it on the −20 V side.
-                lookahead_s = age + dt + 0.1
-                v_pred = v_now + i_desired * lookahead_s / self._C
+                # Predictive soft-limit check: where will V_real be at
+                # the next sample? Past i_commanded over age (already
+                # in flight) plus i_desired over dt + slack. Without
+                # this, Move/Jog at max speed can cross the soft limit
+                # by several volts between worker decisions before the
+                # watchdog's hard trip catches it.
+                slack = 0.1
+                v_pred = v_now + (
+                    self._i_commanded * age + i_desired * (dt + slack)
+                ) / self._C
                 if not self._soft_lo <= v_pred <= self._soft_hi:
                     self._yoko.set_current(0.0)
+                    self._i_commanded = 0.0
                     self.finished.emit(
-                        {"limit": True, "v_final": v_now, "v_pred": v_pred}
+                        {"limit": True, "v_final": v_real_now, "v_pred": v_pred}
                     )
                     return
                 self._yoko.set_current(i_desired)
+                self._i_commanded = i_desired
                 if self._cancel.wait(dt):
                     break
             # End of loop — success, cancel, or break. Source to 0 in
             # all cases (the finally also covers exceptions).
             self._yoko.set_current(0.0)
+            self._i_commanded = 0.0
             if self._cancel.is_set():
                 self.finished.emit({"cancelled": True, "v_final": v_last})
             else:
@@ -356,6 +381,7 @@ class _MoveWorker(QObject):
         except Exception as e:  # noqa: BLE001 — narrowed by re-raising would lose context
             try:
                 self._yoko.set_current(0.0)
+                self._i_commanded = 0.0
             except _YOKO_ERRORS as e2:
                 log.exception("move worker: set_current(0) on err failed: %s", e2)
             self.finished.emit({"err": str(e), "v_final": v_last})
@@ -1274,6 +1300,8 @@ class YokoPanel(QGroupBox):
         # context to be cute about speed.
         speed_a = self._default_speed_a
         dt = KEITHLEY_CONVERSION_S
+        i_commanded = 0.0  # parallel to _MoveWorker._i_commanded
+        soft_lo, soft_hi = self._soft_limits
         while time.monotonic() < deadline:
             v_now, func, age = self._latest.read()
             if v_now is None or func != "DCV" or age > self._stale_s:
@@ -1282,18 +1310,18 @@ class YokoPanel(QGroupBox):
                     age, func,
                 )
                 break
-            error = target - v_now
+            # Compensate sample staleness for the current we've been
+            # sourcing since (mirrors _MoveWorker; without it the
+            # final approach overshoots by ~i·age/C).
+            v_real_now = v_now + i_commanded * age / self._C
+            error = target - v_real_now
             if abs(error) < self._tolerance_v:
                 break
             i_desired = error * self._C / dt
             if abs(i_desired) > speed_a:
                 i_desired = speed_a if error > 0 else -speed_a
-            # Same predictive soft-limit check as the workers — we
-            # shouldn't blow past −18.5/+28.5 V during the shutdown
-            # ramp either (unlikely from a target of 0, but cheap).
-            lookahead_s = age + dt + 0.1
-            v_pred = v_now + i_desired * lookahead_s / self._C
-            soft_lo, soft_hi = self._soft_limits
+            slack = 0.1
+            v_pred = v_now + (i_commanded * age + i_desired * (dt + slack)) / self._C
             if not soft_lo <= v_pred <= soft_hi:
                 log.warning(
                     "shutdown ramp: predicted V_pred=%+.3f outside soft limits — bailing",
@@ -1305,6 +1333,7 @@ class YokoPanel(QGroupBox):
             except _YOKO_ERRORS as e:
                 log.warning("shutdown ramp: set_current failed: %s", e)
                 break
+            i_commanded = i_desired
             time.sleep(dt)
         # Always end at I=0, regardless of how the loop exited.
         try:
