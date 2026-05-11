@@ -7,6 +7,40 @@ device_index = 0
 # OUR_DEFAULTS in main.py. Re-add `gain = ...` / `exposure_us = ...` here
 # only if a per-deployment override is needed.
 
+# USB webcam — display-only secondary viewer. Live toggle in the bottom
+# StatusBar opens/closes a detached window. Currently configured for the
+# Anker PowerConf C200 (see docs/air-stacker-pc.md "Secondary camera").
+# Design rationale: WEBCAM_PIP_PROPOSAL.md.
+[webcam]
+# Skip the webcam entirely (no UI button shown). Default: true (toggle visible).
+enabled = true
+# Device matching — Qt Multimedia identifies cameras by description.
+# Substring match, case-insensitive. Survives USB-port reshuffles.
+device_description = "Anker PowerConf C200"
+# Exact-id override (use only if multiple cameras share a description).
+# device_id = "\\\\?\\usb#vid_291a&pid_3369&mi_00#..."
+
+# Capture format. 1280x720 NV12 @ 30 fps is the validated default on the
+# Anker C200 (probed 2026-05-10). NV12 preferred over MJPEG (no decode)
+# and over YUYV (cv2 probe showed YUYV caps below 1080p).
+width = 1280
+height = 720
+target_fps = 30
+pixel_format = "NV12"        # "NV12" | "MJPEG" | "YUYV"
+
+# Whether the window opens on app launch. Default: false (operator clicks
+# the StatusBar toggle when they want it).
+default_visible = false
+
+# Capture backend. "qt" (PySide6.QtMultimedia, recommended) | "cv2"
+# (fallback; not implemented in v0). The Qt path uses Media Foundation
+# on Windows.
+backend = "qt"
+
+# Last window geometry — written on close, restored on open. Operators
+# can leave this commented out; the GUI writes it back automatically.
+# window_geometry = { x = 1920, y = 100, width = 960, height = 540 }
+
 # CONEX-CC axes. Each entry is one controller on its own COM port (address 1 by convention).
 # Axis A on COM3 is currently disconnected — re-add a [[axis]] entry when it's wired up:
 #   name = "Axis A", port = "COM3", baud = 921600, units = "mm", step = 0.01

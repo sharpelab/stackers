@@ -53,6 +53,8 @@ from focus_metric import sharpness as compute_sharpness
 from heater import OmegaPlatinum, SystemState
 from smc100_panel import SMC100Panel
 from status_bar import StatusBar
+from webcam import WebcamConfig
+from webcam_window import WebcamWindow
 from yoko_panel import YokoPanel
 
 import tomlkit
@@ -2900,6 +2902,8 @@ class CameraWindow(QMainWindow):
         config = load_config()
         camera_cfg = config.get("camera", {})
         device_index = int(camera_cfg.get("device_index", 0))
+        self._webcam_cfg = WebcamConfig.from_toml(config.get("webcam"))
+        self._webcam_window: WebcamWindow | None = None
 
         self._spin_system = PySpin.System.GetInstance()
         self._cam_list = self._spin_system.GetCameras()
@@ -2940,6 +2944,17 @@ class CameraWindow(QMainWindow):
             self.camera_options_panel.binning_change_requested.connect(
                 self._on_binning_change_requested
             )
+
+        # Webcam toggle wiring. The button is disabled if the [webcam] config
+        # is `enabled = false` — operator can't open something we've been told
+        # to ignore.
+        if self._webcam_cfg.enabled:
+            self.status_bar.webcam_toggled.connect(self._on_webcam_toggled)
+            if self._webcam_cfg.default_visible:
+                self.status_bar.webcam_button.setChecked(True)
+        else:
+            self.status_bar.webcam_button.setEnabled(False)
+            self.status_bar.webcam_button.setToolTip("disabled in config.toml [webcam]")
 
         # Pipeline state — workers and mailboxes are recreated every time
         # acquisition (re)starts, e.g. on a binning swap.
@@ -3119,6 +3134,55 @@ class CameraWindow(QMainWindow):
             self.camera_options_panel.binning_change_complete(applied)
         log.info("binning change complete: %d×", applied)
 
+    @Slot(bool)
+    def _on_webcam_toggled(self, checked: bool) -> None:
+        """Open or close the detached webcam window.
+
+        Connected to `StatusBar.webcam_toggled`. The window is created
+        lazily on first open; on close (either via the toggle or the
+        window's X button) we save its geometry to config.toml so the
+        next open lands in the same place.
+        """
+        if checked:
+            if self._webcam_window is None:
+                self._webcam_window = WebcamWindow(self._webcam_cfg, parent=self)
+                self._webcam_window.closed.connect(self._on_webcam_closed)
+            self._webcam_window.show()
+            self._webcam_window.raise_()
+            self._webcam_window.activateWindow()
+        else:
+            if self._webcam_window is not None:
+                self._webcam_window.close()
+                # _on_webcam_closed handles cleanup + geometry save.
+
+    @Slot()
+    def _on_webcam_closed(self) -> None:
+        """Webcam window dismissed — save geometry, drop the ref, sync the toggle."""
+        if self._webcam_window is not None:
+            self._persist_webcam_geometry(self._webcam_window.saved_geometry())
+            self._webcam_window.deleteLater()
+            self._webcam_window = None
+        self.status_bar.set_webcam_checked(False)
+
+    def _persist_webcam_geometry(self, geometry: tuple[int, int, int, int]) -> None:
+        """Write the webcam window's last (x, y, w, h) to config.toml.
+
+        Best-effort — failures log but don't propagate. tomlkit preserves
+        surrounding comments and formatting.
+        """
+        try:
+            doc = tomlkit.parse(CONFIG_PATH.read_text(encoding="utf-8"))
+            section = doc.setdefault("webcam", tomlkit.table())
+            geom_table = tomlkit.inline_table()
+            geom_table.update({
+                "x": geometry[0], "y": geometry[1],
+                "width": geometry[2], "height": geometry[3],
+            })
+            section["window_geometry"] = geom_table
+            CONFIG_PATH.write_text(tomlkit.dumps(doc), encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — config write is best-effort
+            log.warning("could not persist webcam geometry: %s", e)
+
     def _build_settings_panel(self, camera_cfg: dict) -> QWidget:
         panel = QWidget()
         panel.setFixedWidth(240)
@@ -3246,6 +3310,10 @@ class CameraWindow(QMainWindow):
             self.status_bar.set_fps(fps)
 
     def closeEvent(self, event) -> None:
+        # Close the webcam first so its geometry gets persisted via the
+        # `closed` signal before we tear down the main window.
+        if self._webcam_window is not None:
+            self._webcam_window.close()
         self._stop_workers()
         if self.camera_options_panel is not None:
             self.camera_options_panel.shutdown()
