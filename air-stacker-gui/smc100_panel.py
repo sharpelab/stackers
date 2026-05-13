@@ -72,6 +72,11 @@ _SMC100_ERRORS = (SMC100Error, serial.SerialException)
 # the end-of-run bits or on the protective trips matters most.
 _FAULT_STATES = NOT_REFERENCED_STATES  # plus state code "10" (ESP err) included
 
+# Panel surfaces positions in µm even though the SMC100 ASCII protocol
+# (and the LTA-HS ESP `1SU` mapping) is mm-native. config.toml stays in
+# mm; this constant is the boundary scale between the two.
+_UM_PER_MM = 1000.0
+
 
 class _PollWorker(QObject):
     """Single-axis polling worker — gated mailbox via Qt's queued signal.
@@ -117,8 +122,10 @@ class SMC100Panel(QGroupBox):
 
     def __init__(self, cfg: dict) -> None:
         super().__init__("Z stage (SMC100)")
-        self.units = cfg.get("units", "mm")
-        self._step_default = float(cfg.get("step", 0.1))
+        # cfg["units"] is ignored — the panel always displays µm regardless
+        # of what config.toml says (which is "mm" for historical reasons).
+        # cfg["step"] is mm-native; convert to µm for the spinbox default.
+        self._step_default_um = float(cfg.get("step", 0.1)) * _UM_PER_MM
         self._poll_interval_s = (
             int(cfg.get("poll_interval_ms", self.DEFAULT_POLL_MS)) / 1000.0
         )
@@ -160,32 +167,35 @@ class SMC100Panel(QGroupBox):
         pos_font.setFamily("monospace")
         self.position_label.setFont(pos_font)
 
+        # Position spinboxes in µm. decimals=2 (10 nm display step) sits
+        # just above the LTA-HS encoder's 35.4 nm/count; the controller
+        # silently rounds sub-encoder requests to the nearest count.
         self.target_spin = QDoubleSpinBox()
         self.target_spin.setKeyboardTracking(False)
-        self.target_spin.setDecimals(3)
+        self.target_spin.setDecimals(2)
         self.target_spin.setSingleStep(0.1)
-        self.target_spin.setSuffix(f" {self.units}")
-        self.target_spin.setRange(-1e6, 1e6)  # tightened in _apply_limits
+        self.target_spin.setSuffix(" µm")
+        self.target_spin.setRange(-1e9, 1e9)  # tightened in _apply_limits
 
         self.go_btn = QPushButton("Go")
 
         self.step_spin = QDoubleSpinBox()
         self.step_spin.setKeyboardTracking(False)
-        self.step_spin.setDecimals(3)
-        self.step_spin.setSingleStep(0.01)
-        self.step_spin.setSuffix(f" {self.units}")
-        self.step_spin.setRange(0.0, 1e6)
-        self.step_spin.setValue(self._step_default)
+        self.step_spin.setDecimals(2)
+        self.step_spin.setSingleStep(0.1)
+        self.step_spin.setSuffix(" µm")
+        self.step_spin.setRange(0.0, 1e9)
+        self.step_spin.setValue(self._step_default_um)
 
         self.jog_minus_btn = QPushButton("−")
         self.jog_plus_btn = QPushButton("+")
 
         self.velocity_spin = QDoubleSpinBox()
         self.velocity_spin.setKeyboardTracking(False)
-        self.velocity_spin.setDecimals(3)
-        self.velocity_spin.setSingleStep(0.5)
-        self.velocity_spin.setRange(0.001, 1000.0)
-        self.velocity_spin.setSuffix(f" {self.units}/s")
+        self.velocity_spin.setDecimals(1)
+        self.velocity_spin.setSingleStep(100.0)
+        self.velocity_spin.setRange(1.0, 1_000_000.0)
+        self.velocity_spin.setSuffix(" µm/s")
 
         self.home_btn = QPushButton("Home")
         self.enable_btn = QPushButton("Enable")
@@ -249,22 +259,25 @@ class SMC100Panel(QGroupBox):
         if eff is not None:
             self._apply_limits(eff)
 
-        # Pre-populate velocity from the controller (best-effort).
+        # Pre-populate velocity from the controller (best-effort). Driver
+        # returns mm/s; spinbox is µm/s.
         try:
             current_v = self.axis.velocity()
             self.velocity_spin.blockSignals(True)
-            self.velocity_spin.setValue(current_v)
+            self.velocity_spin.setValue(current_v * _UM_PER_MM)
             self.velocity_spin.blockSignals(False)
         except SMC100Error:
             pass
 
-        # Apply default_velocity if requested. Note: this is a transient
+        # Apply default_velocity if requested. cfg value is mm/s (config-
+        # native); driver also wants mm/s, spinbox is µm/s. Transient
         # write (VA without PW), not persisted to flash.
         if self._default_velocity is not None:
             try:
-                self.axis.set_velocity(float(self._default_velocity))
+                default_mm_s = float(self._default_velocity)
+                self.axis.set_velocity(default_mm_s)
                 self.velocity_spin.blockSignals(True)
-                self.velocity_spin.setValue(float(self._default_velocity))
+                self.velocity_spin.setValue(default_mm_s * _UM_PER_MM)
                 self.velocity_spin.blockSignals(False)
             except SMC100Error as e:
                 log.warning("set_velocity failed: %s", e)
@@ -357,14 +370,17 @@ class SMC100Panel(QGroupBox):
         self.stop_btn.clicked.connect(lambda: self._safe(self.axis.stop))
 
     def _apply_limits(self, limits: tuple[float, float]) -> None:
-        """Tighten the target spinner range to the effective software clamp."""
+        """Tighten the target spinner range to the effective software clamp.
+        Driver hands us mm; spinbox is µm."""
         lo, hi = limits
-        self.target_spin.setRange(lo, hi)
+        self.target_spin.setRange(lo * _UM_PER_MM, hi * _UM_PER_MM)
 
     # --- click handlers (GUI thread) ----------------------------------------
 
     def _on_go(self) -> None:
-        self._safe(self.axis.move_absolute, self.target_spin.value())
+        self._safe(
+            self.axis.move_absolute, self.target_spin.value() / _UM_PER_MM
+        )
 
     def _on_jog_pressed(self, direction: int) -> None:
         """Mouse-down on a jog button — arm the click-vs-hold timer."""
@@ -400,8 +416,11 @@ class SMC100Panel(QGroupBox):
                 self._safe(self.axis.move_relative, travel)
         else:
             # No limits or no cached position — fall back to a step move.
-            # Better than refusing to move at all.
-            self._safe(self.axis.move_relative, direction * self.step_spin.value())
+            # Better than refusing to move at all. Step spinbox is µm.
+            self._safe(
+                self.axis.move_relative,
+                direction * self.step_spin.value() / _UM_PER_MM,
+            )
         self._jog_continuous = True
 
     def _on_jog_released(self) -> None:
@@ -417,11 +436,12 @@ class SMC100Panel(QGroupBox):
             self._safe(self.axis.stop)
         else:
             # Quick click: cancel the pending continuous switch and fire
-            # a single step move using whatever's in the Step spinbox.
+            # a single step move using whatever's in the Step spinbox
+            # (µm → mm for the driver).
             self._jog_timer.stop()
             self._safe(
                 self.axis.move_relative,
-                self._jog_direction * self.step_spin.value(),
+                self._jog_direction * self.step_spin.value() / _UM_PER_MM,
             )
         self._jog_direction = 0
         self._jog_continuous = False
@@ -431,7 +451,10 @@ class SMC100Panel(QGroupBox):
             self._refresh_button_enables(self._last_state_code)
 
     def _on_set_velocity(self) -> None:
-        self._safe(self.axis.set_velocity, self.velocity_spin.value())
+        # Spinbox is µm/s; driver takes mm/s.
+        self._safe(
+            self.axis.set_velocity, self.velocity_spin.value() / _UM_PER_MM
+        )
 
     def _on_leave_jog(self) -> None:
         # JM0 first to silence the keypad (transient — reverts to JM1 on
@@ -490,9 +513,10 @@ class SMC100Panel(QGroupBox):
         if "pos" in payload:
             pos = payload["pos"]
             self._last_position = pos
-            text = f"{pos:.3f} {self.units}"
+            # Driver returns mm; display in µm with 10 nm resolution.
+            text = f"{pos * _UM_PER_MM:.2f} µm"
             if "setpoint" in payload:
-                text += f"  →  {payload['setpoint']:.3f}"
+                text += f"  →  {payload['setpoint'] * _UM_PER_MM:.2f}"
             self.position_label.setText(text)
         elif "pos_err" in payload:
             self.position_label.setText(f"pos err: {payload['pos_err']}")
