@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
 import pyvisa.errors
 
 from keithley617 import Keithley617, Keithley617Error, format_engineering
+from widgets import action_button
 from yoko import VOLTAGE_RANGE_V, Yoko7651, YokoError
 
 # Exception tuples for narrowing the hardware-resilience try/except blocks.
@@ -665,7 +666,7 @@ class YokoPanel(QGroupBox):
             "font-weight: bold; padding: 4px 8px;"
         )
         self.trip_label.setVisible(False)
-        self.trip_ack_btn = QPushButton("Acknowledge")
+        self.trip_ack_btn = action_button("Acknowledge")
         self.trip_ack_btn.setVisible(False)
 
         self.voltage_label = QLabel("—")
@@ -706,7 +707,7 @@ class YokoPanel(QGroupBox):
         self.target_spin.setSingleStep(0.1)
         self.target_spin.setSuffix(" V")
         self.target_spin.setRange(self._soft_limits[0], self._soft_limits[1])
-        self.move_btn = QPushButton("Move")
+        self.move_btn = action_button("Move")
 
         # Step + Speed spinboxes.
         self.step_spin = QDoubleSpinBox()
@@ -730,15 +731,15 @@ class YokoPanel(QGroupBox):
         self.jog_plus_btn = QPushButton("+")
 
         # STOP — top-right red panic button, matching smc100/rotation.
-        self.stop_btn = QPushButton("STOP")
+        self.stop_btn = action_button("STOP")
         self.stop_btn.setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; "
             "font-weight: bold; padding: 2px 10px; }"
             "QPushButton:pressed { background-color: #962d22; }"
         )
 
-        self.enable_btn = QPushButton("Enable")
-        self.disable_btn = QPushButton("Disable")
+        self.enable_btn = action_button("Enable")
+        self.disable_btn = action_button("Disable")
         self.disable_btn.setToolTip(
             "Stop sourcing (I→0) and open the relay. Piezo holds at its "
             "current voltage. Move to 0 V first if you want it discharged."

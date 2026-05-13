@@ -34,8 +34,8 @@ from __future__ import annotations
 import logging
 import threading
 
-from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
@@ -59,6 +59,7 @@ from smc100 import (
     error_label,
     state_label,
 )
+from widgets import action_button
 
 log = logging.getLogger("airstacker.smc100")
 
@@ -76,6 +77,12 @@ _FAULT_STATES = NOT_REFERENCED_STATES  # plus state code "10" (ESP err) included
 # (and the LTA-HS ESP `1SU` mapping) is mm-native. config.toml stays in
 # mm; this constant is the boundary scale between the two.
 _UM_PER_MM = 1000.0
+
+# LTA-HS encoder unit, used as a startup fallback if `SU?` query fails.
+# The SMC100 silently rounds motion requests to the nearest integer
+# count, so sending a non-count-aligned distance moves less than asked.
+# Real value gets read from the controller at open() time.
+_FALLBACK_ENCODER_MM = 3.539e-5
 
 
 class _PollWorker(QObject):
@@ -152,6 +159,10 @@ class SMC100Panel(QGroupBox):
         )
         self._configured_limits = position_limits
 
+        # Encoder unit cache for snap-to-count. Populated post-open(); the
+        # fallback covers the open-failed case so handlers don't crash.
+        self._encoder_mm: float = _FALLBACK_ENCODER_MM
+
         # --- widgets --------------------------------------------------------
         self.status_label = QLabel("disconnected")
         self.error_label = QLabel("")
@@ -177,7 +188,7 @@ class SMC100Panel(QGroupBox):
         self.target_spin.setSuffix(" µm")
         self.target_spin.setRange(-1e9, 1e9)  # tightened in _apply_limits
 
-        self.go_btn = QPushButton("Go")
+        self.go_btn = action_button("Go")
 
         self.step_spin = QDoubleSpinBox()
         self.step_spin.setKeyboardTracking(False)
@@ -197,21 +208,21 @@ class SMC100Panel(QGroupBox):
         self.velocity_spin.setRange(1.0, 1_000_000.0)
         self.velocity_spin.setSuffix(" µm/s")
 
-        self.home_btn = QPushButton("Home")
-        self.enable_btn = QPushButton("Enable")
-        self.disable_btn = QPushButton("Disable")
-        self.reset_btn = QPushButton("Reset")
+        self.home_btn = action_button("Home")
+        self.enable_btn = action_button("Enable")
+        self.disable_btn = action_button("Disable")
+        self.reset_btn = action_button("Reset")
         # Escape hatch out of JOGGING state. Sends JM0 (silence keypad)
         # then JD (leave JOGGING). Both transient — no flash writes.
         # Hidden until polling reports JOGGING; the layout row collapses
         # when it's not visible.
-        self.leave_jog_btn = QPushButton("Leave jog")
+        self.leave_jog_btn = action_button("Leave jog")
         self.leave_jog_btn.setVisible(False)
 
         # Stop sits on the top-right of the panel (same line as status)
         # rather than as a full-width banner. Red styling keeps it visually
         # distinct as a panic button without taking a row to itself.
-        self.stop_btn = QPushButton("STOP")
+        self.stop_btn = action_button("STOP")
         self.stop_btn.setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; "
             "font-weight: bold; padding: 2px 10px; }"
@@ -235,10 +246,25 @@ class SMC100Panel(QGroupBox):
         # mode). See _on_jog_pressed / _on_jog_released.
         self._jog_direction: int = 0
         self._jog_continuous: bool = False
+        # The direction of the most recent +/− click, persisted across
+        # releases — drives the spacebar-repeat shortcut. None until the
+        # operator has clicked one of the jog buttons at least once.
+        self._last_jog_direction: int | None = None
         self._jog_timer = QTimer(self)
         self._jog_timer.setSingleShot(True)
         self._jog_timer.setInterval(self.JOG_HOLD_MS)
         self._jog_timer.timeout.connect(self._on_jog_continuous_fire)
+
+        # Spacebar repeats the last clicked +/− jog. Panel-scoped so the
+        # shortcut only fires when keyboard focus is somewhere inside
+        # this SMC100 panel (a child spinbox counts) — spacebar in
+        # another panel doesn't accidentally jog Z. See Sandesh's
+        # feedback re: old GUI behavior.
+        self._space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self._space_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut
+        )
+        self._space_shortcut.activated.connect(self._on_space_repeat_jog)
 
         try:
             self.axis.open()
@@ -251,6 +277,17 @@ class SMC100Panel(QGroupBox):
             self.id_label.setText(self.axis.identify())
         except SMC100Error:
             pass
+
+        # Read the encoder unit from the controller so _snap_mm matches
+        # this particular stage rather than the LTA-HS-typical default.
+        try:
+            self._encoder_mm = self.axis.encoder_unit()
+            log.info("smc100 encoder unit: %.3e mm/count", self._encoder_mm)
+        except SMC100Error as e:
+            log.warning(
+                "encoder_unit query failed (%s); using fallback %.3e mm/count",
+                e, _FALLBACK_ENCODER_MM,
+            )
 
         # Tighten the target spinner to the effective software clamp (the
         # intersection of position_limits and the controller's SL/SR). If
@@ -377,17 +414,44 @@ class SMC100Panel(QGroupBox):
 
     # --- click handlers (GUI thread) ----------------------------------------
 
+    def _snap_mm(self, mm: float) -> float:
+        """Round a distance/position (mm) to the nearest integer encoder
+        count. The SMC100 truncates sub-count requests, so without this
+        a 0.1 µm step (~2.82 counts) moves only 2 counts = 0.07 µm."""
+        return round(mm / self._encoder_mm) * self._encoder_mm
+
     def _on_go(self) -> None:
         self._safe(
-            self.axis.move_absolute, self.target_spin.value() / _UM_PER_MM
+            self.axis.move_absolute,
+            self._snap_mm(self.target_spin.value() / _UM_PER_MM),
         )
 
     def _on_jog_pressed(self, direction: int) -> None:
-        """Mouse-down on a jog button — arm the click-vs-hold timer."""
+        """Mouse-down on a jog button — arm the click-vs-hold timer.
+        Also persists the direction for the spacebar-repeat shortcut."""
         log.info("smc100: jog pressed dir=%+d (timer armed)", direction)
         self._jog_direction = direction
+        self._last_jog_direction = direction
         self._jog_continuous = False
         self._jog_timer.start()
+
+    def _on_space_repeat_jog(self) -> None:
+        """Spacebar handler — repeats the last clicked +/− jog.
+
+        No-op if no jog has been clicked this session or if the target
+        button is currently disabled (e.g. motor still moving from a
+        prior step). Routes through ``btn.click()`` so the request
+        flows through ``_on_jog_pressed`` / ``_on_jog_released`` and
+        inherits the encoder-snap + state gating already on that path.
+        """
+        if self._last_jog_direction is None:
+            return
+        btn = (
+            self.jog_plus_btn if self._last_jog_direction > 0
+            else self.jog_minus_btn
+        )
+        if btn.isEnabled():
+            btn.click()
 
     def _on_jog_continuous_fire(self) -> None:
         """Hold threshold elapsed — switch from step to continuous travel.
@@ -419,7 +483,9 @@ class SMC100Panel(QGroupBox):
             # Better than refusing to move at all. Step spinbox is µm.
             self._safe(
                 self.axis.move_relative,
-                direction * self.step_spin.value() / _UM_PER_MM,
+                self._snap_mm(
+                    direction * self.step_spin.value() / _UM_PER_MM
+                ),
             )
         self._jog_continuous = True
 
@@ -437,11 +503,15 @@ class SMC100Panel(QGroupBox):
         else:
             # Quick click: cancel the pending continuous switch and fire
             # a single step move using whatever's in the Step spinbox
-            # (µm → mm for the driver).
+            # (µm → mm for the driver, snapped to the encoder count grid).
             self._jog_timer.stop()
             self._safe(
                 self.axis.move_relative,
-                self._jog_direction * self.step_spin.value() / _UM_PER_MM,
+                self._snap_mm(
+                    self._jog_direction
+                    * self.step_spin.value()
+                    / _UM_PER_MM
+                ),
             )
         self._jog_direction = 0
         self._jog_continuous = False

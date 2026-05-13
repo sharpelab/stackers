@@ -295,6 +295,13 @@ class SMC100Axis:
         sr = float(self.query("SR?"))
         return sl, sr
 
+    def encoder_unit(self) -> float:
+        """``SU?`` — encoder unit in mm/count. LTA-HS reports 3.539e-5
+        (≈ 35.4 nm/count). The controller silently rounds motion requests
+        to the nearest integer multiple of this, so software requests
+        that aren't whole-count multiples move less than asked."""
+        return float(self.query("SU?"))
+
     # --- motion (mutating, but transient — no persistent writes) ------------
 
     def _check_target(self, target: float) -> None:

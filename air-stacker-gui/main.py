@@ -55,6 +55,7 @@ from smc100_panel import SMC100Panel
 from status_bar import StatusBar
 from webcam import WebcamConfig
 from webcam_window import WebcamWindow
+from widgets import action_button
 from yoko_panel import YokoPanel
 
 import tomlkit
@@ -1411,7 +1412,7 @@ class ConexAxisPanel(QGroupBox):
         self.target_spin.setSingleStep(0.01)
         if self.units:
             self.target_spin.setSuffix(f" {self.units}")
-        self.go_btn = QPushButton("Go")
+        self.go_btn = action_button("Go")
 
         self.step_spin = QDoubleSpinBox()
         self.step_spin.setKeyboardTracking(False)
@@ -1431,12 +1432,12 @@ class ConexAxisPanel(QGroupBox):
 
         self.jog_minus_btn = QPushButton("−")
         self.jog_plus_btn = QPushButton("+")
-        self.home_btn = QPushButton("Home")
-        self.enable_btn = QPushButton("Enable")
-        self.disable_btn = QPushButton("Disable")
+        self.home_btn = action_button("Home")
+        self.enable_btn = action_button("Enable")
+        self.disable_btn = action_button("Disable")
 
         # Stop sits on the top-right of the status row (matches SMC100).
-        self.stop_btn = QPushButton("STOP")
+        self.stop_btn = action_button("STOP")
         self.stop_btn.setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; "
             "font-weight: bold; padding: 2px 10px; }"
@@ -2838,8 +2839,8 @@ class HeaterPanel(QGroupBox):
         self.max_output_spin.setKeyboardTracking(False)
         self.max_output_spin.setValue(float(cfg.get("max_output_default", 40.0)))
 
-        self.run_btn = QPushButton("Run")
-        self.stop_btn = QPushButton("Stop")
+        self.run_btn = action_button("Run")
+        self.stop_btn = action_button("Stop")
 
         outer = QVBoxLayout(self)
         outer.addWidget(self.status_label)
