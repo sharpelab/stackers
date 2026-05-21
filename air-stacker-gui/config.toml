@@ -108,17 +108,20 @@ piezo_capacitance_uf = 2.0
 # settling lag, see YOKO_SETTLE_S in yoko_panel.py). 2.5 µA on 2 µF
 # = 1.25 V/s, so a 30 V wind-down takes ~24 s. Slower gives smaller
 # residual offset from 0; the operator-facing Start uses the Current
-# spinbox directly, bounded by [-max_speed_a, +max_speed_a].
+# slider directly, bounded by [-max_speed_a, +max_speed_a].
 default_speed_a = 2.5e-6      # 2.5 µA, shutdown ramp only
-max_speed_a = 20e-6           # 20 µA — Current spinbox bound. Beyond
-                              # this, one 617 conversion cycle (333 ms)
-                              # eats > 4 V of motion before the
-                              # predictive trip can intercept.
+max_speed_a = 5e-6            # 5 µA — Current slider upper bound. The
+                              # slider snaps to ticks at 0.5/1.0/2.5/5.0
+                              # µA. At 5 µA into 2 µF the worst-case
+                              # one-cycle (333 ms) ΔV ≈ 0.83 V, well
+                              # inside safety_margin_v=1.5 — predictive
+                              # trip still has a clean intercept.
 
 # Safety margin (in V) between the predictive-floor trip and the
 # hard voltage_limits[0]. Soft floor = voltage_limits[0] + this.
 # Sized to cover the unanticipated ΔV during one 617 conversion at
-# max_speed_a (~0.6 V at 20 µA into 2 µF with ±20 % C tolerance).
+# max_speed_a (~0.83 V at 5 µA into 2 µF; ±20 % C tolerance + scheduling
+# jitter absorbed by the remaining 0.7 V headroom).
 safety_margin_v = 1.5
 
 # Watchdog: if the 617 hasn't returned a fresh reading in this long,

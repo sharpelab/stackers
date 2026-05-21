@@ -36,12 +36,12 @@ from PySide6.QtCore import QObject, QPointF, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
-    QDoubleSpinBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QProgressDialog,
+    QSlider,
     QVBoxLayout,
     QWidget,
 )
@@ -67,7 +67,7 @@ DEFAULT_NM_PER_VOLT = 140_000.0 / 150.0  # ≈ 933.33
 # Defaults — see config.toml for the documented rationale.
 DEFAULT_CAPACITANCE_UF = 1.7
 DEFAULT_SPEED_A = 2.5e-6
-DEFAULT_MAX_SPEED_A = 20e-6
+DEFAULT_MAX_SPEED_A = 5e-6
 DEFAULT_SAFETY_MARGIN_V = 1.5
 DEFAULT_STALE_MS = 1000
 
@@ -356,6 +356,108 @@ class _TravelBar(QWidget):
             p.drawEllipse(QPointF(x, bar_y), 5.0, 5.0)
 
 
+class _CurrentTickStrip(QWidget):
+    """Tick-mark strip painted under the current slider.
+
+    Labelled ticks at the named operator-preferred values (0.5, 1.0, 2.5,
+    5.0 µA). Padding matches the QSlider handle inset so tick centers
+    line up with handle positions for those values.
+    """
+
+    _AXIS = "#888"
+
+    def __init__(self, ticks: tuple[float, ...], max_ua: float) -> None:
+        super().__init__()
+        self._ticks = ticks
+        self._max_ua = max_ua
+        self.setMinimumHeight(16)
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 — Qt override
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = self.width()
+        # QSlider default handle ≈ 18 px wide; the groove insets by half
+        # the handle on each side. 9 px matches the handle center range
+        # so tick labels sit under the values the handle can actually
+        # reach. If a custom QStyle changes the handle width this drifts
+        # by a few px — visually fine.
+        pad = 9.0
+        x_lo = pad
+        x_hi = w - pad
+        font = QFont(self.font())
+        font.setPointSize(8)
+        p.setFont(font)
+        fm = QFontMetrics(font)
+        p.setPen(QPen(QColor(self._AXIS), 1))
+        for tick in self._ticks:
+            x = x_lo + tick / self._max_ua * (x_hi - x_lo)
+            p.drawLine(QPointF(x, 0), QPointF(x, 4))
+            label = f"{tick:g}"
+            tw = fm.horizontalAdvance(label)
+            p.drawText(QPointF(x - tw / 2, 14), label)
+
+
+class _CurrentSlider(QWidget):
+    """Horizontal 0 → max_ua linear slider with sticky operator ticks.
+
+    Ticks at 0.5 / 1.0 / 2.5 / 5.0 µA are visually marked on a strip
+    below the slider and are *sticky*: while dragging, if the raw
+    position falls within ``SNAP_WINDOW_UA`` of one of them, the slider
+    snaps to that tick value. The mouse must drag past the snap window
+    on the far side of the tick to escape. Tunes how easy it is to land
+    on a known speed without overshoot.
+    """
+
+    TICKS_UA: tuple[float, ...] = (0.5, 1.0, 2.5, 5.0)
+    SNAP_WINDOW_UA = 0.1
+    _STEPS = 1000  # 0.005 µA resolution at max_ua = 5.0
+
+    valueChanged = Signal(float)
+
+    def __init__(self, max_ua: float) -> None:
+        super().__init__()
+        self._max_ua = max_ua
+        ticks_in_range = tuple(t for t in self.TICKS_UA if t <= max_ua)
+
+        self._slider = QSlider(Qt.Orientation.Horizontal)
+        self._slider.setRange(0, self._STEPS)
+        self._slider.setSingleStep(1)
+        self._slider.setPageStep(50)
+        # ClickFocus — same rationale as the prior spinbox: keyboard
+        # adjustments require an explicit click; auto-focus-routing
+        # from elsewhere won't land here and start eating arrow keys.
+        self._slider.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self._slider.valueChanged.connect(self._on_raw_changed)
+
+        self._tick_strip = _CurrentTickStrip(ticks_in_range, max_ua)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(self._slider)
+        layout.addWidget(self._tick_strip)
+
+    def _on_raw_changed(self, raw: int) -> None:
+        ua = raw / self._STEPS * self._max_ua
+        for tick in self.TICKS_UA:
+            if abs(ua - tick) <= self.SNAP_WINDOW_UA:
+                snapped_raw = round(tick / self._max_ua * self._STEPS)
+                if snapped_raw != raw:
+                    self._slider.blockSignals(True)
+                    self._slider.setValue(snapped_raw)
+                    self._slider.blockSignals(False)
+                ua = tick
+                break
+        self.valueChanged.emit(ua)
+
+    def value(self) -> float:
+        return self._slider.value() / self._STEPS * self._max_ua
+
+    def setValue(self, ua: float) -> None:  # noqa: N802 — Qt naming
+        clamped = max(0.0, min(self._max_ua, ua))
+        self._slider.setValue(int(round(clamped / self._max_ua * self._STEPS)))
+
+
 class YokoPanel(QGroupBox):
     """Live readout + operator-driven CC source for the Yoko 7651 + NPM140."""
 
@@ -480,20 +582,18 @@ class YokoPanel(QGroupBox):
 
 
         # Unsigned current magnitude in µA. Sign comes from which
-        # direction button the operator presses (+ vs −); the spinbox
+        # direction button the operator presses (+ vs −); the slider
         # itself never goes negative. Default 0 so a stray + or −
         # click at panel-open is a noop.
-        self.current_spin = QDoubleSpinBox()
-        self.current_spin.setKeyboardTracking(False)
-        # ClickFocus — typeable when explicitly clicked, but stays out
-        # of tab order so Qt's auto-focus-routing (e.g. when another
-        # focused widget elsewhere is dismissed) doesn't land here.
-        self.current_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
-        self.current_spin.setDecimals(3)
-        self.current_spin.setSingleStep(0.5)
-        self.current_spin.setSuffix(" µA")
-        self.current_spin.setRange(0.0, self._max_speed_a * 1e6)
-        self.current_spin.setValue(0.0)
+        self.current_slider = _CurrentSlider(max_ua=self._max_speed_a * 1e6)
+        self.current_readout = QLabel("0.000 µA")
+        readout_font = QFont(self.current_readout.font())
+        readout_font.setStyleHint(QFont.StyleHint.Monospace)
+        readout_font.setFamily("monospace")
+        self.current_readout.setFont(readout_font)
+        self.current_slider.valueChanged.connect(
+            lambda ua: self.current_readout.setText(f"{ua:.3f} µA")
+        )
 
         # Direction buttons: + sources +I (V rises), − sources −I (V
         # falls). Clicking the opposite direction while sourcing flips
@@ -501,14 +601,9 @@ class YokoPanel(QGroupBox):
         self.up_btn = action_button("+")
         self.down_btn = action_button("−")
 
-        # Stop — red, always-live halt. set_current(0) on click; works
-        # even when not nominally sourcing (idempotent safety net).
+        # Stop — set_current(0). Live only while sourcing; greyed
+        # otherwise (see _refresh_controls).
         self.stop_btn = action_button("Stop")
-        self.stop_btn.setStyleSheet(
-            "QPushButton { background-color: #c0392b; color: white; "
-            "font-weight: bold; padding: 2px 10px; }"
-            "QPushButton:pressed { background-color: #962d22; }"
-        )
 
         self.enable_btn = action_button("Enable")
 
@@ -607,8 +702,11 @@ class YokoPanel(QGroupBox):
         outer.addWidget(sep1)
 
         outer.addWidget(self.voltage_label)
-        outer.addWidget(self.travel_label)
-        outer.addWidget(self.dvdt_label)
+        sub_row = QHBoxLayout()
+        sub_row.addWidget(self.travel_label)
+        sub_row.addStretch(1)
+        sub_row.addWidget(self.dvdt_label)
+        outer.addLayout(sub_row)
         outer.addWidget(self.travel_bar)
 
         sep2 = QFrame()
@@ -616,10 +714,12 @@ class YokoPanel(QGroupBox):
         sep2.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep2)
 
-        current_row = QHBoxLayout()
-        current_row.addWidget(QLabel("Current:"))
-        current_row.addWidget(self.current_spin, stretch=1)
-        outer.addLayout(current_row)
+        current_header = QHBoxLayout()
+        current_header.addWidget(QLabel("Current:"))
+        current_header.addStretch(1)
+        current_header.addWidget(self.current_readout)
+        outer.addLayout(current_header)
+        outer.addWidget(self.current_slider)
 
         button_row = QHBoxLayout()
         button_row.addWidget(self.up_btn, stretch=1)
@@ -692,7 +792,7 @@ class YokoPanel(QGroupBox):
         if self.yoko.cached_output_on is not True:
             self.status_label.setText("can't source — output is OFF (Enable first)")
             return
-        magnitude_a = self.current_spin.value() * 1e-6
+        magnitude_a = self.current_slider.value() * 1e-6
         i_a = direction * magnitude_a
         # Refuse up-front if the requested I would immediately trip
         # the predictive floor — better UX than letting the watchdog
@@ -837,7 +937,7 @@ class YokoPanel(QGroupBox):
     def _set_controls_enabled(self, enabled: bool) -> None:
         """Used at startup when open() failed."""
         for w in (
-            self.current_spin,
+            self.current_slider,
             self.up_btn,
             self.down_btn,
             self.enable_btn,
