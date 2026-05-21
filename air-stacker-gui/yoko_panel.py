@@ -345,9 +345,10 @@ class YokoPanel(QGroupBox):
         # which is fine because the hard trip is the backstop.
         self._sourcing: bool = False
         self._i_commanded: float = 0.0
-        # Surface 617 problems (wrong mode, comm error, overflow) in
-        # the main status_label rather than a dedicated row. None = OK.
+        # Surface instrument problems (wrong mode, comm error, overflow)
+        # in the main status_label rather than a dedicated row. None = OK.
         self._k617_issue: str | None = None
+        self._yoko_issue: str | None = None
 
         self._yoko_poll_worker: _YokoPollWorker | None = None
         self._yoko_poll_thread: QThread | None = None
@@ -374,9 +375,8 @@ class YokoPanel(QGroupBox):
         self.travel_label = QLabel("")
         self.travel_label.setStyleSheet("color: #888; font-size: 8pt;")
 
-        # Yoko I sourcing readout — secondary, formatted A.
-        self.current_label = QLabel("—")
-        self.current_label.setStyleSheet("color: #888;")
+        # Implied dV/dt from the Yoko OD poll. Doubles as a "source is
+        # alive" indicator — empty when output is off.
         self.dvdt_label = QLabel("")
         self.dvdt_label.setStyleSheet("color: #888;")
 
@@ -510,7 +510,6 @@ class YokoPanel(QGroupBox):
 
         outer.addWidget(self.voltage_label)
         outer.addWidget(self.travel_label)
-        outer.addWidget(self.current_label)
         outer.addWidget(self.dvdt_label)
 
         sep2 = QFrame()
@@ -666,11 +665,15 @@ class YokoPanel(QGroupBox):
             return
         if self.keithley is None:
             self.status_label.setText(
-                self._k617_issue or "no 617 — display only"
+                self._k617_issue or self._yoko_issue or "no 617 — display only"
             )
             return
-        if self._k617_issue:
-            self.status_label.setText(self._k617_issue)
+        # Instrument problems take precedence over routine state — if
+        # the 617 is in DCA or the Yoko is in V mode, surface that
+        # rather than the "sourcing X µA" line. Pipe-separate when both.
+        if self._k617_issue or self._yoko_issue:
+            parts = [s for s in (self._k617_issue, self._yoko_issue) if s]
+            self.status_label.setText(" · ".join(parts))
             return
         if self._sourcing and self._i_commanded != 0.0:
             self.status_label.setText(
@@ -747,20 +750,20 @@ class YokoPanel(QGroupBox):
     @Slot(object)
     def _apply_yoko_state(self, payload: dict) -> None:
         if "_worker_err" in payload:
-            self.current_label.setText(f"yoko poll err: {payload['_worker_err']}")
+            self._yoko_issue = f"yoko poll err: {payload['_worker_err']}"
+            self._refresh_status_label()
             return
         if "od_err" in payload:
-            self.current_label.setText(f"yoko OD err: {payload['od_err']}")
+            self._yoko_issue = f"yoko OD err: {payload['od_err']}"
+            self._refresh_status_label()
             return
 
         value = payload["value"]
         function = payload["function"]
         status = payload["status"]
 
+        issue: str | None = None
         if function == "A":
-            self.current_label.setText(
-                f"Yoko sourcing {format_engineering(value, 'A')}"
-            )
             # Implied piezo dV/dt = I / C. Small enough that the
             # operator can sanity-check the spinbox value visually.
             dvdt = value / self._C
@@ -769,17 +772,18 @@ class YokoPanel(QGroupBox):
                 self.yoko.seed_output_cache(abs(value) > OUTPUT_ON_THRESHOLD_A)
                 self._cache_seeded = True
                 self._refresh_controls()
-                self._refresh_status_label()
         else:
             # Yoko in V mode unexpectedly (e.g. someone hit the
-            # front-panel function key). Surface but don't crash.
-            self.current_label.setText(
-                f"Yoko in {function} mode (expected A): {value:+.3f}"
-            )
+            # front-panel function key). Flag it so +/− greying is
+            # explained in the status line.
             self.dvdt_label.setText("")
+            issue = f"yoko in {function} mode (expected A)"
 
         if status == "E":
-            self.current_label.setText(self.current_label.text() + " · OVERLOAD")
+            issue = (issue + " · OVERLOAD") if issue else "yoko OVERLOAD"
+
+        self._yoko_issue = issue
+        self._refresh_status_label()
 
     @Slot(object)
     def _apply_k617_state(self, payload: dict) -> None:
