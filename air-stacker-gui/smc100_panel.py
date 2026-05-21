@@ -123,9 +123,10 @@ class SMC100Panel(QGroupBox):
 
     DEFAULT_POLL_MS = 100
     # Mouse-down duration past which a jog button switches from step to
-    # continuous mode. 250 ms is comfortable for an intentional click and
-    # short enough that a hold feels responsive.
-    JOG_HOLD_MS = 250
+    # continuous mode. 500 ms matches the OS-conventional long-press feel
+    # — short enough that an intentional hold doesn't feel sluggish, long
+    # enough that a normal click never accidentally triggers continuous.
+    JOG_HOLD_MS = 500
 
     def __init__(self, cfg: dict) -> None:
         super().__init__("Z stage (SMC100)")
