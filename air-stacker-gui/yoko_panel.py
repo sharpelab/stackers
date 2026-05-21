@@ -32,7 +32,7 @@ import threading
 import time
 from typing import Callable
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
@@ -270,7 +270,7 @@ class YokoPanel(QGroupBox):
     DEFAULT_POLL_MS = 1000
 
     def __init__(self, cfg: dict) -> None:
-        super().__init__("Fine Z (Yoko 7651 → NPM140) [CC]")
+        super().__init__("Yoko (fine Z)")
 
         # --- config ---------------------------------------------------------
         self._yoko_poll_s = (
@@ -345,6 +345,9 @@ class YokoPanel(QGroupBox):
         # which is fine because the hard trip is the backstop.
         self._sourcing: bool = False
         self._i_commanded: float = 0.0
+        # Surface 617 problems (wrong mode, comm error, overflow) in
+        # the main status_label rather than a dedicated row. None = OK.
+        self._k617_issue: str | None = None
 
         self._yoko_poll_worker: _YokoPollWorker | None = None
         self._yoko_poll_thread: QThread | None = None
@@ -369,7 +372,7 @@ class YokoPanel(QGroupBox):
         v_font.setFamily("monospace")
         self.voltage_label.setFont(v_font)
         self.travel_label = QLabel("")
-        self.travel_label.setStyleSheet("color: #888;")
+        self.travel_label.setStyleSheet("color: #888; font-size: 8pt;")
 
         # Yoko I sourcing readout — secondary, formatted A.
         self.current_label = QLabel("—")
@@ -377,26 +380,31 @@ class YokoPanel(QGroupBox):
         self.dvdt_label = QLabel("")
         self.dvdt_label.setStyleSheet("color: #888;")
 
-        # 617 mode + status — surfaces a front-panel function-knob bump.
-        self.k617_status_label = QLabel("")
-        self.k617_status_label.setStyleSheet("color: #888;")
 
-        # Signed-current input in µA, range covers both directions of
-        # max_speed_a. Default 0 so a Start at panel-open is a noop.
+        # Unsigned current magnitude in µA. Sign comes from which
+        # direction button the operator presses (+ vs −); the spinbox
+        # itself never goes negative. Default 0 so a stray + or −
+        # click at panel-open is a noop.
         self.current_spin = QDoubleSpinBox()
         self.current_spin.setKeyboardTracking(False)
+        # ClickFocus — typeable when explicitly clicked, but stays out
+        # of tab order so Qt's auto-focus-routing (e.g. when another
+        # focused widget elsewhere is dismissed) doesn't land here.
+        self.current_spin.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.current_spin.setDecimals(3)
         self.current_spin.setSingleStep(0.5)
         self.current_spin.setSuffix(" µA")
-        self.current_spin.setRange(
-            -self._max_speed_a * 1e6, +self._max_speed_a * 1e6
-        )
+        self.current_spin.setRange(0.0, self._max_speed_a * 1e6)
         self.current_spin.setValue(0.0)
-        self.start_btn = action_button("Start")
 
-        # STOP — top-right red panic-cum-stop. set_current(0) on click,
-        # always live (only way out of any sourcing or tripped state
-        # short of Acknowledge).
+        # Direction buttons: + sources +I (V rises), − sources −I (V
+        # falls). Clicking the opposite direction while sourcing flips
+        # I without needing to Stop first — live reversal.
+        self.up_btn = action_button("+")
+        self.down_btn = action_button("−")
+
+        # Stop — red, always-live halt. set_current(0) on click; works
+        # even when not nominally sourcing (idempotent safety net).
         self.stop_btn = action_button("Stop")
         self.stop_btn.setStyleSheet(
             "QPushButton { background-color: #c0392b; color: white; "
@@ -455,11 +463,10 @@ class YokoPanel(QGroupBox):
                 self.keithley.open()
             except _K617_ERRORS as e:
                 log.warning("keithley617 open failed: %s", e)
-                self.k617_status_label.setText(f"617 open failed: {e}")
+                self._k617_issue = f"617 open failed: {e}"
                 self.keithley = None
 
         if self.keithley is not None:
-            self.k617_status_label.setText(f"617 @ {self.keithley.resource}")
             self._k617_thread = QThread()
             self._k617_worker = _KeithleyWatchdogWorker(
                 self.keithley,
@@ -477,10 +484,6 @@ class YokoPanel(QGroupBox):
             self._k617_worker.tripped.connect(self._on_tripped)
             self._k617_worker.finished.connect(self._k617_thread.quit)
             self._k617_thread.start()
-        else:
-            self.k617_status_label.setText(
-                "no 617 configured — Enable/Start disabled (no V feedback)"
-            )
 
         self._refresh_controls()
         self._refresh_status_label()
@@ -492,7 +495,7 @@ class YokoPanel(QGroupBox):
 
         status_row = QHBoxLayout()
         status_row.addWidget(self.status_label, stretch=1)
-        status_row.addWidget(self.stop_btn)
+        status_row.addWidget(self.enable_btn)
         outer.addLayout(status_row)
 
         trip_row = QHBoxLayout()
@@ -509,33 +512,28 @@ class YokoPanel(QGroupBox):
         outer.addWidget(self.travel_label)
         outer.addWidget(self.current_label)
         outer.addWidget(self.dvdt_label)
-        outer.addWidget(self.k617_status_label)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
         sep2.setFrameShadow(QFrame.Shadow.Sunken)
         outer.addWidget(sep2)
 
-        source_row = QHBoxLayout()
-        source_row.addWidget(QLabel("Current:"))
-        source_row.addWidget(self.current_spin, stretch=1)
-        source_row.addWidget(self.start_btn)
-        outer.addLayout(source_row)
+        current_row = QHBoxLayout()
+        current_row.addWidget(QLabel("Current:"))
+        current_row.addWidget(self.current_spin, stretch=1)
+        outer.addLayout(current_row)
 
-        sep3 = QFrame()
-        sep3.setFrameShape(QFrame.Shape.HLine)
-        sep3.setFrameShadow(QFrame.Shadow.Sunken)
-        outer.addWidget(sep3)
-
-        action_row = QHBoxLayout()
-        action_row.addWidget(self.enable_btn)
-        action_row.addStretch(1)
-        outer.addLayout(action_row)
+        button_row = QHBoxLayout()
+        button_row.addWidget(self.up_btn, stretch=1)
+        button_row.addWidget(self.down_btn, stretch=1)
+        button_row.addWidget(self.stop_btn, stretch=1)
+        outer.addLayout(button_row)
 
         outer.addStretch(1)
 
     def _wire_signals(self) -> None:
-        self.start_btn.clicked.connect(self._on_start)
+        self.up_btn.clicked.connect(lambda: self._on_source(+1))
+        self.down_btn.clicked.connect(lambda: self._on_source(-1))
         self.stop_btn.clicked.connect(self._on_stop)
         self.enable_btn.clicked.connect(self._on_enable)
         self.trip_ack_btn.clicked.connect(self._on_trip_ack)
@@ -582,16 +580,22 @@ class YokoPanel(QGroupBox):
         self._refresh_status_label()
         self._refresh_controls()
 
-    def _on_start(self) -> None:
+    def _on_source(self, direction: int) -> None:
+        """Apply current at the spinbox magnitude with the given sign.
+
+        Called by the + and − buttons. Clicking the opposite direction
+        while sourcing flips I without needing Stop first.
+        """
         if not self._ready_to_source():
             self.status_label.setText(
-                "can't start — no fresh 617 DCV reading inside hard limits"
+                "can't source — no fresh 617 DCV reading inside hard limits"
             )
             return
         if self.yoko.cached_output_on is not True:
-            self.status_label.setText("can't start — output is OFF (Enable first)")
+            self.status_label.setText("can't source — output is OFF (Enable first)")
             return
-        i_a = self.current_spin.value() * 1e-6
+        magnitude_a = self.current_spin.value() * 1e-6
+        i_a = direction * magnitude_a
         # Refuse up-front if the requested I would immediately trip
         # the predictive floor — better UX than letting the watchdog
         # fire on the next cycle and forcing an Acknowledge.
@@ -601,18 +605,18 @@ class YokoPanel(QGroupBox):
             v_pred = v + i_a * lookahead / self._C
             if v_pred < self._soft_limits[0]:
                 self.status_label.setText(
-                    f"refused: I={i_a*1e6:+.2f}µA from V={v:+.3f} would breach "
-                    f"floor (v_pred={v_pred:+.3f}); pick a smaller |I|"
+                    f"refused: −{magnitude_a*1e6:.2f}µA from V={v:+.3f} would "
+                    f"breach floor (v_pred={v_pred:+.3f}); pick a smaller |I|"
                 )
                 return
         self._safe(self.yoko.set_current, i_a)
         self._sourcing = True
         self._i_commanded = i_a
-        if i_a == 0.0:
+        if magnitude_a == 0.0:
             self.status_label.setText("sourcing 0 µA (idle)")
         else:
             self.status_label.setText(f"sourcing {i_a*1e6:+.3f} µA")
-        log.info("yoko: start sourcing I=%+.3fµA  V=%s", i_a * 1e6,
+        log.info("yoko: source I=%+.3fµA  V=%s", i_a * 1e6,
                  f"{v:+.3f}" if v is not None else "?")
         self._refresh_controls()
 
@@ -661,7 +665,12 @@ class YokoPanel(QGroupBox):
             self.status_label.setText("TRIPPED — see banner")
             return
         if self.keithley is None:
-            self.status_label.setText("no 617 — display only")
+            self.status_label.setText(
+                self._k617_issue or "no 617 — display only"
+            )
+            return
+        if self._k617_issue:
+            self.status_label.setText(self._k617_issue)
             return
         if self._sourcing and self._i_commanded != 0.0:
             self.status_label.setText(
@@ -677,31 +686,42 @@ class YokoPanel(QGroupBox):
             self.status_label.setText("OUTPUT OFF")
 
     def _refresh_controls(self) -> None:
-        """Sync Enable / Start enabled state. Stop and Acknowledge always live."""
+        """Sync Enable / +/− / Stop enabled state. Stop is live iff sourcing.
+        Acknowledge always live (visibility controlled separately)."""
+        # Stop is only meaningful while sourcing — when idle it has
+        # nothing to halt. Watchdog already cleared _sourcing on trip,
+        # so this also disables Stop in the tripped state (Acknowledge
+        # is the action there).
+        self.stop_btn.setEnabled(self._sourcing)
+
         if self._tripped:
             self.enable_btn.setEnabled(False)
-            self.start_btn.setEnabled(False)
+            self.up_btn.setEnabled(False)
+            self.down_btn.setEnabled(False)
             return
 
         ready = self._ready_to_source()
         state = self.yoko.cached_output_on
 
         if not ready or state is None:
-            # 617 missing / not in DCV / stale → can't enable, can't start.
+            # 617 missing / not in DCV / stale → can't enable, can't source.
             self.enable_btn.setEnabled(False)
-            self.start_btn.setEnabled(False)
+            self.up_btn.setEnabled(False)
+            self.down_btn.setEnabled(False)
             return
 
         if state:
-            # Output on. Enable redundant; Start always live so the
-            # operator can re-apply a new current mid-session without
-            # toggling Stop first.
+            # Output on. Enable redundant; both direction buttons live
+            # so the operator can re-apply with a new magnitude or
+            # flip direction without going through Stop first.
             self.enable_btn.setEnabled(False)
-            self.start_btn.setEnabled(True)
+            self.up_btn.setEnabled(True)
+            self.down_btn.setEnabled(True)
         else:
-            # Output off. Need Enable before Start makes sense.
+            # Output off. Need Enable before sourcing makes sense.
             self.enable_btn.setEnabled(True)
-            self.start_btn.setEnabled(False)
+            self.up_btn.setEnabled(False)
+            self.down_btn.setEnabled(False)
 
     def _safe(self, fn, *args) -> None:
         name = getattr(fn, "__name__", repr(fn))
@@ -716,7 +736,8 @@ class YokoPanel(QGroupBox):
         """Used at startup when open() failed."""
         for w in (
             self.current_spin,
-            self.start_btn,
+            self.up_btn,
+            self.down_btn,
             self.enable_btn,
         ):
             w.setEnabled(enabled)
@@ -763,11 +784,13 @@ class YokoPanel(QGroupBox):
     @Slot(object)
     def _apply_k617_state(self, payload: dict) -> None:
         if "_worker_err" in payload:
-            self.k617_status_label.setText(f"617 poll err: {payload['_worker_err']}")
+            self._k617_issue = f"617 poll err: {payload['_worker_err']}"
+            self._refresh_status_label()
             return
         if "k617_err" in payload:
             self.voltage_label.setText("—")
-            self.k617_status_label.setText(f"617 err: {payload['k617_err']}")
+            self._k617_issue = f"617 err: {payload['k617_err']}"
+            self._refresh_status_label()
             self._refresh_controls()
             return
 
@@ -780,17 +803,19 @@ class YokoPanel(QGroupBox):
             self.voltage_label.setText(format_engineering(value, "V"))
             travel_um = value * self._nm_per_volt / 1000.0
             self.travel_label.setText(f"≈ {travel_um:+.2f} µm extension")
-            suffix = f"617 · {function}"
+            issue: str | None = None
         else:
-            # Wrong-mode display: still show the reading but with the
-            # function suffix so it's obvious why Start is greyed.
+            # Wrong mode — still show reading but flag the problem so
+            # the operator knows why +/− are greyed.
             self.voltage_label.setText(format_engineering(value, unit))
             self.travel_label.setText("")
-            suffix = f"617 · {function} (need DCV for control)"
+            issue = f"617 in {function} (need DCV for control)"
 
         if status != "N":
-            suffix += " · OVERFLOW"
-        self.k617_status_label.setText(suffix)
+            issue = (issue + " · OVERFLOW") if issue else "617 · OVERFLOW"
+
+        self._k617_issue = issue
+        self._refresh_status_label()
         self._refresh_controls()
 
     # --- shutdown -----------------------------------------------------------
