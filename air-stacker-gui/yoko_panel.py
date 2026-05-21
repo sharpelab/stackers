@@ -1,23 +1,41 @@
-"""PySide6 panel for the Yokogawa 7651 driving the NPM140 fine-Z piezo
-as an operator-driven constant-current source.
+"""PySide6 panel for the Yokogawa 7651 driving the NPM140 fine-Z piezo.
 
-Operator workflow: type a signed current in the Current spinbox, press
-Start to source it, watch the live V trace from the Keithley 617, press
-Stop to drop I to 0. There is no closed-loop "move to target voltage"
-— the operator IS the loop. This sidesteps the Yoko's ~0.6 s output
-settling lag and the NPM140's nonlinear V-dependent leakage, both of
-which made the prior auto-Move unstable. See
-YOKO_CONTROL_INVESTIGATION.md for the diagnostic series.
+Two operator modes share the same hardware path:
+
+  * **Constant-I** (+/− buttons): pick a magnitude on the Current
+    slider, press + or − to source ±I. Fire-and-forget; Stop drops I
+    to 0. Operator-IS-the-loop pattern — no closed loop, no overshoot
+    surprises.
+
+  * **Target-tracking** (drag on travel bar): drag the marker to set
+    a target voltage. A GUI-thread P-law controller runs every fresh
+    617 reading: ``i_cmd = clip(K · err, ±i_slider)`` with
+    ``K = C / τ`` so an unclipped command would zero the error in one
+    Yoko settling time. Target persists past drag-release into a
+    Holding state where the same controller corrects against drift
+    (steady-state ``|err| ≈ I_leak / K``). Slider value acts as a
+    max-speed cap in both Tracking and Holding. Quantizes i_cmd to
+    the Yoko's 100 nA resolution — sub-step values round to 0, giving
+    a ~15 mV deadband for free.
+
+The two modes are mutually exclusive: +/− cancels any active target;
+dragging on the bar cancels constant-I. Stop tears down whichever is
+active. Compared to the prior closed-loop auto-Move that was ripped
+out in `61f785b`, the K = C/τ gain deliberately under-damps the
+high-bandwidth tracking that oscillated against V-dependent leakage —
+see YOKO_CONTROL_INVESTIGATION.md for the diagnostic series.
 
 Safety: the NPM140's −20 V hard floor has no hardware-side protection
-(the Yoko can swing to −30 V). Two safety layers run on the 617 poll
+(the Yoko can swing to −30 V); the +30 V ceiling is hardware-bounded
+by the Yoko's compliance. Two safety layers run on the 617 poll
 thread:
   - **Hard trip** (reactive): V already outside [hard_lo, hard_hi].
-    Always armed.
-  - **Predictive trip** (proactive): only fires while sourcing — if
+    Always armed; symmetric on both ends.
+  - **Predictive trip** (proactive, floor-side only): if
     ``v + i_commanded · (dt + slack) / C`` would cross the soft
-    floor, kill the source one cycle early. This is the working
-    envelope; the operator hits it before the hard trip ever fires.
+    floor while sourcing negative, kill the source one cycle early.
+    No ceiling-side predictor — the Yoko's compliance clamps before
+    NPM140 damage.
 Both call ``set_current(0)`` and latch a "TRIPPED" state the operator
 must Acknowledge. Start is gated on a fresh DCV reading inside hard
 limits, so a 617 comm loss can't trick us into sourcing blind.
@@ -33,10 +51,18 @@ import threading
 import time
 from typing import Callable
 
-from PySide6.QtCore import QObject, QPointF, Qt, QThread, Signal, Slot
+from PySide6.QtCore import (
+    QEventLoop,
+    QObject,
+    QPointF,
+    Qt,
+    QThread,
+    QTimer,
+    Signal,
+    Slot,
+)
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
-    QApplication,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -66,7 +92,10 @@ log = logging.getLogger("airstacker.yoko")
 DEFAULT_NM_PER_VOLT = 140_000.0 / 150.0  # ≈ 933.33
 
 # Defaults — see config.toml for the documented rationale.
-DEFAULT_CAPACITANCE_UF = 1.7
+# DEFAULT_CAPACITANCE_UF is the measured NPM140 value (Probe 2 in
+# YOKO_CONTROL_INVESTIGATION.md, 2026-05-11), not the datasheet 1.7 µF.
+# Sets the controller gain K = C / τ; an off-by-X% here biases settling.
+DEFAULT_CAPACITANCE_UF = 2.0
 DEFAULT_SPEED_A = 2.5e-6
 DEFAULT_MAX_SPEED_A = 5e-6
 DEFAULT_SAFETY_MARGIN_V = 1.5
@@ -81,12 +110,13 @@ KEITHLEY_CONVERSION_S = 0.333
 # read and a GUI-thread Start.
 PREDICT_SLACK_S = 0.1
 
-# Time between "we send set_current(0)" and "I has actually decayed
-# to ~0 on the Yoko". From the YOKO_CONTROL_INVESTIGATION.md probe
-# series; the Yoko 7651's output stage settles with τ ≈ 0.6 s. Used
-# only by the shutdown ramp to predict where V will land *after* we
-# stop sourcing — without it the open-loop ramp overshoots zero by
-# i · τ / C (~1.5 V at 5 µA on 2 µF).
+# Yoko 7651 output settling lag — time between sending set_current(X)
+# and I actually reaching X on the unit. From Probe 3b in
+# YOKO_CONTROL_INVESTIGATION.md (~0.6 s first-order). Two roles:
+#   * Controller gain: K = C / YOKO_SETTLE_S so an unclipped P command
+#     would zero the error in one τ.
+#   * Shutdown overshoot prediction: V keeps moving at the old i for
+#     ~τ after set_current(0), so v_after_stop = v + i · τ / C.
 YOKO_SETTLE_S = 0.6
 
 # "Output is on" inference threshold on the Yoko's OD; reading in I
@@ -94,6 +124,25 @@ YOKO_SETTLE_S = 0.6
 # programmed current; anything above this magnitude is definitely
 # sourcing into a load.
 OUTPUT_ON_THRESHOLD_A = 10e-9  # 10 nA
+
+# Yoko 7651 1 mA range programming resolution. The target-mode
+# controller quantizes i_cmd to this step to skip bus traffic for
+# sub-resolution changes (the Yoko would round anyway). Also acts as
+# a natural deadband: at K = C/τ ≈ 3.3 µA/V into 2 µF, |err| < ~15 mV
+# rounds to i_cmd = 0.
+YOKO_I_RESOLUTION_A = 100e-9
+
+
+def _predict_v_one_cycle(v: float, i_a: float, capacitance_f: float) -> float:
+    """Project V one 617 conversion + slack ahead at constant i_a.
+
+    Single source of truth for the soft-floor predictive trip: the
+    watchdog (worker thread), +/− refusal (GUI thread), and target
+    controller (GUI thread) all use this same lookahead. The window
+    covers one 617 conversion (333 ms) plus PREDICT_SLACK_S for
+    _latest staleness + GUI scheduling jitter.
+    """
+    return v + i_a * (KEITHLEY_CONVERSION_S + PREDICT_SLACK_S) / capacitance_f
 
 
 class _LatestReading:
@@ -120,12 +169,6 @@ class _LatestReading:
             if self._value is None:
                 return (None, None, float("inf"))
             return (self._value, self._function, time.monotonic() - self._timestamp)
-
-    def invalidate(self) -> None:
-        with self._lock:
-            self._value = None
-            self._function = None
-            self._timestamp = 0.0
 
 
 class _YokoPollWorker(QObject):
@@ -197,7 +240,7 @@ class _KeithleyWatchdogWorker(QObject):
         soft_floor: float,
         capacitance_f: float,
         poll_interval_s: float,
-        get_source_state: Callable[[], tuple[bool, float]],
+        get_commanded_current: Callable[[], float],
     ) -> None:
         super().__init__()
         self._k = keithley
@@ -207,7 +250,7 @@ class _KeithleyWatchdogWorker(QObject):
         self._soft_floor = soft_floor
         self._C = capacitance_f
         self._interval = poll_interval_s
-        self._get_source_state = get_source_state
+        self._get_commanded_current = get_commanded_current
         self._stop_event = threading.Event()
         self._tripped = False
 
@@ -238,10 +281,11 @@ class _KeithleyWatchdogWorker(QObject):
                             # is the damage threshold; the Yoko's
                             # +30 V ceiling is hardware-bounded so no
                             # ceiling-side predictor.
-                            sourcing, i_cmd = self._get_source_state()
-                            if sourcing and i_cmd < 0:
-                                lookahead = KEITHLEY_CONVERSION_S + PREDICT_SLACK_S
-                                v_pred = r.value + i_cmd * lookahead / self._C
+                            i_cmd = self._get_commanded_current()
+                            if i_cmd < 0:
+                                v_pred = _predict_v_one_cycle(
+                                    r.value, i_cmd, self._C,
+                                )
                                 if v_pred < self._soft_floor:
                                     self._fire_trip(
                                         f"v_pred {v_pred:+.3f} V would breach "
@@ -280,14 +324,28 @@ class _TravelBar(QWidget):
     """Horizontal scale showing piezo V within the hard limits.
 
     Three labeled ticks (hard_lo, 0, hard_hi — typically −20, 0, +30)
-    with a circle marker at the current V. Marker is blue in the safe
+    with a filled circle at the current V. Marker is blue in the safe
     zone, red when within ``safety_margin`` of either hard limit —
     visual preview of the predictive trip zone.
+
+    Click-and-drag on the bar to set a target voltage; the bar paints a
+    hollow ring at the target. ``target_changed`` fires continuously
+    during the drag and the target persists past mouse release (so the
+    panel's P-law controller can hold there). ``target_cleared`` fires
+    when an external caller (Stop / +-/− / trip) clears the target.
+    Targets are clamped to the soft limits so the operator can't aim
+    into the predictive-trip zone.
     """
 
     _AXIS = "#888"
     _MARKER = "#3498db"
     _MARKER_WARN = "#c0392b"
+    _TARGET = "#2c3e50"
+    _TARGET_DRAG = "#5dade2"
+
+    target_changed = Signal(float)
+    target_cleared = Signal()
+    drag_released = Signal()
 
     def __init__(
         self,
@@ -300,12 +358,77 @@ class _TravelBar(QWidget):
         self._hi = hard_hi
         self._margin = safety_margin
         self._v: float | None = None
+        self._target: float | None = None
+        self._dragging: bool = False
         self.setMinimumHeight(34)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_voltage(self, v: float | None) -> None:
         if v != self._v:
             self._v = v
             self.update()
+
+    def set_target(self, v: float | None) -> None:
+        """External setter — Stop / +/− / trip use this to clear the
+        target (passing None). Emits ``target_cleared`` on None,
+        ``target_changed`` otherwise. Idempotent."""
+        if v == self._target:
+            return
+        self._target = v
+        self.update()
+        if v is None:
+            self.target_cleared.emit()
+        else:
+            self.target_changed.emit(v)
+
+    @property
+    def target(self) -> float | None:
+        return self._target
+
+    @property
+    def is_dragging(self) -> bool:
+        return self._dragging
+
+    def _x_to_v(self, x: float) -> float:
+        pad_x = 18.0
+        x_lo = pad_x
+        x_hi = self.width() - pad_x
+        span = self._hi - self._lo
+        if x_hi <= x_lo:
+            return self._lo
+        return self._lo + (x - x_lo) / (x_hi - x_lo) * span
+
+    def _clamp_target(self, v: float) -> float:
+        # Clamp to soft limits — predictive trip would catch anything
+        # past, so don't let the operator command into that zone.
+        soft_lo = self._lo + self._margin
+        soft_hi = self._hi - self._margin
+        return max(soft_lo, min(soft_hi, v))
+
+    def mousePressEvent(self, ev) -> None:  # noqa: N802 — Qt override
+        if ev.button() != Qt.MouseButton.LeftButton:
+            return
+        self._dragging = True
+        v = self._clamp_target(self._x_to_v(ev.position().x()))
+        self._target = v
+        self.target_changed.emit(v)
+        self.update()
+
+    def mouseMoveEvent(self, ev) -> None:  # noqa: N802 — Qt override
+        if not self._dragging:
+            return
+        v = self._clamp_target(self._x_to_v(ev.position().x()))
+        if v != self._target:
+            self._target = v
+            self.target_changed.emit(v)
+            self.update()
+
+    def mouseReleaseEvent(self, ev) -> None:  # noqa: N802 — Qt override
+        if not self._dragging or ev.button() != Qt.MouseButton.LeftButton:
+            return
+        self._dragging = False
+        self.drag_released.emit()
+        self.update()  # repaint to switch ghost → locked target style
 
     def paintEvent(self, _event) -> None:  # noqa: N802 — Qt override
         p = QPainter(self)
@@ -342,7 +465,16 @@ class _TravelBar(QWidget):
             tw = fm.horizontalAdvance(label)
             p.drawText(QPointF(x - tw / 2, bar_y + 18), label)
 
-        # Position marker
+        # Target marker (hollow ring) — paint under the V marker so the
+        # current position is always on top when they overlap.
+        if self._target is not None:
+            x = v_to_x(self._target)
+            color = QColor(self._TARGET_DRAG if self._dragging else self._TARGET)
+            p.setPen(QPen(color, 1.5))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QPointF(x, bar_y), 7.0, 7.0)
+
+        # Position marker (filled, current V)
         if self._v is not None:
             v_clamped = max(self._lo, min(self._hi, self._v))
             x = v_to_x(v_clamped)
@@ -566,13 +698,24 @@ class YokoPanel(QGroupBox):
         self._tripped: bool = False
         self._trip_reason: str | None = None
         self._cache_seeded = False  # for the Yoko I cache
-        # Sourcing state — read from the watchdog thread by
-        # _get_source_state for the predictive trip. Plain attribute
-        # reads are atomic under the GIL; the watchdog could observe a
-        # one-cycle-old (sourcing, i) pair across a GUI-thread update,
-        # which is fine because the hard trip is the backstop.
-        self._sourcing: bool = False
+        # Last commanded current. Read from the watchdog thread by
+        # _get_commanded_current for the predictive trip. Plain float
+        # reads are atomic under the GIL; the watchdog could observe
+        # a one-cycle-old value across a GUI-thread update, which is
+        # fine because the hard trip is the backstop. ``!= 0`` is the
+        # canonical "we're asking the Yoko to source" check (Stop
+        # button enable, status label, shutdown step 1).
         self._i_commanded: float = 0.0
+        # Target-mode setpoint. While not None, the controller (see
+        # _controller_tick) drives V toward this value at every fresh
+        # 617 reading. Set by drag on travel_bar; cleared by Stop /
+        # +/− / trip / shutdown.
+        self._target_v: float | None = None
+        # During shutdown, _drive_to_zero_for_shutdown reuses the same
+        # target controller but overrides the slider cap with
+        # default_speed_a (predictable wind-down speed regardless of
+        # whatever the slider was last set to).
+        self._shutdown_active: bool = False
         # Surface instrument problems (wrong mode, comm error, overflow)
         # in the main status_label rather than a dedicated row. None = OK.
         self._k617_issue: str | None = None
@@ -703,7 +846,7 @@ class YokoPanel(QGroupBox):
                 self._soft_limits[0],
                 self._C,
                 self._k617_poll_s,
-                self._get_source_state,
+                self._get_commanded_current,
             )
             self._k617_worker.moveToThread(self._k617_thread)
             self._k617_thread.started.connect(self._k617_worker.run)
@@ -769,6 +912,9 @@ class YokoPanel(QGroupBox):
         self.stop_btn.clicked.connect(self._on_stop)
         self.enable_btn.clicked.connect(self._on_enable)
         self.trip_ack_btn.clicked.connect(self._on_trip_ack)
+        self.travel_bar.target_changed.connect(self._on_target_changed)
+        self.travel_bar.target_cleared.connect(self._on_target_cleared)
+        self.travel_bar.drag_released.connect(self._on_drag_released)
 
     # --- helpers ------------------------------------------------------------
 
@@ -795,10 +941,11 @@ class YokoPanel(QGroupBox):
         lo, hi = self._hard_limits
         return lo <= v <= hi
 
-    def _get_source_state(self) -> tuple[bool, float]:
-        """Snapshot for the watchdog's predictive trip. Called from the
-        watchdog thread, so keep it cheap and lock-free."""
-        return (self._sourcing, self._i_commanded)
+    def _get_commanded_current(self) -> float:
+        """Snapshot of the last-commanded I for the watchdog's predictive
+        trip. Called from the watchdog thread, so keep it cheap and
+        lock-free — plain attribute read is atomic under the GIL."""
+        return self._i_commanded
 
     # --- click handlers (GUI thread) ----------------------------------------
 
@@ -813,7 +960,7 @@ class YokoPanel(QGroupBox):
         self._refresh_controls()
 
     def _on_source(self, direction: int) -> None:
-        """Apply current at the spinbox magnitude with the given sign.
+        """Apply current at the slider's magnitude with the given sign.
 
         Called by the + and − buttons. Clicking the opposite direction
         while sourcing flips I without needing Stop first.
@@ -827,38 +974,48 @@ class YokoPanel(QGroupBox):
             self.status_label.setText("can't source — output is OFF (Enable first)")
             return
         magnitude_a = self.current_slider.value() * 1e-6
+        # Refuse zero magnitude — sourcing 0 µA is a no-op that would
+        # leave _i_commanded == 0 (i.e., "not sourcing") with the UI
+        # claiming we are. Use Stop for the explicit-halt semantic.
+        if magnitude_a == 0.0:
+            self.status_label.setText(
+                "refused: set a magnitude on the slider first"
+            )
+            return
         i_a = direction * magnitude_a
         # Refuse up-front if the requested I would immediately trip
         # the predictive floor — better UX than letting the watchdog
         # fire on the next cycle and forcing an Acknowledge.
         v = self._latest_v()
         if v is not None and i_a < 0:
-            lookahead = KEITHLEY_CONVERSION_S + PREDICT_SLACK_S
-            v_pred = v + i_a * lookahead / self._C
+            v_pred = _predict_v_one_cycle(v, i_a, self._C)
             if v_pred < self._soft_limits[0]:
                 self.status_label.setText(
                     f"refused: −{magnitude_a*1e6:.2f}µA from V={v:+.3f} would "
                     f"breach floor (v_pred={v_pred:+.3f}); pick a smaller |I|"
                 )
                 return
+        # Cancel any active target controller — +/− is fire-and-forget
+        # constant-I. Clearing first so a 617 tick between here and
+        # set_current can't re-fight the new direction.
+        if self._target_v is not None:
+            self.travel_bar.set_target(None)
         self._safe(self.yoko.set_current, i_a)
-        self._sourcing = True
         self._i_commanded = i_a
-        if magnitude_a == 0.0:
-            self.status_label.setText("sourcing 0 µA (idle)")
-        else:
-            self.status_label.setText(f"sourcing {i_a*1e6:+.3f} µA")
+        self.status_label.setText(f"sourcing {i_a*1e6:+.3f} µA")
         log.info("yoko: source I=%+.3fµA  V=%s", i_a * 1e6,
                  f"{v:+.3f}" if v is not None else "?")
         self._refresh_controls()
 
     def _on_stop(self) -> None:
-        # Always send set_current(0), regardless of _sourcing — Stop
+        # Always send set_current(0), regardless of _i_commanded — Stop
         # is the universal halt and should be effective even if the
         # cached state has drifted out of sync.
         self._safe(self.yoko.set_current, 0.0)
-        self._sourcing = False
         self._i_commanded = 0.0
+        # Stop also tears down any active target controller.
+        if self._target_v is not None:
+            self.travel_bar.set_target(None)
         log.info("yoko: stop (I=0)")
         self._refresh_status_label()
         self._refresh_controls()
@@ -866,7 +1023,6 @@ class YokoPanel(QGroupBox):
     def _on_trip_ack(self) -> None:
         self._tripped = False
         self._trip_reason = None
-        self._sourcing = False
         self._i_commanded = 0.0
         self.trip_label.setVisible(False)
         self.trip_ack_btn.setVisible(False)
@@ -883,12 +1039,45 @@ class YokoPanel(QGroupBox):
         self._trip_reason = reason
         # Watchdog already set I=0 on the bus; mirror in cached state
         # so a post-Acknowledge Start begins from a clean slate.
-        self._sourcing = False
         self._i_commanded = 0.0
+        # Drop any active target so the post-Ack controller doesn't
+        # immediately re-engage on whatever the operator was aiming at.
+        if self._target_v is not None:
+            self.travel_bar.set_target(None)
         self.trip_label.setText(f"TRIPPED — {reason}")
         self.trip_label.setVisible(True)
         self.trip_ack_btn.setVisible(True)
         self._refresh_controls()
+
+    # --- travel-bar drag handlers ------------------------------------------
+
+    def _on_target_changed(self, v: float) -> None:
+        """Operator dragged on the travel bar or external set_target.
+
+        Engages the controller on the next 617 tick. Same handler whether
+        the drag is in flight (Tracking) or already released (set_target
+        from code) — controller doesn't care.
+        """
+        self._target_v = v
+        self._refresh_status_label()
+        self._refresh_controls()
+
+    def _on_target_cleared(self) -> None:
+        """Travel bar's target was cleared (by external set_target(None)).
+
+        The matching set_current(0) is the caller's responsibility — this
+        slot only tears down the controller's setpoint.
+        """
+        self._target_v = None
+        self._refresh_status_label()
+        self._refresh_controls()
+
+    def _on_drag_released(self) -> None:
+        """Mouse-up after a drag. Target persists into Holding state —
+        controller keeps running. Just a status refresh to flip the
+        verb from 'Tracking' to 'Holding'.
+        """
+        self._refresh_status_label()
 
     # --- state refresh ------------------------------------------------------
 
@@ -908,7 +1097,32 @@ class YokoPanel(QGroupBox):
             parts = [s for s in (self._k617_issue, self._yoko_issue) if s]
             self.status_label.setText(" · ".join(parts))
             return
-        if self._sourcing and self._i_commanded != 0.0:
+        # Target mode (Tracking/Holding) outranks constant-I — the
+        # controller is in charge of i_commanded in this mode.
+        if self._target_v is not None:
+            v_now = self._latest_v()
+            err_txt = (
+                f"err {v_now - self._target_v:+.2f} V"
+                if v_now is not None
+                else "err ?"
+            )
+            ready = self._ready_to_source() and self.yoko.cached_output_on is True
+            if not ready:
+                self.status_label.setText(
+                    f"target {self._target_v:+.2f} V — Enable to engage"
+                )
+                return
+            if self.current_slider.value() <= 0:
+                self.status_label.setText(
+                    f"target {self._target_v:+.2f} V — set max speed on slider"
+                )
+                return
+            verb = "Tracking" if self.travel_bar.is_dragging else "Holding"
+            self.status_label.setText(
+                f"{verb} {self._target_v:+.2f} V · {err_txt}"
+            )
+            return
+        if self._i_commanded != 0.0:
             self.status_label.setText(
                 f"sourcing {self._i_commanded*1e6:+.3f} µA"
             )
@@ -922,13 +1136,18 @@ class YokoPanel(QGroupBox):
             self.status_label.setText("OUTPUT OFF")
 
     def _refresh_controls(self) -> None:
-        """Sync Enable / +/− / Stop enabled state. Stop is live iff sourcing.
-        Acknowledge always live (visibility controlled separately)."""
-        # Stop is only meaningful while sourcing — when idle it has
-        # nothing to halt. Watchdog already cleared _sourcing on trip,
-        # so this also disables Stop in the tripped state (Acknowledge
-        # is the action there).
-        self.stop_btn.setEnabled(self._sourcing)
+        """Sync Enable / +/− / Stop enabled state. Stop is live iff there's
+        something to halt — either constant-I sourcing or an active
+        target controller. Acknowledge always live (visibility controlled
+        separately)."""
+        # Stop is only meaningful when there's something to halt:
+        # either we're sourcing a non-zero I, or a target controller
+        # is engaged (which would otherwise keep ticking on its own).
+        # _on_tripped clears both _i_commanded and _target_v, so this
+        # also disables Stop in the tripped state.
+        self.stop_btn.setEnabled(
+            self._i_commanded != 0.0 or self._target_v is not None
+        )
 
         if self._tripped:
             self.enable_btn.setEnabled(False)
@@ -998,7 +1217,7 @@ class YokoPanel(QGroupBox):
         issue: str | None = None
         if function == "A":
             # Implied piezo dV/dt = I / C. Small enough that the
-            # operator can sanity-check the spinbox value visually.
+            # operator can sanity-check the slider value visually.
             dvdt = value / self._C
             self.dvdt_label.setText(f"≈ {dvdt:+.3f} V/s on {self._C * 1e6:.1f} µF")
             if not self._cache_seeded:
@@ -1017,6 +1236,57 @@ class YokoPanel(QGroupBox):
 
         self._yoko_issue = issue
         self._refresh_status_label()
+
+    def _controller_tick(self, v: float) -> None:
+        """Run one cycle of the target-mode P-law controller.
+
+        Called from _apply_k617_state on every fresh DCV reading. The
+        controller is the same in Tracking and Holding states — in
+        Tracking, _target_v is being updated live by the bar drag; in
+        Holding, _target_v is fixed and the controller drives drift
+        correction. Gain K = C / τ — picked so an unclipped command
+        would zero the error in one Yoko settling time. The slider
+        value caps |i_cmd|; the cap applies in both states.
+
+        Quantizes i_cmd to YOKO_I_RESOLUTION_A — sub-step values round
+        to 0, giving a natural deadband (~15 mV of |err| at K = C/τ
+        into 2 µF). Also gates on the same predictive-floor check
+        +/− uses, so the controller can't deepen toward the floor.
+        """
+        if self._tripped or self._target_v is None:
+            return
+        if not self._ready_to_source():
+            return
+        if self.yoko.cached_output_on is not True:
+            return  # output off — controller has no authority
+
+        error = self._target_v - v
+        K = self._C / YOKO_SETTLE_S
+        i_desired = K * error
+        if self._shutdown_active:
+            # Shutdown override — predictable wind-down speed
+            # regardless of slider position. The slider can't disable
+            # the shutdown ramp.
+            i_max = self._default_speed_a
+        else:
+            i_max = self.current_slider.value() * 1e-6
+        if i_max <= 0:
+            # Operator hasn't picked a max speed. Status label still
+            # shows the target; controller idles until the slider
+            # moves off zero.
+            i_cmd = 0.0
+        else:
+            i_cmd = max(-i_max, min(i_max, i_desired))
+        # Predictive-floor prophylactic — same check +/− does.
+        if i_cmd < 0 and _predict_v_one_cycle(v, i_cmd, self._C) < self._soft_limits[0]:
+            i_cmd = 0.0
+        # Quantize to Yoko resolution — keeps sub-step changes off
+        # the bus and gives a natural deadband from the floor.
+        i_cmd = round(i_cmd / YOKO_I_RESOLUTION_A) * YOKO_I_RESOLUTION_A
+        if i_cmd == self._i_commanded:
+            return
+        self._safe(self.yoko.set_current, i_cmd)
+        self._i_commanded = i_cmd
 
     @Slot(object)
     def _apply_k617_state(self, payload: dict) -> None:
@@ -1043,6 +1313,10 @@ class YokoPanel(QGroupBox):
             travel_um = value * self._nm_per_volt / 1000.0
             self.travel_label.setText(f"≈ {travel_um:+.2f} µm extension")
             self.travel_bar.set_voltage(value)
+            # Drive the controller off the freshest reading we have.
+            # Runs on GUI thread; Yoko._lock serializes any conflict
+            # with the watchdog's set_current(0) on trip.
+            self._controller_tick(value)
             issue: str | None = None
         else:
             # Wrong mode — still show reading but flag the problem so
@@ -1065,27 +1339,31 @@ class YokoPanel(QGroupBox):
         """Safe-shutdown protocol: leave the piezo at V ≈ 0 V, I = 0 A, relay open.
 
         Sequence:
-          1. If sourcing, drop I to 0 so the wind-down ramp starts
-             from a known state.
-          2. Block here ramping V → 0 using the watchdog's _latest, if
-             V is well off zero and we have 617 feedback.
+          1. If sourcing constant-I, drop I to 0.
+          2. Drive V → 0 by the target controller (same K = C/τ law as
+             runtime target-mode), with the slider cap overridden by
+             default_speed_a for a predictable wind-down. Skipped if V
+             is already near 0 or we don't have 617 feedback.
           3. safe_disable_current — SA0 + O0.
           4. Stop watchdog + Yoko-poll threads, close instruments.
 
-        Blocking the GUI thread is fine — the app is tearing down.
+        Returns synchronously: the GUI thread blocks on a nested
+        QEventLoop in step 2, but events keep flowing — the controller
+        runs off 617 ticks as usual and a QTimer polls the settle/dialog.
         """
         # 1. Stop sourcing if we were.
-        if self._sourcing:
+        if self._i_commanded != 0.0:
             try:
                 self.yoko.set_current(0.0)
             except _YOKO_ERRORS as e:
                 log.warning("shutdown: set_current(0) failed: %s", e)
-        self._sourcing = False
         self._i_commanded = 0.0
 
-        # 2. Ramp V → 0 if needed and we have 617 feedback. Skipped
-        # when output is already off, when we're tripped (operator
-        # acknowledges to recover), or when 617 isn't usable.
+        # 2. Drive V → 0 via the controller. Skipped when output is
+        # already off, when we're tripped (operator acknowledges to
+        # recover), or when 617 isn't usable. The modal dialog has no
+        # cancel button: aborting mid-ramp leaves the piezo at a
+        # random V which is exactly what we're trying to avoid.
         if (
             self.yoko.is_open
             and self.yoko.cached_output_on
@@ -1094,36 +1372,7 @@ class YokoPanel(QGroupBox):
         ):
             v_start = self._latest_v()
             if v_start is not None and abs(v_start) >= 0.5:
-                # Modal progress dialog — the ramp blocks the GUI
-                # thread for several seconds, and without UI feedback
-                # the operator can't tell the app from a hang. No
-                # cancel button: aborting a shutdown mid-ramp leaves
-                # the piezo at a random V which is exactly what we're
-                # trying to avoid.
-                dlg = QProgressDialog(
-                    f"Ramping V from {v_start:+.2f} V → 0 V…\n"
-                    "(Yoko 7651 + NPM140 — please wait)",
-                    "",  # cancel text (suppressed via setCancelButton below)
-                    0, 100,
-                    self.window(),
-                )
-                dlg.setWindowTitle("Shutting down Yoko")
-                dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
-                dlg.setMinimumDuration(0)  # show immediately
-                dlg.setAutoClose(False)
-                dlg.setAutoReset(False)
-                dlg.setCancelButton(None)
-                dlg.setValue(0)
-                dlg.show()
-                QApplication.processEvents()
-                try:
-                    self._shutdown_ramp_to_zero(
-                        deadline_s=60.0, dialog=dlg, v_start=v_start,
-                    )
-                except Exception as e:  # noqa: BLE001
-                    log.warning("shutdown ramp-to-zero failed: %s", e)
-                finally:
-                    dlg.close()
+                self._drive_to_zero_for_shutdown(v_start)
 
         # 3. Drop I to 0 and open the relay. Always do this if the
         # output is still on — leaves the unit in a known safe state
@@ -1152,109 +1401,99 @@ class YokoPanel(QGroupBox):
                 log.warning("keithley617 close failed: %s", e)
         self.yoko.close()
 
-    def _shutdown_ramp_to_zero(
-        self,
-        *,
-        deadline_s: float,
-        dialog: QProgressDialog | None = None,
-        v_start: float | None = None,
-    ) -> None:
-        """Block-the-GUI-thread open-loop ramp to V ≈ 0.
+    def _drive_to_zero_for_shutdown(self, v_start: float) -> None:
+        """Drive V → 0 via the target controller, with a modal dialog.
 
-        Sources ``default_speed_a`` opposite-sign of the current V until
-        V_predicted_after_stop crosses zero (or limit-breaches, or
-        deadline elapses). Predictive bail uses ``YOKO_SETTLE_S`` to
-        compensate for the τ ≈ 0.6 s settling lag — without it we'd
-        overshoot by i·τ/C.
+        Reuses the runtime target controller — same K = C/τ proportional
+        law, same predictive-floor check, same 617-tick cadence. The
+        only differences vs operator-driven target mode:
 
-        ``dialog`` is updated each iteration with the live V; pumping
-        ``QApplication.processEvents`` lets it repaint while the GUI
-        thread blocks here.
+          * ``_shutdown_active`` makes the controller use
+            ``default_speed_a`` as i_max instead of the slider.
+          * A QTimer polls the settle condition (``|v| < 50 mV`` AND
+            ``i_commanded == 0``) and updates the dialog. The poll
+            quits the nested event loop on settle or deadline.
+
+        Belt-and-suspenders cleanup: forces I=0 + clears the target
+        after the loop exits, regardless of how it exited, so step 3
+        of ``shutdown`` opens the relay onto a quiescent source.
         """
-        if v_start is None:
-            v_start = self._latest_v()
-        if v_start is None:
-            log.warning("shutdown ramp: no 617 reading — skipping ramp")
-            return
-        if abs(v_start) < 0.5:
-            return  # already at zero, nothing to do
         log.info(
-            "shutdown ramp: start V=%+.3f → 0  I=%+.2fµA  τ=%.2fs  C=%.2fµF",
-            v_start, self._default_speed_a * 1e6, YOKO_SETTLE_S, self._C * 1e6,
+            "shutdown: drive V=%+.3f → 0  i_max=%.2fµA  K=C/τ=%.2fµA/V",
+            v_start, self._default_speed_a * 1e6,
+            (self._C / YOKO_SETTLE_S) * 1e6,
         )
-        deadline = time.monotonic() + deadline_s
-        soft_lo, soft_hi = self._soft_limits
-        direction = -1 if v_start > 0 else +1
-        i_signed = direction * self._default_speed_a
-        # Where V will land if we issue set_current(0) RIGHT NOW.
-        # Accounts for Yoko output settling (τ) — V keeps moving at
-        # roughly i_signed for τ seconds after we stop sourcing.
-        overshoot_v = i_signed * YOKO_SETTLE_S / self._C
+
+        self._shutdown_active = True
+        # set_target() emits target_changed → _on_target_changed sets
+        # self._target_v = 0.0, engaging the controller on the next
+        # 617 tick. Overwrites any operator-set target (intentional —
+        # shutdown means go to 0 regardless of prior intent).
+        self.travel_bar.set_target(0.0)
+
+        dlg = QProgressDialog(
+            f"Ramping V from {v_start:+.2f} V → 0 V…\n"
+            "(Yoko 7651 + NPM140 — please wait)",
+            "",  # cancel text (suppressed via setCancelButton below)
+            0, 100,
+            self.window(),
+        )
+        dlg.setWindowTitle("Shutting down Yoko")
+        dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+        dlg.setMinimumDuration(0)  # show immediately
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.setCancelButton(None)
+        dlg.setValue(0)
+        dlg.show()
+
+        loop = QEventLoop()
+        deadline = time.monotonic() + 60.0
+        tolerance_v = 0.05
         v_start_abs = abs(v_start)
+
+        def _poll() -> None:
+            v = self._latest_v()
+            if v is not None:
+                progress = max(0, min(100, int(
+                    100 * (1.0 - abs(v) / v_start_abs)
+                )))
+                dlg.setValue(progress)
+                dlg.setLabelText(
+                    f"Ramping V → 0  ·  now {v:+.3f} V  "
+                    f"(started {v_start:+.2f} V)"
+                )
+            if (
+                v is not None
+                and abs(v) < tolerance_v
+                and self._i_commanded == 0.0
+            ):
+                log.info("shutdown: settled at v=%+.3f V", v)
+                loop.quit()
+                return
+            if time.monotonic() > deadline:
+                log.warning(
+                    "shutdown: deadline reached at v=%s",
+                    f"{v:+.3f}" if v is not None else "?",
+                )
+                loop.quit()
+                return
+
+        poll_timer = QTimer()
+        poll_timer.setInterval(200)
+        poll_timer.timeout.connect(_poll)
+        poll_timer.start()
+        loop.exec()
+        poll_timer.stop()
+
+        # Teardown. Clear the controller target + force I=0 so step 3
+        # opens the relay onto a quiescent source (the controller
+        # could otherwise have just commanded a small non-zero I).
+        self.travel_bar.set_target(None)
+        self._shutdown_active = False
         try:
-            self.yoko.set_current(i_signed)
+            self.yoko.set_current(0.0)
         except _YOKO_ERRORS as e:
-            log.warning("shutdown ramp: set_current failed: %s", e)
-            return
-        try:
-            iter_n = 0
-            while time.monotonic() < deadline:
-                iter_n += 1
-                v, func, age = self._latest.read()
-                if v is None or func != "DCV" or age > self._stale_s:
-                    log.warning(
-                        "shutdown ramp: stale/missing 617 (age=%s, func=%s) — bailing",
-                        age, func,
-                    )
-                    break
-                # Predictive bail on soft limits — keeps shutdown from
-                # accidentally tripping the predictive watchdog.
-                next_v_pred = v + i_signed * (
-                    KEITHLEY_CONVERSION_S + PREDICT_SLACK_S
-                ) / self._C
-                if next_v_pred < soft_lo or next_v_pred > soft_hi:
-                    log.info(
-                        "shutdown ramp: next V_pred=%+.3f outside soft limits — bailing",
-                        next_v_pred,
-                    )
-                    break
-                # Zero-crossing predictive bail — stop sourcing when the
-                # post-settle V (v + overshoot) will be on the far side
-                # of zero. Lands V near 0 instead of overshooting by τ.
-                v_after_stop = v + overshoot_v
-                if direction > 0 and v_after_stop >= 0:
-                    log.info(
-                        "shutdown ramp: bail at iter %d  v=%+.3f  v_after_stop=%+.3f",
-                        iter_n, v, v_after_stop,
-                    )
-                    break
-                if direction < 0 and v_after_stop <= 0:
-                    log.info(
-                        "shutdown ramp: bail at iter %d  v=%+.3f  v_after_stop=%+.3f",
-                        iter_n, v, v_after_stop,
-                    )
-                    break
-                # Refresh dialog so the operator sees progress (and the
-                # GUI doesn't look like it's hung).
-                if dialog is not None:
-                    progress = max(0, min(100, int(
-                        100 * (1.0 - abs(v) / v_start_abs)
-                    )))
-                    dialog.setValue(progress)
-                    dialog.setLabelText(
-                        f"Ramping V → 0  ·  now {v:+.3f} V  "
-                        f"(started {v_start:+.2f} V)"
-                    )
-                QApplication.processEvents()
-                time.sleep(KEITHLEY_CONVERSION_S)
-        finally:
-            try:
-                self.yoko.set_current(0.0)
-            except _YOKO_ERRORS as e:
-                log.warning("shutdown ramp: final set_current(0) failed: %s", e)
-            v_final = self._latest_v()
-            log.info(
-                "shutdown ramp: done after %d iters  v_final=%s",
-                iter_n,
-                f"{v_final:+.3f}" if v_final is not None else "?",
-            )
+            log.warning("shutdown: final set_current(0) failed: %s", e)
+        self._i_commanded = 0.0
+        dlg.close()
