@@ -370,7 +370,7 @@ class Yoko7651:
             raise YokoError(f"voltage {value} V out of range {self._voltage_limits}")
         if self._mode_cache != "V":
             self.set_mode("V")
-        self._write(f"SA{value:+.6f};E")
+        self._write(f"SA{value:+.9f};E")
         self._voltage_cache = value
 
     def set_current(self, value: float) -> None:
@@ -379,7 +379,7 @@ class Yoko7651:
             raise YokoError(f"current {value} A out of range {self._current_limits}")
         if self._mode_cache != "A":
             self.set_mode("A")
-        self._write(f"SA{value:+.6f};E")
+        self._write(f"SA{value:+.9f};E")
         self._current_cache = value
 
     def set_output(self, on: bool) -> None:
