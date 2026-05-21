@@ -103,11 +103,13 @@ poll_interval_ms = 1000
 piezo_capacitance_uf = 2.0
 
 # Speed used by the on-close shutdown ramp (open-loop, sources
-# default_speed_a opposite-sign of current V until V crosses zero).
-# 5 µA on 2 µF = 2.5 V/s, so a worst-case 30 V wind-down takes ~12 s.
-# The operator-facing Start uses the Current spinbox directly,
-# bounded by [-max_speed_a, +max_speed_a].
-default_speed_a = 5e-6        # 5 µA, shutdown ramp only
+# default_speed_a opposite-sign of current V until V_after_stop
+# crosses zero — predictive bail accounts for the Yoko's τ ≈ 0.6 s
+# settling lag, see YOKO_SETTLE_S in yoko_panel.py). 2.5 µA on 2 µF
+# = 1.25 V/s, so a 30 V wind-down takes ~24 s. Slower gives smaller
+# residual offset from 0; the operator-facing Start uses the Current
+# spinbox directly, bounded by [-max_speed_a, +max_speed_a].
+default_speed_a = 2.5e-6      # 2.5 µA, shutdown ramp only
 max_speed_a = 20e-6           # 20 µA — Current spinbox bound. Beyond
                               # this, one 617 conversion cycle (333 ms)
                               # eats > 4 V of motion before the

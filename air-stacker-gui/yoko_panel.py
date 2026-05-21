@@ -35,11 +35,13 @@ from typing import Callable
 from PySide6.QtCore import QObject, QPointF, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
+    QApplication,
     QDoubleSpinBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
     QLabel,
+    QProgressDialog,
     QVBoxLayout,
     QWidget,
 )
@@ -64,7 +66,7 @@ DEFAULT_NM_PER_VOLT = 140_000.0 / 150.0  # ≈ 933.33
 
 # Defaults — see config.toml for the documented rationale.
 DEFAULT_CAPACITANCE_UF = 1.7
-DEFAULT_SPEED_A = 5e-6
+DEFAULT_SPEED_A = 2.5e-6
 DEFAULT_MAX_SPEED_A = 20e-6
 DEFAULT_SAFETY_MARGIN_V = 1.5
 DEFAULT_STALE_MS = 1000
@@ -77,6 +79,14 @@ KEITHLEY_CONVERSION_S = 0.333
 # Covers _latest staleness + scheduling jitter between the watchdog
 # read and a GUI-thread Start.
 PREDICT_SLACK_S = 0.1
+
+# Time between "we send set_current(0)" and "I has actually decayed
+# to ~0 on the Yoko". From the YOKO_CONTROL_INVESTIGATION.md probe
+# series; the Yoko 7651's output stage settles with τ ≈ 0.6 s. Used
+# only by the shutdown ramp to predict where V will land *after* we
+# stop sourcing — without it the open-loop ramp overshoots zero by
+# i · τ / C (~1.5 V at 5 µA on 2 µF).
+YOKO_SETTLE_S = 0.6
 
 # "Output is on" inference threshold on the Yoko's OD; reading in I
 # mode. With the relay open the unit reads near 0 A regardless of the
@@ -948,10 +958,38 @@ class YokoPanel(QGroupBox):
             and not self._tripped
             and self._k617_worker is not None
         ):
-            try:
-                self._shutdown_ramp_to_zero(deadline_s=60.0)
-            except Exception as e:  # noqa: BLE001
-                log.warning("shutdown ramp-to-zero failed: %s", e)
+            v_start = self._latest_v()
+            if v_start is not None and abs(v_start) >= 0.5:
+                # Modal progress dialog — the ramp blocks the GUI
+                # thread for several seconds, and without UI feedback
+                # the operator can't tell the app from a hang. No
+                # cancel button: aborting a shutdown mid-ramp leaves
+                # the piezo at a random V which is exactly what we're
+                # trying to avoid.
+                dlg = QProgressDialog(
+                    f"Ramping V from {v_start:+.2f} V → 0 V…\n"
+                    "(Yoko 7651 + NPM140 — please wait)",
+                    "",  # cancel text (suppressed via setCancelButton below)
+                    0, 100,
+                    self.window(),
+                )
+                dlg.setWindowTitle("Shutting down Yoko")
+                dlg.setWindowModality(Qt.WindowModality.ApplicationModal)
+                dlg.setMinimumDuration(0)  # show immediately
+                dlg.setAutoClose(False)
+                dlg.setAutoReset(False)
+                dlg.setCancelButton(None)
+                dlg.setValue(0)
+                dlg.show()
+                QApplication.processEvents()
+                try:
+                    self._shutdown_ramp_to_zero(
+                        deadline_s=60.0, dialog=dlg, v_start=v_start,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log.warning("shutdown ramp-to-zero failed: %s", e)
+                finally:
+                    dlg.close()
 
         # 3. Drop I to 0 and open the relay. Always do this if the
         # output is still on — leaves the unit in a known safe state
@@ -980,32 +1018,54 @@ class YokoPanel(QGroupBox):
                 log.warning("keithley617 close failed: %s", e)
         self.yoko.close()
 
-    def _shutdown_ramp_to_zero(self, *, deadline_s: float) -> None:
+    def _shutdown_ramp_to_zero(
+        self,
+        *,
+        deadline_s: float,
+        dialog: QProgressDialog | None = None,
+        v_start: float | None = None,
+    ) -> None:
         """Block-the-GUI-thread open-loop ramp to V ≈ 0.
 
         Sources ``default_speed_a`` opposite-sign of the current V until
-        V crosses zero (or limit-breaches, or deadline elapses). No
-        predictive scale-down, no model. Settling lag + leakage cause
-        some overshoot past zero, but the watchdog's hard trip + the
-        following safe_disable_current both serve as backstops.
+        V_predicted_after_stop crosses zero (or limit-breaches, or
+        deadline elapses). Predictive bail uses ``YOKO_SETTLE_S`` to
+        compensate for the τ ≈ 0.6 s settling lag — without it we'd
+        overshoot by i·τ/C.
+
+        ``dialog`` is updated each iteration with the live V; pumping
+        ``QApplication.processEvents`` lets it repaint while the GUI
+        thread blocks here.
         """
-        v_start = self._latest_v()
+        if v_start is None:
+            v_start = self._latest_v()
         if v_start is None:
             log.warning("shutdown ramp: no 617 reading — skipping ramp")
             return
         if abs(v_start) < 0.5:
             return  # already at zero, nothing to do
+        log.info(
+            "shutdown ramp: start V=%+.3f → 0  I=%+.2fµA  τ=%.2fs  C=%.2fµF",
+            v_start, self._default_speed_a * 1e6, YOKO_SETTLE_S, self._C * 1e6,
+        )
         deadline = time.monotonic() + deadline_s
         soft_lo, soft_hi = self._soft_limits
         direction = -1 if v_start > 0 else +1
         i_signed = direction * self._default_speed_a
+        # Where V will land if we issue set_current(0) RIGHT NOW.
+        # Accounts for Yoko output settling (τ) — V keeps moving at
+        # roughly i_signed for τ seconds after we stop sourcing.
+        overshoot_v = i_signed * YOKO_SETTLE_S / self._C
+        v_start_abs = abs(v_start)
         try:
             self.yoko.set_current(i_signed)
         except _YOKO_ERRORS as e:
             log.warning("shutdown ramp: set_current failed: %s", e)
             return
         try:
+            iter_n = 0
             while time.monotonic() < deadline:
+                iter_n += 1
                 v, func, age = self._latest.read()
                 if v is None or func != "DCV" or age > self._stale_s:
                     log.warning(
@@ -1013,25 +1073,54 @@ class YokoPanel(QGroupBox):
                         age, func,
                     )
                     break
-                # Predictive bail on soft limits so we don't overshoot
-                # into the predictive-trip zone during shutdown.
-                lookahead = KEITHLEY_CONVERSION_S + PREDICT_SLACK_S
-                v_pred = v + i_signed * lookahead / self._C
-                if v_pred < soft_lo or v_pred > soft_hi:
+                # Predictive bail on soft limits — keeps shutdown from
+                # accidentally tripping the predictive watchdog.
+                next_v_pred = v + i_signed * (
+                    KEITHLEY_CONVERSION_S + PREDICT_SLACK_S
+                ) / self._C
+                if next_v_pred < soft_lo or next_v_pred > soft_hi:
                     log.info(
-                        "shutdown ramp: predicted V_pred=%+.3f outside soft "
-                        "limits — bailing", v_pred,
+                        "shutdown ramp: next V_pred=%+.3f outside soft limits — bailing",
+                        next_v_pred,
                     )
                     break
-                # Crossed zero? Stop. Sign-sensitive so we don't bail
-                # immediately if shutdown launched near zero already.
-                if direction > 0 and v >= 0:
+                # Zero-crossing predictive bail — stop sourcing when the
+                # post-settle V (v + overshoot) will be on the far side
+                # of zero. Lands V near 0 instead of overshooting by τ.
+                v_after_stop = v + overshoot_v
+                if direction > 0 and v_after_stop >= 0:
+                    log.info(
+                        "shutdown ramp: bail at iter %d  v=%+.3f  v_after_stop=%+.3f",
+                        iter_n, v, v_after_stop,
+                    )
                     break
-                if direction < 0 and v <= 0:
+                if direction < 0 and v_after_stop <= 0:
+                    log.info(
+                        "shutdown ramp: bail at iter %d  v=%+.3f  v_after_stop=%+.3f",
+                        iter_n, v, v_after_stop,
+                    )
                     break
+                # Refresh dialog so the operator sees progress (and the
+                # GUI doesn't look like it's hung).
+                if dialog is not None:
+                    progress = max(0, min(100, int(
+                        100 * (1.0 - abs(v) / v_start_abs)
+                    )))
+                    dialog.setValue(progress)
+                    dialog.setLabelText(
+                        f"Ramping V → 0  ·  now {v:+.3f} V  "
+                        f"(started {v_start:+.2f} V)"
+                    )
+                QApplication.processEvents()
                 time.sleep(KEITHLEY_CONVERSION_S)
         finally:
             try:
                 self.yoko.set_current(0.0)
             except _YOKO_ERRORS as e:
                 log.warning("shutdown ramp: final set_current(0) failed: %s", e)
+            v_final = self._latest_v()
+            log.info(
+                "shutdown ramp: done after %d iters  v_final=%s",
+                iter_n,
+                f"{v_final:+.3f}" if v_final is not None else "?",
+            )
