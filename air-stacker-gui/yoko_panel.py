@@ -32,8 +32,8 @@ import threading
 import time
 from typing import Callable
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
-from PySide6.QtGui import QFont
+from PySide6.QtCore import QObject, QPointF, Qt, QThread, Signal, Slot
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFrame,
@@ -41,6 +41,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QVBoxLayout,
+    QWidget,
 )
 
 import pyvisa.errors
@@ -264,6 +265,87 @@ class _KeithleyWatchdogWorker(QObject):
         self._stop_event.set()
 
 
+class _TravelBar(QWidget):
+    """Horizontal scale showing piezo V within the hard limits.
+
+    Three labeled ticks (hard_lo, 0, hard_hi — typically −20, 0, +30)
+    with a circle marker at the current V. Marker is blue in the safe
+    zone, red when within ``safety_margin`` of either hard limit —
+    visual preview of the predictive trip zone.
+    """
+
+    _AXIS = "#888"
+    _MARKER = "#3498db"
+    _MARKER_WARN = "#c0392b"
+
+    def __init__(
+        self,
+        hard_lo: float,
+        hard_hi: float,
+        safety_margin: float,
+    ) -> None:
+        super().__init__()
+        self._lo = hard_lo
+        self._hi = hard_hi
+        self._margin = safety_margin
+        self._v: float | None = None
+        self.setMinimumHeight(34)
+
+    def set_voltage(self, v: float | None) -> None:
+        if v != self._v:
+            self._v = v
+            self.update()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 — Qt override
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        w = self.width()
+        h = self.height()
+        pad_x = 18.0
+        bar_y = h * 0.40
+        x_lo = pad_x
+        x_hi = w - pad_x
+        span = self._hi - self._lo
+
+        def v_to_x(v: float) -> float:
+            return x_lo + (v - self._lo) / span * (x_hi - x_lo)
+
+        # Axis line
+        p.setPen(QPen(QColor(self._AXIS), 1))
+        p.drawLine(QPointF(x_lo, bar_y), QPointF(x_hi, bar_y))
+
+        # Ticks + labels at lo, 0, hi
+        font = QFont(self.font())
+        font.setPointSize(8)
+        p.setFont(font)
+        fm = QFontMetrics(font)
+        tick_half = 4.0
+        for v in (self._lo, 0.0, self._hi):
+            x = v_to_x(v)
+            p.drawLine(
+                QPointF(x, bar_y - tick_half),
+                QPointF(x, bar_y + tick_half),
+            )
+            label = f"{v:+.0f} V" if v != 0 else "0 V"
+            tw = fm.horizontalAdvance(label)
+            p.drawText(QPointF(x - tw / 2, bar_y + 18), label)
+
+        # Position marker
+        if self._v is not None:
+            v_clamped = max(self._lo, min(self._hi, self._v))
+            x = v_to_x(v_clamped)
+            soft_lo = self._lo + self._margin
+            soft_hi = self._hi - self._margin
+            color = QColor(
+                self._MARKER_WARN if (v_clamped < soft_lo or v_clamped > soft_hi)
+                else self._MARKER
+            )
+            p.setBrush(color)
+            p.setPen(QPen(color))
+            p.drawEllipse(QPointF(x, bar_y), 5.0, 5.0)
+
+
 class YokoPanel(QGroupBox):
     """Live readout + operator-driven CC source for the Yoko 7651 + NPM140."""
 
@@ -379,6 +461,12 @@ class YokoPanel(QGroupBox):
         # alive" indicator — empty when output is off.
         self.dvdt_label = QLabel("")
         self.dvdt_label.setStyleSheet("color: #888;")
+
+        # Horizontal travel scale: -20 V / 0 / +30 V (or whatever
+        # voltage_limits says) with a marker at the live V.
+        self.travel_bar = _TravelBar(
+            self._hard_limits[0], self._hard_limits[1], self._margin_v
+        )
 
 
         # Unsigned current magnitude in µA. Sign comes from which
@@ -511,6 +599,7 @@ class YokoPanel(QGroupBox):
         outer.addWidget(self.voltage_label)
         outer.addWidget(self.travel_label)
         outer.addWidget(self.dvdt_label)
+        outer.addWidget(self.travel_bar)
 
         sep2 = QFrame()
         sep2.setFrameShape(QFrame.Shape.HLine)
@@ -789,10 +878,12 @@ class YokoPanel(QGroupBox):
     def _apply_k617_state(self, payload: dict) -> None:
         if "_worker_err" in payload:
             self._k617_issue = f"617 poll err: {payload['_worker_err']}"
+            self.travel_bar.set_voltage(None)
             self._refresh_status_label()
             return
         if "k617_err" in payload:
             self.voltage_label.setText("—")
+            self.travel_bar.set_voltage(None)
             self._k617_issue = f"617 err: {payload['k617_err']}"
             self._refresh_status_label()
             self._refresh_controls()
@@ -807,12 +898,14 @@ class YokoPanel(QGroupBox):
             self.voltage_label.setText(format_engineering(value, "V"))
             travel_um = value * self._nm_per_volt / 1000.0
             self.travel_label.setText(f"≈ {travel_um:+.2f} µm extension")
+            self.travel_bar.set_voltage(value)
             issue: str | None = None
         else:
             # Wrong mode — still show reading but flag the problem so
             # the operator knows why +/− are greyed.
             self.voltage_label.setText(format_engineering(value, unit))
             self.travel_label.setText("")
+            self.travel_bar.set_voltage(None)
             issue = f"617 in {function} (need DCV for control)"
 
         if status != "N":
