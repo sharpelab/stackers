@@ -97,53 +97,32 @@ poll_interval_ms = 1000
 # NPM140 capacitance — measured 2026-05-11 by ramping V at constant
 # +1 µA and observing the slope (0.49 V/s implies C = 2.0 µF). The
 # datasheet quotes 1.7 µF ±20 %, so 2.0 sits at the high end of the
-# tolerance band but is consistent with it. Used by the closed-loop
-# Move to size the predictive scale-down (i_needed = error * C / dt);
-# the wrong value just produces a proportional gain error that the
-# next iteration corrects, but the right value gives one-shot
-# convergence.
+# tolerance band but is consistent with it. Used by the watchdog's
+# predictive floor trip (v_pred = v + i·(dt+slack)/C); the wrong
+# value under-protects against the −20 V hard limit.
 piezo_capacitance_uf = 2.0
 
-# Default sourcing current for Move/Jog. 5 µA on a 1.7 µF piezo is
-# dV/dt ≈ 2.94 V/s ≈ 2.7 µm/s — crosses the 50 V working range in
-# ~17 s, slow enough that a fat-fingered target doesn't blow past
-# the user-intended stop. Operator can adjust live via the Speed
-# spinbox within [min_speed_a, max_speed_a].
-default_speed_a = 5e-6        # 5 µA
-min_speed_a = 100e-9          # 100 nA — Yoko 1 mA range resolution floor
-max_speed_a = 20e-6           # 20 µA — beyond this, one 617 conversion
-                              # cycle (333 ms) eats > 4 V of motion before
-                              # the closed loop can react. Bump cautiously.
+# Speed used by the on-close shutdown ramp (open-loop, sources
+# default_speed_a opposite-sign of current V until V crosses zero).
+# 5 µA on 2 µF = 2.5 V/s, so a worst-case 30 V wind-down takes ~12 s.
+# The operator-facing Start uses the Current spinbox directly,
+# bounded by [-max_speed_a, +max_speed_a].
+default_speed_a = 5e-6        # 5 µA, shutdown ramp only
+max_speed_a = 20e-6           # 20 µA — Current spinbox bound. Beyond
+                              # this, one 617 conversion cycle (333 ms)
+                              # eats > 4 V of motion before the
+                              # predictive trip can intercept.
 
-# Per-click jog step (in V). Hold the +/− button past the click-vs-hold
-# threshold to switch into continuous mode at default_speed_a.
-jog_step_v = 0.1
-
-# Tolerance for "we've hit the target" in closed-loop Move (in V).
-# Must be larger than the 617's typical noise/jitter (~few mV at the
-# 200 mV range; ~tens of mV when autoranging up). Smaller → more
-# accurate but risks oscillating around target.
-move_tolerance_v = 0.05
-
-# Closed-loop conservatism. The Move worker aims to converge `error`
-# to 0 over `approach_factor` 617-conversion cycles instead of one.
-# The 617's 333 ms integrating ADC + the NPM140's ±20 % C tolerance
-# make an aggressive (k=1) one-shot solver overshoot consistently;
-# k=2 halves the corrective I and gives the loop margin to absorb the
-# model error. k=3-4 if k=2 still overshoots; k=1 reverts to the
-# original aggressive behavior.
-approach_factor = 2.0
-
-# Safety margin (in V) between the Move spinbox bounds and the
-# hard voltage_limits. Soft trip = voltage_limits ± this. Sized to
-# cover worst-case overshoot at max_speed_a (~0.8 V at 20 µA with
-# ±20 % C tolerance), with margin to spare.
+# Safety margin (in V) between the predictive-floor trip and the
+# hard voltage_limits[0]. Soft floor = voltage_limits[0] + this.
+# Sized to cover the unanticipated ΔV during one 617 conversion at
+# max_speed_a (~0.6 V at 20 µA into 2 µF with ±20 % C tolerance).
 safety_margin_v = 1.5
 
-# Watchdog: if the 617 hasn't returned a fresh reading in this long
-# while output is on, the Move/Jog worker bails and the panel trips.
-# The 617's native conversion time is 330 ms, so anything < 500 ms
-# is a real comm-loss signal.
+# Watchdog: if the 617 hasn't returned a fresh reading in this long,
+# Start refuses (no V feedback → no predictive safety). The 617's
+# native conversion time is 330 ms, so anything < 500 ms is a real
+# comm-loss signal.
 move_stale_ms = 1000
 
 # Keithley 617 electrometer across the piezo terminals (live voltage
