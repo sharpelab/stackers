@@ -28,6 +28,7 @@ Expected ``cfg`` keys — see ``config.toml`` for the documented defaults.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from typing import Callable
@@ -357,19 +358,24 @@ class _TravelBar(QWidget):
 
 
 class _CurrentTickStrip(QWidget):
-    """Tick-mark strip painted under the current slider.
+    """Tick-mark strip painted under the current slider (log axis).
 
-    Labelled ticks at the named operator-preferred values (0.5, 1.0, 2.5,
-    5.0 µA). Padding matches the QSlider handle inset so tick centers
-    line up with handle positions for those values.
+    "0" label at the far left where raw 0 == 0 µA, then the operator-
+    preferred values (0.5, 1.0, 2.5, 5.0 µA) at their log positions.
+    Padding matches the QSlider handle inset so tick centers line up
+    with handle positions.
     """
 
     _AXIS = "#888"
 
-    def __init__(self, ticks: tuple[float, ...], max_ua: float) -> None:
+    def __init__(
+        self, ticks: tuple[float, ...], min_ua: float, max_ua: float,
+    ) -> None:
         super().__init__()
         self._ticks = ticks
-        self._max_ua = max_ua
+        self._log_min = math.log10(min_ua)
+        self._log_max = math.log10(max_ua)
+        self._log_range = self._log_max - self._log_min
         self.setMinimumHeight(16)
 
     def paintEvent(self, _event) -> None:  # noqa: N802 — Qt override
@@ -389,8 +395,13 @@ class _CurrentTickStrip(QWidget):
         p.setFont(font)
         fm = QFontMetrics(font)
         p.setPen(QPen(QColor(self._AXIS), 1))
+        # "0" label at the far left — raw 0 is special-cased in
+        # _CurrentSlider as the off-state position.
+        p.drawLine(QPointF(x_lo, 0), QPointF(x_lo, 4))
+        p.drawText(QPointF(x_lo - fm.horizontalAdvance("0") / 2, 14), "0")
         for tick in self._ticks:
-            x = x_lo + tick / self._max_ua * (x_hi - x_lo)
+            frac = (math.log10(tick) - self._log_min) / self._log_range
+            x = x_lo + frac * (x_hi - x_lo)
             p.drawLine(QPointF(x, 0), QPointF(x, 4))
             label = f"{tick:g}"
             tw = fm.horizontalAdvance(label)
@@ -398,25 +409,32 @@ class _CurrentTickStrip(QWidget):
 
 
 class _CurrentSlider(QWidget):
-    """Horizontal 0 → max_ua linear slider with sticky operator ticks.
+    """Horizontal log-scale slider over [0, max_ua] with sticky ticks.
 
-    Ticks at 0.5 / 1.0 / 2.5 / 5.0 µA are visually marked on a strip
-    below the slider and are *sticky*: while dragging, if the raw
-    position falls within ``SNAP_WINDOW_UA`` of one of them, the slider
-    snaps to that tick value. The mouse must drag past the snap window
-    on the far side of the tick to escape. Tunes how easy it is to land
-    on a known speed without overshoot.
+    Raw range [0, _STEPS]:
+      - raw 0 → 0 µA (special "off" position; matches the original
+        spinbox-at-0 startup behavior — +/− with the slider here is a
+        noop).
+      - raw 1..N → log10-spaced over [MIN_NONZERO_UA, max_ua].
+
+    Snap-on-drag at the named ticks (0.5/1.0/2.5/5.0 µA) within
+    SNAP_TOLERANCE_DECADES on the log axis (≈ ±10 % of the tick value,
+    symmetric in log space). Snap windows don't overlap between ticks.
     """
 
     TICKS_UA: tuple[float, ...] = (0.5, 1.0, 2.5, 5.0)
-    SNAP_WINDOW_UA = 0.1
-    _STEPS = 1000  # 0.005 µA resolution at max_ua = 5.0
+    MIN_NONZERO_UA = 0.05  # left edge of log axis (raw 1)
+    SNAP_TOLERANCE_DECADES = 0.04  # ≈ ±10 % of tick value
+    _STEPS = 1000
 
     valueChanged = Signal(float)
 
     def __init__(self, max_ua: float) -> None:
         super().__init__()
         self._max_ua = max_ua
+        self._log_min = math.log10(self.MIN_NONZERO_UA)
+        self._log_max = math.log10(max_ua)
+        self._log_range = self._log_max - self._log_min
         ticks_in_range = tuple(t for t in self.TICKS_UA if t <= max_ua)
 
         self._slider = QSlider(Qt.Orientation.Horizontal)
@@ -429,7 +447,9 @@ class _CurrentSlider(QWidget):
         self._slider.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self._slider.valueChanged.connect(self._on_raw_changed)
 
-        self._tick_strip = _CurrentTickStrip(ticks_in_range, max_ua)
+        self._tick_strip = _CurrentTickStrip(
+            ticks_in_range, self.MIN_NONZERO_UA, max_ua,
+        )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -437,25 +457,39 @@ class _CurrentSlider(QWidget):
         layout.addWidget(self._slider)
         layout.addWidget(self._tick_strip)
 
+    def _raw_to_ua(self, raw: int) -> float:
+        if raw <= 0:
+            return 0.0
+        frac = (raw - 1) / (self._STEPS - 1)
+        return 10 ** (self._log_min + frac * self._log_range)
+
+    def _ua_to_raw(self, ua: float) -> int:
+        if ua <= 0:
+            return 0
+        ua_c = max(self.MIN_NONZERO_UA, min(self._max_ua, ua))
+        frac = (math.log10(ua_c) - self._log_min) / self._log_range
+        return 1 + int(round(frac * (self._STEPS - 1)))
+
     def _on_raw_changed(self, raw: int) -> None:
-        ua = raw / self._STEPS * self._max_ua
-        for tick in self.TICKS_UA:
-            if abs(ua - tick) <= self.SNAP_WINDOW_UA:
-                snapped_raw = round(tick / self._max_ua * self._STEPS)
-                if snapped_raw != raw:
-                    self._slider.blockSignals(True)
-                    self._slider.setValue(snapped_raw)
-                    self._slider.blockSignals(False)
-                ua = tick
-                break
+        ua = self._raw_to_ua(raw)
+        if ua > 0:
+            log_ua = math.log10(ua)
+            for tick in self.TICKS_UA:
+                if abs(log_ua - math.log10(tick)) <= self.SNAP_TOLERANCE_DECADES:
+                    snapped_raw = self._ua_to_raw(tick)
+                    if snapped_raw != raw:
+                        self._slider.blockSignals(True)
+                        self._slider.setValue(snapped_raw)
+                        self._slider.blockSignals(False)
+                    ua = tick
+                    break
         self.valueChanged.emit(ua)
 
     def value(self) -> float:
-        return self._slider.value() / self._STEPS * self._max_ua
+        return self._raw_to_ua(self._slider.value())
 
     def setValue(self, ua: float) -> None:  # noqa: N802 — Qt naming
-        clamped = max(0.0, min(self._max_ua, ua))
-        self._slider.setValue(int(round(clamped / self._max_ua * self._STEPS)))
+        self._slider.setValue(self._ua_to_raw(ua))
 
 
 class YokoPanel(QGroupBox):
