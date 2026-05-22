@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import PySpin
-from PySide6.QtCore import QObject, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QLockFile, QObject, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -72,6 +72,11 @@ ICON_PATH = Path(__file__).resolve().parent / "assets" / "icons" / "air_stacker.
 # find after a crash (vs. buried under AppData on Windows), and outside the
 # git checkout so rotated files don't pollute the working tree.
 LOG_DIR = Path.home() / "air-stacker-gui-logs"
+# Single-instance lock — sits next to the log file. QLockFile auto-removes
+# on normal exit and detects dead-PID staleness on its own; if the GUI was
+# SIGKILL'd or the host rebooted with the file still present, the operator
+# can delete it manually (it's listed in the "already running" dialog).
+LOCK_PATH = LOG_DIR / ".air-stacker-gui.lock"
 
 log = logging.getLogger("airstacker")
 
@@ -3601,6 +3606,31 @@ def main() -> int:
     app = QApplication([sys.argv[0]] + qt_args)
     if ICON_PATH.exists():
         app.setWindowIcon(QIcon(str(ICON_PATH)))
+
+    # Single-instance lock. Acquired before CameraWindow construction
+    # so a second launch never even starts spinning up PySpin / serial
+    # / VISA — it sees the lock, tells the operator the GUI is already
+    # running, and exits. QLockFile is held for the lifetime of the
+    # process; assigning to a local var (not _, not transient) keeps
+    # it from being GC'd before app.exec() returns.
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    instance_lock = QLockFile(str(LOCK_PATH))
+    instance_lock.setStaleLockTime(0)  # rely on Qt's PID liveness check
+    if not instance_lock.tryLock(0):
+        log.warning("another GUI instance is already running; lockfile=%s", LOCK_PATH)
+        QMessageBox.warning(
+            None,
+            "Air Stacker GUI already running",
+            (
+                "An instance of Air Stacker GUI is already running.\n\n"
+                f"Lock file: {LOCK_PATH}\n\n"
+                "If you're certain no instance is running (e.g. the "
+                "GUI crashed), delete that file and relaunch."
+            ),
+        )
+        return 1
+    log.info("acquired single-instance lock: %s", LOCK_PATH)
+
     win = CameraWindow()
     win.resize(960, 720)
     win.show()
