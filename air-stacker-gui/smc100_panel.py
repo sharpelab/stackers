@@ -561,7 +561,7 @@ class SMC100Panel(QGroupBox):
         self._safe(self.axis.leave_jog)
 
     def _safe(self, fn, *args) -> None:
-        name = getattr(fn, "__name__", repr(fn))
+        name = fn.__name__
         log.info("smc100: %s(%s)", name, args if args else "")
         try:
             fn(*args)

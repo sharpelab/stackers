@@ -1179,7 +1179,7 @@ class YokoPanel(QGroupBox):
             self.down_btn.setEnabled(False)
 
     def _safe(self, fn, *args) -> None:
-        name = getattr(fn, "__name__", repr(fn))
+        name = fn.__name__
         log.info("yoko: %s(%s)", name, args if args else "")
         try:
             fn(*args)
