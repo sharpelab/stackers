@@ -24,6 +24,10 @@ in ``config.toml``):
     cap; passed through to :class:`SMC100Axis`. The air-stacker rig sets
     ``[0.0, 30.0]``.
   - ``default_velocity`` (float, optional) — pushed to ``VA`` on connect
+  - ``min_velocity`` (float, default 0.001 mm/s = 1 µm/s) — lower bound on
+    the velocity spinbox. Operator can't type below this. Rig-specific:
+    the LTA-HS trips on RMS current limit if commanded to crawl below
+    ~5 µm/s for ~10 s, so the air-stacker config raises this to ``0.005``.
 
 Persistent CONFIG-mode commands (``PW0``/``PW1``/EEPROM saves) are not
 exposed by either the driver or this panel.
@@ -139,6 +143,10 @@ class SMC100Panel(QGroupBox):
             int(cfg.get("poll_interval_ms", self.DEFAULT_POLL_MS)) / 1000.0
         )
         self._default_velocity = cfg.get("default_velocity")
+        # Lower bound on the velocity spinbox (µm/s). cfg value is mm/s
+        # for consistency with default_velocity and the rest of the
+        # [smc100] block; convert to µm for the spinbox.
+        self._min_velocity_um_s = float(cfg.get("min_velocity", 0.001)) * _UM_PER_MM
 
         # Optional position_limits from TOML, e.g. position_limits = [0.0, 30.0].
         # tomlkit hands us a list-like; coerce to a plain tuple of floats.
@@ -207,7 +215,7 @@ class SMC100Panel(QGroupBox):
         self.velocity_spin.setKeyboardTracking(False)
         self.velocity_spin.setDecimals(1)
         self.velocity_spin.setSingleStep(100.0)
-        self.velocity_spin.setRange(1.0, 1_000_000.0)
+        self.velocity_spin.setRange(self._min_velocity_um_s, 1_000_000.0)
         self.velocity_spin.setSuffix(" µm/s")
 
         self.home_btn = action_button("Home")

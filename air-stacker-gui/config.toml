@@ -73,6 +73,11 @@ units = "mm"
 step = 0.1
 poll_interval_ms = 100
 position_limits = [0.0, 30.0]
+# LTA-HS RMS-current-trip floor. At velocities below ~5 µm/s the servo
+# holds enough sustained current that the SMC100's protective trip fires
+# after ~10 s of motion, dropping out of MOVING into NOT REFERENCED and
+# forcing a re-home. mm/s for consistency with default_velocity.
+min_velocity = 0.005
 
 # Yokogawa 7651 → NPM140 piezo (fine-Z axis), GPIB.
 # Panel operates the Yoko as a **constant-current source**: the piezo
