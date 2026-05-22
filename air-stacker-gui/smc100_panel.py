@@ -529,15 +529,13 @@ class SMC100Panel(QGroupBox):
 
     def _on_leave_jog(self) -> None:
         # JM0 first to silence the keypad (transient — reverts to JM1 on
-        # next boot), then JD to leave JOGGING. Done as a single try-block
-        # so we surface whichever step failed and keep the order semantic.
+        # next boot), then JD to leave JOGGING. Route both calls through
+        # _safe so each bus call gets its own INFO log line in the file;
+        # _safe also clobbers status_label on error which is the behavior
+        # we want here.
         log.info("smc100: leave-jog — sending JM0 then JD")
-        try:
-            self.axis.disable_keypad()
-            self.axis.leave_jog()
-        except _SMC100_ERRORS as e:
-            log.exception("smc100: leave-jog failed")
-            self.status_label.setText(f"leave jog err: {e}")
+        self._safe(self.axis.disable_keypad)
+        self._safe(self.axis.leave_jog)
 
     def _safe(self, fn, *args) -> None:
         name = getattr(fn, "__name__", repr(fn))
@@ -596,6 +594,19 @@ class SMC100Panel(QGroupBox):
         if "state_code" in payload:
             sc = payload["state_code"]
             ec = payload["error_code"]
+            # State-transition log — INFO on actual change only (skip
+            # no-change ticks). Initial _apply_state() call before the
+            # worker starts logs as "— → <state>", which is useful: gives
+            # the forensic timeline a defined zero point.
+            if sc != self._last_state_code:
+                prev = self._last_state_code or "—"
+                log.info("smc100: state %s → %s (%s)", prev, sc, state_label(sc))
+            # Non-zero error register — TS auto-clears on read, so this
+            # poll cycle is the only chance to capture the bits. Log
+            # directly here, not via the error_label widget, so the
+            # forensic record doesn't depend on UI state.
+            if ec != "0000":
+                log.warning("smc100: error 0x%s — %s", ec, error_label(ec))
             self._last_state_code = sc
             self.status_label.setText(state_label(sc))
             if ec != "0000":

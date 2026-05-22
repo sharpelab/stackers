@@ -10,6 +10,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, replace
 from functools import lru_cache
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import cv2
@@ -67,22 +68,64 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config.toml"
 SETTINGS_PATH = Path(__file__).resolve().parent / "settings.toml"
 ICON_PATH = Path(__file__).resolve().parent / "assets" / "icons" / "air_stacker.ico"
 
+# On-disk log directory. Top-level of the operator's home so it's easy to
+# find after a crash (vs. buried under AppData on Windows), and outside the
+# git checkout so rotated files don't pollute the working tree.
+LOG_DIR = Path.home() / "air-stacker-gui-logs"
+
 log = logging.getLogger("airstacker")
 
 
 def configure_logging(verbose: int) -> None:
-    """verbose=0 → WARNING (default); 1 → INFO; 2+ → DEBUG."""
+    """verbose=0 → WARNING (default); 1 → INFO; 2+ → DEBUG.
+
+    Stderr verbosity honors ``verbose``. A separate ``RotatingFileHandler``
+    captures INFO+ to ``~/air-stacker-gui-logs/`` so forensics survive
+    terminal closure. Size-based rotation (10 MiB × 10) caps disk use at
+    ~110 MB regardless of session length; time-based rotation would either
+    truncate busy days or blow the budget when the GUI is left running for
+    many days. INFO threshold (not DEBUG) keeps the file from flooding with
+    periodic perf tickers (camera fps, paintGL ms) — those live at DEBUG
+    and are only reachable via ``-vv`` on stderr.
+    """
     if verbose >= 2:
-        level = logging.DEBUG
+        stderr_level = logging.DEBUG
     elif verbose >= 1:
-        level = logging.INFO
+        stderr_level = logging.INFO
     else:
-        level = logging.WARNING
-    handler = logging.StreamHandler(sys.stderr)
-    handler.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
-    log.addHandler(handler)
-    log.setLevel(level)
+        stderr_level = logging.WARNING
+
+    # Logger sits at DEBUG so both handlers see every record; each handler
+    # gates its own level. Without this, the verbose=0 path would mask
+    # DEBUG before the file handler could ever see it.
+    log.setLevel(logging.DEBUG)
     log.propagate = False
+
+    stderr = logging.StreamHandler(sys.stderr)
+    stderr.setLevel(stderr_level)
+    stderr.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+    log.addHandler(stderr)
+
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        file_path = LOG_DIR / "air-stacker-gui.log"
+        file_handler = RotatingFileHandler(
+            file_path,
+            maxBytes=10 * 1024 * 1024,
+            backupCount=10,
+            encoding="utf-8",
+        )
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s.%(msecs)03d %(levelname)-7s %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        log.addHandler(file_handler)
+        log.info("logging to %s", file_path)
+    except OSError as e:
+        # Bad permissions or read-only home shouldn't keep the GUI from
+        # starting — fall through with stderr-only logging.
+        log.warning("could not configure file logging at %s: %s", LOG_DIR, e)
 
 
 def load_config() -> dict:
@@ -925,7 +968,7 @@ class _CameraGLWindow(QOpenGLWindow):
         self._paint_count += 1
         if self._paint_count >= 60:
             cycles = max(self._paint_count - 1, 1)
-            log.info(
+            log.debug(
                 "paintGL avg=%.1fms max=%.1fms cycle=%.1fms cycle_max=%.1fms surf=%dx%d n=%d",
                 self._paint_total / self._paint_count * 1000,
                 self._paint_max * 1000,
@@ -1170,7 +1213,7 @@ class CameraAcquireWorker(QObject):
                 log_count += 1
                 if t3 - log_start > 2.0:
                     span = t3 - log_start
-                    log.info(
+                    log.debug(
                         "acq    %.1f fps  fetch=%.1f deb=%.1f pub=%.2f ms/frame",
                         log_count / span,
                         t_fetch / log_count * 1000,
@@ -1267,7 +1310,7 @@ class CameraProcessWorker(QObject):
             log_count += 1
             if t4 - log_start > 2.0:
                 span = t4 - log_start
-                log.info(
+                log.debug(
                     "proc   %.1f fps emit=%.1f/s  wait=%.1f adj=%.1f pub=%.2f ms/frame",
                     log_count / span,
                     log_emits / span,
@@ -1359,7 +1402,7 @@ class HistWorker(QObject):
                 n = len(comp_ms)
                 ca = np.asarray(comp_ms)
                 ra = np.asarray(rend_ms)
-                log.info(
+                log.debug(
                     "hist   %.1f fps  comp min/med/p90/max=%.1f/%.1f/%.1f/%.1f  "
                     "rend min/med/p90/max=%.1f/%.1f/%.1f/%.1f  ms/iter (n=%d)",
                     n / span,
