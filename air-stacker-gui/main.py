@@ -3503,7 +3503,7 @@ class CameraWindow(QMainWindow):
         if span < 2.0:
             return
         delivered = self._on_frame_calls - self._on_frame_noops
-        log.info(
+        log.debug(
             "_on_frame calls=%.1f/s delivered=%.1f/s noops=%.1f/s",
             self._on_frame_calls / span,
             delivered / span,
