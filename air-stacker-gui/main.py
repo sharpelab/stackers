@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFrame,
     QGridLayout,
@@ -3075,9 +3076,144 @@ class HeaterPanel(QGroupBox):
         self.heater.close()
 
 
-class CameraWindow(QMainWindow):
+class StartupAborted(Exception):
+    """Raised when the operator clicks X on LaunchingDialog mid-startup.
+
+    Propagates up out of CameraWindow construction so main() can exit
+    cleanly. Partial init state (PySpin handles, opened panels) is torn
+    down in CameraWindow's except path before the exception re-raises.
+    """
+
+
+class LaunchingDialog(QDialog):
+    """Small 'Launching…' indicator shown during CameraWindow construction.
+
+    Closes the operator-feedback gap that lets the GUI process run for
+    several seconds (PySpin / serial / VISA setup) with no visible
+    window. The X (window close button) sets a cancel flag; CameraWindow
+    checks it at construction checkpoints and raises StartupAborted.
+
+    Honest caveat: X is responsive *between* construction steps, not
+    *during* a single long step (e.g. Yoko's ~8.5 s VISA timeout when
+    the 7651 is offline). Full responsiveness requires deferring device
+    connects to worker threads — separate refactor.
+    """
+
     def __init__(self) -> None:
         super().__init__()
+        self.setWindowTitle("Air Stacker — launching")
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.WindowCloseButtonHint
+        )
+        self._label = QLabel("Launching Air Stacker GUI…")
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._label)
+        self.setMinimumWidth(360)
+        self._cancelled = False
+
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled
+
+    def update_status(self, text: str) -> None:
+        """Update the visible message, repaint, and let queued events
+        (including an X click) through. Call this between long steps."""
+        self._label.setText(text)
+        QApplication.processEvents()
+
+    def closeEvent(self, event) -> None:
+        self._cancelled = True
+        log.info("launch dialog X clicked — abort at next checkpoint")
+        event.accept()
+
+
+class CameraWindow(QMainWindow):
+    def __init__(self, launch_dialog: LaunchingDialog | None = None) -> None:
+        super().__init__()
+        self._launch_dialog = launch_dialog
+        # Sub-panel refs pre-init'd to None *here* (not in _initialize) so
+        # _abort_cleanup can rely on their existence regardless of how
+        # early the abort fires. Their nullability is already part of
+        # the post-init runtime contract (each panel is conditional on
+        # config presence), so this doesn't pollute the type at use sites.
+        self.axis_panels: list[ConexAxisPanel] = []
+        self.heater_panel: HeaterPanel | None = None
+        self.smc100_panel: SMC100Panel | None = None
+        self.yoko_panel: YokoPanel | None = None
+        self.camera_options_panel: CameraOptionsPanel | None = None
+        self.adjustments_panel: ImageAdjustmentsPanel | None = None
+        # PySpin handles get assigned in _initialize. They are *not*
+        # pre-init'd to None — once _initialize succeeds they're
+        # non-nullable from every runtime method's perspective.
+        # _abort_cleanup gates its PySpin teardown on this flag rather
+        # than touching self.cam directly when it may not exist.
+        self._pyspin_acquired = False
+        try:
+            self._initialize()
+        except StartupAborted:
+            self._abort_cleanup()
+            raise
+
+    def _checkpoint(self, status: str) -> None:
+        """Update the launch dialog (if any) and abort if X was clicked.
+
+        Call between long-running init steps so the dialog stays
+        responsive and the operator's X click takes effect promptly.
+        """
+        if self._launch_dialog is None:
+            return
+        self._launch_dialog.update_status(status)
+        if self._launch_dialog.cancelled:
+            raise StartupAborted()
+
+    def _abort_cleanup(self) -> None:
+        """Best-effort tear-down of partially-constructed state.
+
+        Sub-panel refs are pre-init'd to None in __init__, so the
+        `is not None` checks here just mean "construction made it that
+        far". PySpin teardown gates on _pyspin_acquired — the runtime
+        contract is that self.cam / self._cam_list / self._spin_system
+        are only valid when that flag is True.
+        """
+        log.info("startup aborted — tearing down partial CameraWindow")
+        for p in (
+            self.camera_options_panel,
+            self.heater_panel,
+            self.smc100_panel,
+            self.yoko_panel,
+        ):
+            if p is not None:
+                try:
+                    p.shutdown()
+                except Exception as e:  # noqa: BLE001
+                    log.debug("abort cleanup (panel): %s", e)
+        for ap in self.axis_panels:
+            try:
+                ap.shutdown()
+            except Exception as e:  # noqa: BLE001
+                log.debug("abort cleanup (axis): %s", e)
+        if self._pyspin_acquired:
+            try:
+                self.cam.EndAcquisition()
+            except Exception as e:  # noqa: BLE001
+                log.debug("abort cleanup EndAcquisition: %s", e)
+            try:
+                self.cam.DeInit()
+            except Exception as e:  # noqa: BLE001
+                log.debug("abort cleanup DeInit: %s", e)
+            try:
+                self._cam_list.Clear()
+            except Exception as e:  # noqa: BLE001
+                log.debug("abort cleanup Clear: %s", e)
+            try:
+                self._spin_system.ReleaseInstance()
+            except Exception as e:  # noqa: BLE001
+                log.debug("abort cleanup ReleaseInstance: %s", e)
+            self._pyspin_acquired = False
+
+    def _initialize(self) -> None:
+        self._checkpoint("Loading config…")
         self.setWindowTitle("Air Stacker — live")
         self.label = CameraDisplay()
         self.label.setText("connecting…")
@@ -3091,13 +3227,6 @@ class CameraWindow(QMainWindow):
         self._on_frame_calls = 0
         self._on_frame_noops = 0
         self._on_frame_log_start = time.perf_counter()
-
-        self.axis_panels: list[ConexAxisPanel] = []
-        self.heater_panel: HeaterPanel | None = None
-        self.smc100_panel: SMC100Panel | None = None
-        self.yoko_panel: YokoPanel | None = None
-        self.camera_options_panel: CameraOptionsPanel | None = None
-        self.adjustments_panel: ImageAdjustmentsPanel | None = None
         self.adjustments = ImageAdjustments()
 
         config = load_config()
@@ -3113,18 +3242,27 @@ class CameraWindow(QMainWindow):
         )
         self._webcam_window: WebcamWindow | None = None
 
-        self._spin_system = PySpin.System.GetInstance()
-        self._cam_list = self._spin_system.GetCameras()
-        if self._cam_list.GetSize() == 0:
-            self._cam_list.Clear()
-            self._spin_system.ReleaseInstance()
+        self._checkpoint("Initializing camera (Spinnaker)…")
+        spin_system = PySpin.System.GetInstance()
+        cam_list = spin_system.GetCameras()
+        if cam_list.GetSize() == 0:
+            # Roll back the local refs immediately — they never make
+            # it onto self, so _abort_cleanup has nothing to do.
+            cam_list.Clear()
+            spin_system.ReleaseInstance()
             raise RuntimeError("no cameras enumerated by Spinnaker")
-        self.cam = self._cam_list.GetByIndex(device_index)
+        self._spin_system = spin_system
+        self._cam_list = cam_list
+        self.cam = cam_list.GetByIndex(device_index)
         self.cam.Init()
-
         self._apply_camera_startup()
         self.cam.BeginAcquisition()
+        # PySpin handles are now in their runtime-valid state. Any
+        # later abort (or normal closeEvent) routes teardown through
+        # _abort_cleanup / closeEvent, both of which see the flag set.
+        self._pyspin_acquired = True
 
+        self._checkpoint("Building UI…")
         settings_panel = self._build_settings_panel(camera_cfg)
         right_panel = self._build_right_panel(
             axes_cfg=config.get("axis", []),
@@ -3455,18 +3593,28 @@ class CameraWindow(QMainWindow):
         # rough approach), then fine Z (Yoko/NPM140 piezo, µm scale, final
         # touch-down) at the bottom.
         for cfg in axes_cfg:
+            self._checkpoint(f"Connecting to axis: {cfg.get('name', '?')}…")
             ap = ConexAxisPanel(cfg)
             self.axis_panels.append(ap)
             layout.addWidget(ap)
         if heater_cfg:
+            self._checkpoint("Connecting to heater…")
             self.heater_panel = HeaterPanel(heater_cfg)
             layout.addWidget(self.heater_panel)
         if smc100_cfg:
+            self._checkpoint("Connecting to SMC100 (Z stage)…")
             self.smc100_panel = SMC100Panel(smc100_cfg)
             layout.addWidget(self.smc100_panel)
         if yoko_cfg:
+            # NB: when the 7651 is offline this call blocks ~8.5 s on
+            # VISA timeouts. The launch dialog will sit on "Connecting
+            # to Yoko…" for that whole window and not be responsive to
+            # an X click until it returns. Deferred-connect refactor
+            # would fix that.
+            self._checkpoint("Connecting to Yoko (NPM140 piezo)…")
             self.yoko_panel = YokoPanel(yoko_cfg)
             layout.addWidget(self.yoko_panel)
+        self._checkpoint("Finalizing UI…")
         layout.addStretch(1)
         return panel
 
@@ -3631,7 +3779,22 @@ def main() -> int:
         return 1
     log.info("acquired single-instance lock: %s", LOCK_PATH)
 
-    win = CameraWindow()
+    # Show the launching dialog before CameraWindow construction so the
+    # operator gets visible feedback during the slow Spinnaker / serial /
+    # VISA setup. processEvents() forces an initial paint; subsequent
+    # paints happen at each _checkpoint() inside CameraWindow.__init__.
+    launch = LaunchingDialog()
+    launch.show()
+    app.processEvents()
+
+    try:
+        win = CameraWindow(launch_dialog=launch)
+    except StartupAborted:
+        log.info("startup aborted by operator")
+        launch.close()
+        return 0
+    launch.close()
+
     win.resize(960, 720)
     win.show()
     return app.exec()
