@@ -37,6 +37,7 @@ import threading
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
+    QApplication,
     QDoubleSpinBox,
     QFrame,
     QGroupBox,
@@ -421,7 +422,28 @@ class SMC100Panel(QGroupBox):
         a 0.1 µm step (~2.82 counts) moves only 2 counts = 0.07 µm."""
         return round(mm / self._encoder_mm) * self._encoder_mm
 
+    def _commit_pending_edits(self) -> None:
+        """Force any in-flight spinbox edit to commit before reading values.
+
+        QDoubleSpinBox with setKeyboardTracking(False) defers the value
+        update until the user explicitly commits (Enter, focus loss,
+        arrow click). Action buttons in this panel use
+        Qt.FocusPolicy.NoFocus (see widgets.action_button), so a normal
+        "type a value, click Go" sequence never moves focus off the
+        spinbox — the click handler would then read the stale value
+        and the typed-but-uncommitted velocity would never reach the
+        controller. Spacebar-repeat is worse: no focus change at all.
+        Clearing focus on the active spinbox forces Qt's natural commit
+        path (interpretText → value update → editingFinished).
+        """
+        fw = QApplication.focusWidget()
+        if isinstance(fw, QDoubleSpinBox) and fw in (
+            self.target_spin, self.step_spin, self.velocity_spin,
+        ):
+            fw.clearFocus()
+
     def _on_go(self) -> None:
+        self._commit_pending_edits()
         self._safe(
             self.axis.move_absolute,
             self._snap_mm(self.target_spin.value() / _UM_PER_MM),
@@ -430,6 +452,7 @@ class SMC100Panel(QGroupBox):
     def _on_jog_pressed(self, direction: int) -> None:
         """Mouse-down on a jog button — arm the click-vs-hold timer.
         Also persists the direction for the spacebar-repeat shortcut."""
+        self._commit_pending_edits()
         log.info("smc100: jog pressed dir=%+d (timer armed)", direction)
         self._jog_direction = direction
         self._last_jog_direction = direction
@@ -598,9 +621,33 @@ class SMC100Panel(QGroupBox):
             # no-change ticks). Initial _apply_state() call before the
             # worker starts logs as "— → <state>", which is useful: gives
             # the forensic timeline a defined zero point.
-            if sc != self._last_state_code:
-                prev = self._last_state_code or "—"
+            prev_state = self._last_state_code
+            if sc != prev_state:
+                prev = prev_state or "—"
                 log.info("smc100: state %s → %s (%s)", prev, sc, state_label(sc))
+                # Re-sync the velocity spinbox on any transition INTO
+                # READY from outside READY. A Reset (RS) reloads the
+                # ESP defaults — including VA — so the spinbox would
+                # otherwise keep showing whatever the operator last
+                # typed while the controller is back at the stage's
+                # default speed (5 mm/s for LTA-HS). Home/Disable likely
+                # preserve VA but the re-poll is cheap insurance.
+                if (
+                    prev_state is not None
+                    and sc in READY_STATES
+                    and prev_state not in READY_STATES
+                ):
+                    try:
+                        v = self.axis.velocity()
+                        self.velocity_spin.blockSignals(True)
+                        self.velocity_spin.setValue(v * _UM_PER_MM)
+                        self.velocity_spin.blockSignals(False)
+                        log.info(
+                            "smc100: velocity re-polled = %.3f µm/s",
+                            v * _UM_PER_MM,
+                        )
+                    except _SMC100_ERRORS as e:
+                        log.warning("smc100: velocity re-poll failed: %s", e)
             # Non-zero error register — TS auto-clears on read, so this
             # poll cycle is the only chance to capture the bits. Log
             # directly here, not via the error_label widget, so the
