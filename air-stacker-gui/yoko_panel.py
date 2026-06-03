@@ -831,9 +831,19 @@ class YokoPanel(QGroupBox):
         if self.keithley is not None:
             try:
                 self.keithley.open()
+                # The 617 powers up (and is left, when re-cabling) with Zero
+                # Check armed — it internally shorts the input and changes its
+                # impedance, which decouples the piezo node and pins readings
+                # at ~0 V. Run the canonical zero sequence (C1X → Z1X → C0X) as
+                # part of init: it refreshes the zero-correct offset and leaves
+                # the unit in its operating state (Zero Check OFF, Zero Correct
+                # ON) so readings reflect the live piezo voltage. Safe here:
+                # the watchdog (the sole thread allowed to touch the 617)
+                # hasn't started yet.
+                self.keithley.zero()
             except _K617_ERRORS as e:
-                log.warning("keithley617 open failed: %s", e)
-                self._k617_issue = f"617 open failed: {e}"
+                log.warning("keithley617 init failed: %s", e)
+                self._k617_issue = f"617 init failed: {e}"
                 self.keithley = None
 
         if self.keithley is not None:
