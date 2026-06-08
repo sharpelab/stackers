@@ -25,10 +25,13 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from PySide6.QtCore import QPointF, QRectF
-from PySide6.QtGui import QPainter
+from PySide6.QtGui import QPainter, QTransform
 
 # Source pixel aspect (width / height). Flea3 = 1440×1080 = 4:3.
 IMAGE_ASPECT = 4 / 3
+# Fixed pivot for every layer's rotate/scale — the image center, in
+# aspect-correct coords (x ∈ [0, IMAGE_ASPECT], y ∈ [0, 1]).
+IMAGE_CENTER = QPointF(IMAGE_ASPECT / 2.0, 0.5)
 
 
 class DrawTool(Enum):
@@ -66,14 +69,15 @@ def to_widget(n: QPointF, rect: QRectF) -> QPointF:
 class OverlayPrimitive:
     """Base for normalized-coord overlay primitives.
 
-    Subclasses store their geometry in normalized image-space and render
-    themselves against the current camera-content rect. Keeping the data
-    as a discriminated set of typed primitives (rather than a flat
-    point-list) is what lets Phase 2 group them into layers and add
-    hit-testing without rewriting storage.
+    Subclasses store their geometry in aspect-correct image coords and draw
+    in those *raw* coords — the painter carries a transform mapping
+    (aspect-correct → widget px), optionally composed with the owning
+    layer's transform, so primitives stay transform-agnostic. Keeping the
+    data as a discriminated set of typed primitives (rather than a flat
+    point-list) is what lets layers group them and add hit-testing.
     """
 
-    def draw(self, painter: QPainter, rect: QRectF) -> None:
+    def draw(self, painter: QPainter) -> None:
         raise NotImplementedError
 
 
@@ -83,14 +87,14 @@ class FreehandStroke(OverlayPrimitive):
 
     points: list[QPointF] = field(default_factory=list)
 
-    def draw(self, painter: QPainter, rect: QRectF) -> None:
+    def draw(self, painter: QPainter) -> None:
         if not self.points:
             return
         if len(self.points) == 1:
             # A click with no drag renders as a dot — a deliberate mark.
-            painter.drawPoint(to_widget(self.points[0], rect))
+            painter.drawPoint(self.points[0])
             return
-        painter.drawPolyline([to_widget(p, rect) for p in self.points])
+        painter.drawPolyline(self.points)
 
 
 @dataclass
@@ -100,8 +104,31 @@ class LineSegment(OverlayPrimitive):
     start: QPointF
     end: QPointF
 
-    def draw(self, painter: QPainter, rect: QRectF) -> None:
-        painter.drawLine(to_widget(self.start, rect), to_widget(self.end, rect))
+    def draw(self, painter: QPainter) -> None:
+        painter.drawLine(self.start, self.end)
+
+
+def layer_transform(layer: OverlayLayer) -> QTransform:
+    """Map a layer's local coords → world (aspect-correct) coords:
+    translate by the layer offset, then rotate + scale about the fixed
+    image center. Composed with the (aspect-correct → px) map at paint."""
+    cx, cy = IMAGE_CENTER.x(), IMAGE_CENTER.y()
+    t = QTransform()
+    t.translate(layer.offset.x(), layer.offset.y())
+    t.translate(cx, cy)
+    t.rotate(layer.rotation_deg)
+    t.scale(layer.scale, layer.scale)
+    t.translate(-cx, -cy)
+    return t
+
+
+def aspect_to_px(rect: QRectF) -> QTransform:
+    """Map aspect-correct coords (x ∈ [0, IMAGE_ASPECT], y ∈ [0, 1]) → widget
+    px within `rect` — the affine form of `to_widget`."""
+    t = QTransform()
+    t.translate(rect.x(), rect.y())
+    t.scale(rect.width() / IMAGE_ASPECT, rect.height())
+    return t
 
 
 @dataclass

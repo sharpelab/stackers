@@ -14,9 +14,11 @@ from PySide6.QtCore import QPointF, QRectF
 
 from overlay import (
     IMAGE_ASPECT,
+    IMAGE_CENTER,
     FreehandStroke,
     LineSegment,
     OverlayLayer,
+    layer_transform,
     normalize_pos,
     to_widget,
 )
@@ -138,6 +140,48 @@ def test_layer_defaults() -> None:
     other = OverlayLayer(name="Layer 2")
     layer.primitives.append(FreehandStroke([QPointF(0.1, 0.1)]))
     assert other.primitives == []
+
+
+def test_layer_transform_identity() -> None:
+    t = layer_transform(OverlayLayer(name="L"))
+    assert _pt_approx(t.map(QPointF(0.3, 0.7)), 0.3, 0.7)
+
+
+def test_layer_transform_center_fixed() -> None:
+    # Rotation + scale leave the image center fixed (offset = 0).
+    t = layer_transform(OverlayLayer(name="L", rotation_deg=37.0, scale=2.5))
+    assert _pt_approx(t.map(IMAGE_CENTER), IMAGE_CENTER.x(), IMAGE_CENTER.y())
+
+
+def test_layer_transform_scale_about_center() -> None:
+    t = layer_transform(OverlayLayer(name="L", scale=2.0))
+    cx, cy = IMAGE_CENTER.x(), IMAGE_CENTER.y()
+    assert _pt_approx(t.map(QPointF(cx + 0.1, cy)), cx + 0.2, cy)
+
+
+def test_layer_transform_rotation_about_center() -> None:
+    # Qt rotates clockwise for +angle (y-down space): a point to the right
+    # of center swings to below center under +90°.
+    t = layer_transform(OverlayLayer(name="L", rotation_deg=90.0))
+    cx, cy = IMAGE_CENTER.x(), IMAGE_CENTER.y()
+    assert _pt_approx(t.map(QPointF(cx + 0.1, cy)), cx, cy + 0.1)
+
+
+def test_layer_transform_offset() -> None:
+    t = layer_transform(OverlayLayer(name="L", offset=QPointF(0.2, -0.1)))
+    assert _pt_approx(t.map(QPointF(0.3, 0.4)), 0.5, 0.3)
+
+
+def test_layer_transform_inverse_roundtrip() -> None:
+    t = layer_transform(
+        OverlayLayer(
+            name="L", offset=QPointF(0.15, -0.05), rotation_deg=23.0, scale=1.7
+        )
+    )
+    inv, ok = t.inverted()
+    assert ok
+    p = QPointF(0.4, 0.6)
+    assert _pt_approx(inv.map(t.map(p)), 0.4, 0.6)
 
 
 if __name__ == "__main__":

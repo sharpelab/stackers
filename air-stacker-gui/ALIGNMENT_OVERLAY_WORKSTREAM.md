@@ -143,9 +143,15 @@ operator can see/drive layers early):**
   add/remove, reorder ▲/▼, active-select), front-most-at-top. Wired into the
   harness; full-app placement still pending. Includes the offscreen-raster
   opacity fix (below).
-- **2c — layer transform**: translate/rotate/scale about the fixed image
-  center as one `QTransform`; inverse for hit-testing.
-- **2d — move tool**: `DrawTool.MOVE`, drag translates the active layer.
+- **2c — layer transform (rotate/scale)** ✅: `layer_transform()` composes
+  translate/rotate/scale about the fixed image center as one `QTransform`,
+  applied on the (raster) painter with a cosmetic pen; primitives draw in
+  raw coords. Input is inverse-mapped so drawing on a transformed layer
+  lands under the cursor. Panel gains rotation + scale (slider + spinbox)
+  under a "Layer Settings" header. Transform math is unit-tested.
+- **2d — translation**: move tool (`DrawTool.MOVE`, drag translates the
+  active layer's `offset`, reusing the transform inverse) and/or panel
+  translate controls.
 
 **Opacity render note (decided in 2b):** the overlay is **rasterized to an
 offscreen ARGB image** (CPU raster engine), cached + dirty-flagged, and
@@ -207,6 +213,6 @@ path (not QPainter) — fold the layer `QTransform` into the blit matrix.
 1. Line tool (typed primitives; rubber-band; keep freehand). ✅ shipped
 1a. Aspect-correct coords (`IMAGE_ASPECT=4/3`; foundation for rigid rotation). ✅
 2. Layers — 2a model+render ✅, 2b management UI + offscreen opacity ✅,
-   2c transform (translate/rotate/scale about center), 2d move tool.
+   2c rotate/scale transform + UI ✅, 2d translation (move tool / controls).
 3. Image-import layer (GL-textured; reuses the Phase 2 transform on the blit
    path; trace then hide).

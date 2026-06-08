@@ -19,11 +19,13 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
     QSlider,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -37,6 +39,8 @@ class LayerPanel(QWidget):
     select_layer_requested = Signal(int)
     visibility_toggled = Signal(int, bool)
     opacity_changed = Signal(int, float)
+    rotation_changed = Signal(int, float)  # (index, degrees)
+    scale_changed = Signal(int, float)  # (index, scale factor)
     move_layer_requested = Signal(int, int)  # (index, delta: +1 toward front)
 
     def __init__(self) -> None:
@@ -68,6 +72,11 @@ class LayerPanel(QWidget):
         divider.setFrameShadow(QFrame.Shadow.Sunken)
         root.addWidget(divider)
 
+        settings_title = QLabel("Layer Settings")
+        settings_title.setStyleSheet("font-weight: bold;")
+        root.addWidget(settings_title)
+
+        # Opacity: slider only (a 0–100% drag reads fine without a number).
         self._opacity_label = QLabel("Opacity")
         root.addWidget(self._opacity_label)
         self._opacity = QSlider(Qt.Orientation.Horizontal)
@@ -75,10 +84,68 @@ class LayerPanel(QWidget):
         self._opacity.valueChanged.connect(self._on_opacity)
         root.addWidget(self._opacity)
 
+        # Rotation + scale: each a slider (drag) paired with a spinbox
+        # (type), kept in sync. Slider values are integers, so scale's
+        # slider works in hundredths (5..500 ↔ 0.05..5.00).
+        root.addWidget(QLabel("Rotation"))
+        self._rotation_slider = QSlider(Qt.Orientation.Horizontal)
+        self._rotation_slider.setRange(0, 360)
+        self._rotation_spin = QSpinBox()
+        self._rotation_spin.setRange(0, 360)
+        self._rotation_spin.setSuffix("°")
+        self._rotation_slider.valueChanged.connect(self._on_rotation_slider)
+        self._rotation_spin.valueChanged.connect(self._on_rotation_spin)
+        root.addLayout(self._pair_row(self._rotation_slider, self._rotation_spin))
+
+        root.addWidget(QLabel("Scale"))
+        self._scale_slider = QSlider(Qt.Orientation.Horizontal)
+        self._scale_slider.setRange(5, 500)
+        self._scale_spin = QDoubleSpinBox()
+        self._scale_spin.setRange(0.05, 5.0)
+        self._scale_spin.setSingleStep(0.05)
+        self._scale_spin.setValue(1.0)
+        self._scale_slider.valueChanged.connect(self._on_scale_slider)
+        self._scale_spin.valueChanged.connect(self._on_scale_spin)
+        root.addLayout(self._pair_row(self._scale_slider, self._scale_spin))
+
         root.addStretch(1)
+
+    @staticmethod
+    def _pair_row(slider: QSlider, spin: QWidget) -> QHBoxLayout:
+        h = QHBoxLayout()
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(4)
+        h.addWidget(slider, stretch=1)
+        h.addWidget(spin)
+        return h
 
     def _on_opacity(self, value: int) -> None:
         self.opacity_changed.emit(self._active, value / 100.0)
+
+    def _on_rotation_slider(self, value: int) -> None:
+        self._rotation_spin.blockSignals(True)
+        self._rotation_spin.setValue(value)
+        self._rotation_spin.blockSignals(False)
+        self.rotation_changed.emit(self._active, float(value))
+
+    def _on_rotation_spin(self, value: int) -> None:
+        self._rotation_slider.blockSignals(True)
+        self._rotation_slider.setValue(value)
+        self._rotation_slider.blockSignals(False)
+        self.rotation_changed.emit(self._active, float(value))
+
+    def _on_scale_slider(self, value: int) -> None:
+        scale = value / 100.0
+        self._scale_spin.blockSignals(True)
+        self._scale_spin.setValue(scale)
+        self._scale_spin.blockSignals(False)
+        self.scale_changed.emit(self._active, scale)
+
+    def _on_scale_spin(self, value: float) -> None:
+        self._scale_slider.blockSignals(True)
+        self._scale_slider.setValue(round(value * 100))
+        self._scale_slider.blockSignals(False)
+        self.scale_changed.emit(self._active, value)
 
     def _clear_rows(self) -> None:
         while self._rows_layout.count():
@@ -105,11 +172,25 @@ class LayerPanel(QWidget):
                 self._build_row(idx, layer, active, n, name_group)
             )
 
-        # Opacity slider reflects the active layer (without re-firing).
-        self._opacity_label.setText(f"Opacity — {layers[active].name}")
+        # Transform controls reflect the active layer (without re-firing).
+        active_layer = layers[active]
+        self._opacity_label.setText(f"Opacity — {active_layer.name}")
         self._opacity.blockSignals(True)
-        self._opacity.setValue(round(layers[active].opacity * 100))
+        self._opacity.setValue(round(active_layer.opacity * 100))
         self._opacity.blockSignals(False)
+
+        deg = round(active_layer.rotation_deg) % 360
+        for w in (self._rotation_slider, self._rotation_spin):
+            w.blockSignals(True)
+            w.setValue(deg)
+            w.blockSignals(False)
+
+        self._scale_slider.blockSignals(True)
+        self._scale_slider.setValue(round(active_layer.scale * 100))
+        self._scale_slider.blockSignals(False)
+        self._scale_spin.blockSignals(True)
+        self._scale_spin.setValue(active_layer.scale)
+        self._scale_spin.blockSignals(False)
 
     def _build_row(
         self,

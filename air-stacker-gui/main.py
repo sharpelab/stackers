@@ -59,6 +59,8 @@ from overlay import (
     LineSegment,
     OverlayLayer,
     OverlayPrimitive,
+    aspect_to_px,
+    layer_transform,
     normalize_pos,
 )
 from smc100_panel import SMC100Panel
@@ -915,6 +917,16 @@ class _CameraGLWindow(QOpenGLWindow):
             self._layers[index].opacity = max(0.0, min(1.0, opacity))
             self._touch_overlay()
 
+    def set_layer_rotation(self, index: int, degrees: float) -> None:
+        if 0 <= index < len(self._layers):
+            self._layers[index].rotation_deg = degrees
+            self._touch_overlay()
+
+    def set_layer_scale(self, index: int, scale: float) -> None:
+        if 0 <= index < len(self._layers):
+            self._layers[index].scale = max(0.01, scale)
+            self._touch_overlay()
+
     def move_layer(self, index: int, delta: int) -> None:
         """Reorder a layer by `delta` in the draw stack (+1 = toward front)."""
         j = index + delta
@@ -952,6 +964,13 @@ class _CameraGLWindow(QOpenGLWindow):
             return None
         return normalize_pos(pos, rect)
 
+    def _to_active_layer_space(self, n: QPointF) -> QPointF:
+        """Map an aspect-correct point into the active layer's local coords,
+        so a stroke drawn on a transformed layer lands under the cursor when
+        it's re-rendered with that layer's transform."""
+        inv, ok = layer_transform(self._active_layer_obj()).inverted()
+        return inv.map(n) if ok else n
+
     def mousePressEvent(self, event) -> None:
         if (
             self._drawing_enabled
@@ -959,6 +978,7 @@ class _CameraGLWindow(QOpenGLWindow):
         ):
             n = self._pos_to_normalized(event.position())
             if n is not None:
+                n = self._to_active_layer_space(n)
                 if self._tool is DrawTool.LINE:
                     # Start fixed at the press; end rubber-bands on move.
                     self._active = LineSegment(n, QPointF(n))
@@ -973,6 +993,7 @@ class _CameraGLWindow(QOpenGLWindow):
         if self._active is not None:
             n = self._pos_to_normalized(event.position())
             if n is not None:
+                n = self._to_active_layer_space(n)
                 if isinstance(self._active, LineSegment):
                     # Rubber-band: only the free endpoint tracks the cursor.
                     self._active.end = n
@@ -1138,20 +1159,27 @@ class _CameraGLWindow(QOpenGLWindow):
 
     def _render_overlay_image(self, w: int, h: int, target: QRectF) -> QImage:
         """Rasterize visible layers + the in-progress primitive to a
-        transparent ARGB image. Layers draw back-to-front, hidden ones
-        skipped; per-layer opacity via `setOpacity` is correct on the raster
-        engine. The active primitive draws last at full opacity."""
-        # Pen width in display pixels: 0.2% of the displayed camera-rect
-        # width, so visual weight stays consistent across binning + resize.
+        transparent ARGB image. Each layer draws under its own transform
+        (layer-local → aspect-correct via `layer_transform`, then
+        aspect-correct → px via `base`), so rotate/scale about the image
+        center is rigid. Primitives draw in raw coords; the pen is cosmetic
+        so line weight is constant regardless of layer scale. Layers draw
+        back-to-front, hidden skipped, per-layer opacity via `setOpacity`
+        (correct on the raster engine). The active primitive draws last, at
+        full opacity, under the active layer's transform."""
+        # Cosmetic pen width in display px: 0.2% of the camera-rect width,
+        # so visual weight stays consistent across binning + resize + scale.
         pen_w = max(1.0, 0.002 * target.width())
+        base = aspect_to_px(target)
         img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         img.fill(Qt.GlobalColor.transparent)
         painter = QPainter(img)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setClipRect(target)
+            painter.setClipRect(target)  # device-px clip, set before transforms
             pen = QPen(QColor(255, 0, 0))
             pen.setWidthF(pen_w)
+            pen.setCosmetic(True)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
@@ -1159,11 +1187,15 @@ class _CameraGLWindow(QOpenGLWindow):
                 if not layer.visible:
                     continue
                 painter.setOpacity(layer.opacity)
+                painter.setTransform(layer_transform(layer) * base)
                 for prim in layer.primitives:
-                    prim.draw(painter, target)
-            painter.setOpacity(1.0)
+                    prim.draw(painter)
             if self._active is not None:
-                self._active.draw(painter, target)
+                painter.setOpacity(1.0)
+                painter.setTransform(
+                    layer_transform(self._active_layer_obj()) * base
+                )
+                self._active.draw(painter)
         finally:
             painter.end()
         return img
@@ -1231,6 +1263,12 @@ class CameraDisplay(QWidget):
 
     def set_layer_opacity(self, index: int, opacity: float) -> None:
         self._gl_window.set_layer_opacity(index, opacity)
+
+    def set_layer_rotation(self, index: int, degrees: float) -> None:
+        self._gl_window.set_layer_rotation(index, degrees)
+
+    def set_layer_scale(self, index: int, scale: float) -> None:
+        self._gl_window.set_layer_scale(index, scale)
 
     def move_layer(self, index: int, delta: int) -> None:
         self._gl_window.move_layer(index, delta)
