@@ -803,9 +803,9 @@ class _CameraGLWindow(QOpenGLWindow):
 
         # Drawing overlay. Primitives are typed (FreehandStroke /
         # LineSegment, see overlay.py) and store their points in
-        # normalized camera-image coords (0..1, 0..1) so they re-render
-        # correctly across window resizes and binning swaps within the
-        # same image-aspect family. `_target_rect` caches the current
+        # aspect-correct image coords (x∈[0,IMAGE_ASPECT], y∈[0,1]) so they
+        # re-render correctly across window resizes and binning swaps within
+        # the same image-aspect family. `_target_rect` caches the current
         # camera-content rect (refreshed every paintGL) so mouse handlers
         # can map widget coords → normalized without re-running the
         # letterbox math. `_active` is the in-progress primitive during a
@@ -858,7 +858,8 @@ class _CameraGLWindow(QOpenGLWindow):
             self.update()
 
     def _pos_to_normalized(self, pos: QPointF) -> QPointF | None:
-        """Map widget coords → (nx, ny) in [0..1] of camera-image space.
+        """Map widget coords → (nx, ny) in aspect-correct image space
+        (x∈[0,IMAGE_ASPECT], y∈[0,1]).
 
         Returns None when the position falls in the letterbox bars or
         before the first paintGL has computed `_target_rect`.

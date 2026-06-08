@@ -12,7 +12,13 @@ from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF
 
-from overlay import FreehandStroke, LineSegment, normalize_pos, to_widget
+from overlay import (
+    IMAGE_ASPECT,
+    FreehandStroke,
+    LineSegment,
+    normalize_pos,
+    to_widget,
+)
 
 
 def _approx(a: float, b: float, eps: float = 1e-9) -> bool:
@@ -32,13 +38,27 @@ def test_roundtrip_widget_to_normalized_to_widget() -> None:
         assert _pt_approx(w, px, py)
 
 
-def test_corners_map_to_unit_square() -> None:
+def test_corners_map_to_aspect_extent() -> None:
+    # Bottom-right normalizes to (IMAGE_ASPECT, 1), not (1, 1) — x carries
+    # the aspect so units are square in screen px.
     rect = QRectF(0, 0, 100, 50)
     tl = normalize_pos(QPointF(0, 0), rect)
     br = normalize_pos(QPointF(100, 50), rect)
     assert tl is not None and br is not None
     assert _pt_approx(tl, 0.0, 0.0)
-    assert _pt_approx(br, 1.0, 1.0)
+    assert _pt_approx(br, IMAGE_ASPECT, 1.0)
+
+
+def test_square_units() -> None:
+    # The point of Phase 1a: against a 4:3 rect, an x-delta and an equal
+    # y-delta map to the SAME pixel distance — so a rotation about center
+    # is rigid, not sheared.
+    rect = QRectF(10, 20, 400, 300)  # 4:3
+    d = 0.2
+    origin = QPointF(0.5, 0.5)
+    px_dx = to_widget(QPointF(0.5 + d, 0.5), rect).x() - to_widget(origin, rect).x()
+    px_dy = to_widget(QPointF(0.5, 0.5 + d), rect).y() - to_widget(origin, rect).y()
+    assert _approx(px_dx, px_dy)
 
 
 def test_outside_rect_is_none() -> None:
@@ -62,8 +82,8 @@ def test_resize_invariance() -> None:
     large = QRectF(40, 30, 800, 400)
     ws = to_widget(n, small)
     wl = to_widget(n, large)
-    assert _pt_approx(ws, 50, 50)
-    assert _pt_approx(wl, 40 + 0.25 * 800, 30 + 0.5 * 400)
+    assert _pt_approx(ws, 0.25 / IMAGE_ASPECT * 200, 0.5 * 100)
+    assert _pt_approx(wl, 40 + 0.25 / IMAGE_ASPECT * 800, 30 + 0.5 * 400)
     # ...and mapping each widget pixel back recovers the normalized point.
     back_s = normalize_pos(ws, small)
     back_l = normalize_pos(wl, large)
@@ -83,10 +103,10 @@ def test_line_preview_then_paint_under_different_rect() -> None:
     # from any drag-time rect still places them correctly.
     r1 = QRectF(0, 0, 100, 100)
     r2 = QRectF(0, 0, 1000, 1000)
-    assert _pt_approx(to_widget(seg.start, r1), 10, 10)
-    assert _pt_approx(to_widget(seg.end, r1), 80, 40)
-    assert _pt_approx(to_widget(seg.start, r2), 100, 100)
-    assert _pt_approx(to_widget(seg.end, r2), 800, 400)
+    assert _pt_approx(to_widget(seg.start, r1), 0.1 / IMAGE_ASPECT * 100, 10)
+    assert _pt_approx(to_widget(seg.end, r1), 0.8 / IMAGE_ASPECT * 100, 40)
+    assert _pt_approx(to_widget(seg.start, r2), 0.1 / IMAGE_ASPECT * 1000, 100)
+    assert _pt_approx(to_widget(seg.end, r2), 0.8 / IMAGE_ASPECT * 1000, 400)
 
 
 def test_zero_length_line_detectable() -> None:

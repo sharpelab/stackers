@@ -5,11 +5,18 @@ geometry can be unit-tested headless and so the data model can grow into
 layers (Phase 2 of the alignment-overlay workstream) without dragging the
 camera pipeline along. See ALIGNMENT_OVERLAY_WORKSTREAM.md.
 
-Coordinate model: every primitive stores points in NORMALIZED image-space
-(0..1, 0..1). `_CameraGLWindow` caches the letterboxed camera-content rect
-each paintGL; mapping to/from widget pixels goes through `normalize_pos` /
+Coordinate model: every primitive stores points in ASPECT-CORRECT NORMALIZED
+image-space — y ∈ [0, 1] and x ∈ [0, IMAGE_ASPECT] (4/3 for the 1440×1080
+Flea3). `_CameraGLWindow` caches the letterboxed camera-content rect each
+paintGL; mapping to/from widget pixels goes through `normalize_pos` /
 `to_widget` against that rect, so overlays track the imaged feature across
 window resize and binning swaps rather than the widget's pixels.
+
+The x-extent is the image aspect (not 1.0) on purpose: against the 4:3
+target rect it makes one x-unit equal one y-unit *in screen pixels*, so a
+layer rotation/scale about the image center (Phase 2) stays geometrically
+rigid instead of shearing. A different camera aspect is an explicit code
+change — edit IMAGE_ASPECT.
 """
 
 from __future__ import annotations
@@ -19,6 +26,9 @@ from enum import Enum, auto
 
 from PySide6.QtCore import QPointF, QRectF
 from PySide6.QtGui import QPainter
+
+# Source pixel aspect (width / height). Flea3 = 1440×1080 = 4:3.
+IMAGE_ASPECT = 4 / 3
 
 
 class DrawTool(Enum):
@@ -30,7 +40,8 @@ class DrawTool(Enum):
 
 
 def normalize_pos(pos: QPointF, rect: QRectF) -> QPointF | None:
-    """Map widget coords → (nx, ny) in [0..1] of camera-image space.
+    """Map widget coords → (nx, ny) in aspect-correct image space
+    (x ∈ [0, IMAGE_ASPECT], y ∈ [0, 1]).
 
     Returns None when `pos` falls in the letterbox bars (outside `rect`)
     or when `rect` is degenerate.
@@ -39,15 +50,15 @@ def normalize_pos(pos: QPointF, rect: QRectF) -> QPointF | None:
         return None
     if not rect.contains(pos):
         return None
-    nx = (pos.x() - rect.x()) / rect.width()
+    nx = (pos.x() - rect.x()) / rect.width() * IMAGE_ASPECT
     ny = (pos.y() - rect.y()) / rect.height()
     return QPointF(nx, ny)
 
 
 def to_widget(n: QPointF, rect: QRectF) -> QPointF:
-    """Map (nx, ny) in [0..1] → widget coords within `rect`."""
+    """Map (nx, ny) in aspect-correct image space → widget coords within `rect`."""
     return QPointF(
-        rect.x() + n.x() * rect.width(),
+        rect.x() + n.x() / IMAGE_ASPECT * rect.width(),
         rect.y() + n.y() * rect.height(),
     )
 

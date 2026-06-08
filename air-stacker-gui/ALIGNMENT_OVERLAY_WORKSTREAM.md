@@ -67,31 +67,75 @@ scribbles. Smallest useful increment, no new architecture.
 **Nice-to-haves (defer):** shift-to-constrain horizontal/vertical, endpoint
 snap, a fixed crosshair/center reticle as a built-in primitive.
 
-## Phase 2 — Basic layer support: visibility, opacity, drag-to-move
+## Phase 1a — Aspect-correct coordinate adjustment (foundation for rotation)
 
-**What:** group primitives into layers; each layer has visibility, opacity,
-and can be dragged to reposition as a unit.
+**What:** change the stored coordinate space from `[0..1]²` to *aspect-correct
+normalized* — **y ∈ [0, 1], x ∈ [0, IMAGE_ASPECT]** with `IMAGE_ASPECT = 4/3`
+hardcoded (the Flea3 is 1440×1080). Image center is `(2/3, 1/2)`.
+
+**Why:** Phase 2 rotation/scale about the image center must be *geometrically
+rigid*, not sheared. In `[0..1]²` the map to screen px is anisotropic (x and y
+have different px-per-unit), so a rotation there shears. Making one x-unit equal
+one y-unit *in screen pixels* — which is exactly what `x ∈ [0, 4/3]` does
+against the 4:3 letterboxed target rect — lets rotation/scale compose as an
+ordinary isotropic transform. This is the load-bearing prerequisite; do it as
+its own increment so Phase 2 isn't debugging coords and layers at once.
+
+**Why hardcoded:** a different camera/aspect is an explicit code change anyway
+(swap the constant) — not worth deriving per-frame. The constant must equal the
+source pixel aspect for units to stay square.
+
+**Where / how:**
+- Fold `IMAGE_ASPECT` into `overlay.py`'s `normalize_pos` / `to_widget` (x maps
+  through the `4/3` extent instead of `1.0`). Primitives and the mouse/paint
+  code are otherwise untouched.
+- Update `test_overlay.py` for the new extent (round-trip, resize-invariance).
+
+**Visible effect: none.** With no rotation yet, freehand/line land exactly
+where they do today; only the internal x-number changes. 1a is verified by
+"tools still land correctly + tests pass + harness looks identical."
+
+## Phase 2 — Layers: visibility, opacity, translate, rotate, scale
+
+**What:** group primitives into layers; each layer has visibility, opacity, and
+a translate + **rotate + scale** transform about the fixed image center, applied
+to the layer as a unit.
 
 **Why:** lets the operator build up reference geometry, dim/hide parts, and
-nudge a whole set into place without redrawing.
+translate/rotate/scale a whole set into place without redrawing.
 
-**Where / how — this is the real refactor:**
-- Replace the flat `_strokes` with `_layers: list[OverlayLayer]`, where a
-  layer holds `primitives`, `visible: bool`, `opacity: float`, and an
-  `offset: QPointF` (normalized) for drag-to-move. (Generalize to a full
-  2D transform if rotate/scale show up later.)
+**Where / how — this is the real refactor (built on 1a's square-unit space):**
+- Replace the flat `_strokes` with `_layers: list[OverlayLayer]`:
+
+  ```python
+  @dataclass
+  class OverlayLayer:
+      name: str
+      primitives: list[OverlayPrimitive]   # aspect-correct coords (Phase 1a)
+      visible: bool = True
+      opacity: float = 1.0
+      offset: QPointF        # translation, aspect-correct units
+      rotation_deg: float = 0.0   # about image center (2/3, 1/2)
+      scale: float = 1.0          # uniform, about image center
+  ```
+- **Fixed pivot:** every layer rotates/scales about the image center — "a layer
+  is fixed at image size." No centroid recompute, no per-layer pivot.
 - New drawing goes onto the **active layer**; mouse handlers target it.
-- Render loop: for each visible layer, `painter.setOpacity(layer.opacity)`,
-  translate by `layer.offset`, draw its primitives.
-- **Drag-to-move:** a "move" tool that translates the active layer's offset.
-  Whole-layer move is enough for alignment (no per-primitive selection
-  needed in v1).
-- **UI:** a small layer panel — list with per-layer visibility checkbox,
-  opacity slider, and active-layer select. Status bar's pencil/trash grows
-  into a small overlay toolbar or a side panel.
+- Render loop: for each visible layer, `painter.save()`, `setOpacity`, apply the
+  layer's `translate→rotate→scale` about center as one `QTransform`, draw its
+  primitives, `painter.restore()`. Because 1a made the space square-unit, the
+  transform is built directly — no px-space juggling. Existing `setClipRect`
+  trims rotated/scaled content that overflows the frame.
+- **Move tool:** translates the active layer's `offset`. Hit-testing a cursor
+  back into layer space means inverting the layer transform (`QTransform
+  .inverted()`) — the spot to be careful.
+- **UI:** a layer panel — per-layer visibility checkbox, opacity slider,
+  rotation dial, scale spinbox, active-layer select. Rotate/scale are
+  panel-driven (no on-canvas handles this phase). Status bar's pencil/trash
+  grows into the overlay toolbar.
 
-**Open questions:** hit-testing to pick which layer a drag grabs (or just
-"drag moves the active layer"); add/delete/reorder layers UI scope.
+**Open questions:** layer management scope (add/delete/reorder/rename) — lean
+minimal first; on-canvas rotate/scale handles deferred.
 
 ## Phase 3 — Import an image layer to trace, then hide
 
@@ -109,19 +153,21 @@ template) directly on the live view.
   uploading the image **once as a GL texture and blitting it** (same path as
   the camera frame, with alpha for opacity). QPainter is fine for the line
   primitives; reserve the texture path for image layers.
-- **Placement:** decide how the image maps into normalized image-space
-  (fit / native + offset). Drag-to-move (Phase 2) handles translation;
-  alignment will likely also want **scale and rotation** — flag as a
-  Phase 3.5 if tracing reveals it's needed.
+- **Placement:** decide how the image maps into the aspect-correct space
+  (fit / native + offset). The Phase 2 layer transform already provides
+  translate + rotate + scale about the image center, so an image layer just
+  reuses it — no new transform work expected.
 
-**Open question:** import is the point where **scale/rotate** become real;
-Phase 2's translate-only transform may need to grow.
+**Open question:** image layers honor the same `offset/rotation_deg/scale`,
+but a GL-textured image needs that transform applied on the **texture blit**
+path (not QPainter) — fold the layer `QTransform` into the blit matrix.
 
 ## Cross-cutting
 
-- **Coordinate system:** keep everything in normalized image-space (0..1) so
-  overlays track features across resize/binning — preserve the existing
-  invariant.
+- **Coordinate system:** everything lives in *aspect-correct normalized* space
+  (Phase 1a) — y ∈ [0,1], x ∈ [0, `IMAGE_ASPECT`=4/3], so overlays track
+  features across resize/binning AND rotation/scale about center stay rigid.
+  Phase 1 shipped on plain `[0..1]²`; 1a is the migration.
 - **Persistence (likely needed):** save/restore a layer set across sessions —
   primitives as JSON, image layers by file reference. Not in any single phase;
   decide once layers exist (Phase 2). Ties into the existing settings.toml
@@ -129,11 +175,16 @@ Phase 2's translate-only transform may need to grow.
 - **Interaction model:** the tool set grows (freehand, line, move, maybe
   select). Plan the overlay toolbar UI early so Phase 1 doesn't paint us into
   a single-button corner.
-- **Undo:** becomes cheap once primitives are discrete (Phase 1+). Nice-to-have.
+- **Undo/redo — TODO (future phase, not yet scheduled):** wanted. Discrete
+  typed primitives + layers make it cheap — either snapshot the layer set or a
+  command stack (add-primitive / move / transform / clear). Slot it in after
+  layers (Phase 2) land; revisit whether it spans layer ops or just drawing.
 
 ## Build order summary
 
-1. Line tool (typed primitives; rubber-band; keep freehand).
-2. Layer model + panel (visibility, opacity, drag-to-move active layer).
-3. Image-import layer (GL-textured, opacity/visibility/move; trace then hide)
-   — promote transform to scale/rotate if tracing needs it.
+1. Line tool (typed primitives; rubber-band; keep freehand). ✅ shipped
+1a. Aspect-correct coords (`IMAGE_ASPECT=4/3`; foundation for rigid rotation).
+2. Layer model + panel (visibility, opacity, translate, rotate, scale about
+   the fixed image center; active-layer drawing + move tool).
+3. Image-import layer (GL-textured; reuses the Phase 2 transform on the blit
+   path; trace then hide).
