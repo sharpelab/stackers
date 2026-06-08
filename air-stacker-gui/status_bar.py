@@ -9,7 +9,16 @@ grows independently via `add_slot` / `add_right_slot`.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton
+from PySide6.QtWidgets import (
+    QButtonGroup,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QWidget,
+)
+
+from overlay import DrawTool
 
 
 class StatusBar(QFrame):
@@ -17,6 +26,7 @@ class StatusBar(QFrame):
 
     webcam_toggled = Signal(bool)
     pencil_toggled = Signal(bool)
+    tool_changed = Signal(object)  # emits a DrawTool
     clear_drawing_clicked = Signal()
 
     def __init__(self) -> None:
@@ -48,10 +58,46 @@ class StatusBar(QFrame):
         self.pencil_button.toggled.connect(self.pencil_toggled.emit)
         self.add_right_slot(self.pencil_button)
 
+        # Tool selector: two mutually-exclusive checkable buttons in one
+        # container, so they read as a group (no divider between them) and
+        # add as a single right-anchored slot. Gated on draw mode — moot
+        # until the operator turns drawing on.
+        self.tool_group_widget = QWidget()
+        tool_layout = QHBoxLayout(self.tool_group_widget)
+        tool_layout.setContentsMargins(0, 0, 0, 0)
+        tool_layout.setSpacing(4)
+        self.freehand_button = QPushButton("✎ Freehand")
+        self.freehand_button.setCheckable(True)
+        self.freehand_button.setFlat(True)
+        self.freehand_button.setChecked(True)
+        self.line_button = QPushButton("／ Line")
+        self.line_button.setCheckable(True)
+        self.line_button.setFlat(True)
+        tool_layout.addWidget(self.freehand_button)
+        tool_layout.addWidget(self.line_button)
+        self.tool_button_group = QButtonGroup(self)
+        self.tool_button_group.setExclusive(True)
+        self.tool_button_group.addButton(self.freehand_button)
+        self.tool_button_group.addButton(self.line_button)
+        self._tool_for_button = {
+            self.freehand_button: DrawTool.FREEHAND,
+            self.line_button: DrawTool.LINE,
+        }
+        self.tool_button_group.buttonToggled.connect(self._on_tool_button_toggled)
+        self.tool_group_widget.setEnabled(False)
+        self.pencil_button.toggled.connect(self.tool_group_widget.setEnabled)
+        self.add_right_slot(self.tool_group_widget)
+
         self.clear_drawing_button = QPushButton("🗑 Clear")
         self.clear_drawing_button.setFlat(True)
         self.clear_drawing_button.clicked.connect(self.clear_drawing_clicked.emit)
         self.add_right_slot(self.clear_drawing_button)
+
+    def _on_tool_button_toggled(self, button, checked: bool) -> None:
+        # Exclusive group fires twice per switch (one off, one on); only
+        # act on the newly-checked button.
+        if checked:
+            self.tool_changed.emit(self._tool_for_button[button])
 
     def add_slot(self, widget: QLabel) -> None:
         """Insert a widget as a new left-anchored slot.
