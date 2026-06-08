@@ -785,6 +785,11 @@ class _CameraGLWindow(QOpenGLWindow):
     Embedded into a regular widget tree via QWidget.createWindowContainer.
     """
 
+    # Emitted whenever the overlay (primitives or a layer's properties)
+    # changes, so a layer panel can live-sync its controls — e.g. the X/Y
+    # offset fields while a layer is dragged on the canvas.
+    overlay_mutated = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         fmt = self.format()
@@ -823,6 +828,14 @@ class _CameraGLWindow(QOpenGLWindow):
         self._drawing_enabled = False
         self._tool: DrawTool = DrawTool.FREEHAND
         self._target_rect: QRectF | None = None
+        # Move tool: drag translates the active layer. `_moving` is set
+        # between press and release; the drag works in aspect-correct world
+        # coords (offset is applied in world space), so it's just a
+        # press→current delta added to the layer's starting offset.
+        self._move_enabled = False
+        self._moving = False
+        self._move_press_world = QPointF()
+        self._move_start_offset = QPointF()
         # The overlay is rasterized to an offscreen ARGB image (CPU raster
         # engine) and blitted as a finished image, rather than stroked
         # straight onto the GL surface: the GL paint engine misrenders
@@ -849,6 +862,7 @@ class _CameraGLWindow(QOpenGLWindow):
         frames call `update()` only, reusing the cached overlay image."""
         self._overlay_dirty = True
         self.update()
+        self.overlay_mutated.emit()
 
     def set_drawing_enabled(self, enabled: bool) -> None:
         """Toggle draw mode. Switches the cursor to a crosshair when on,
@@ -863,6 +877,18 @@ class _CameraGLWindow(QOpenGLWindow):
             if self._active is not None:
                 self._active = None
                 self._touch_overlay()
+
+    def set_move_enabled(self, enabled: bool) -> None:
+        """Toggle move mode — drag translates the active layer. Mutually
+        exclusive with draw mode (the status bar enforces this); uses a
+        size-all cursor when on. A drag in progress is cancelled when move
+        mode is turned off."""
+        self._move_enabled = enabled
+        if enabled:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        else:
+            self.unsetCursor()
+            self._moving = False
 
     def set_tool(self, tool: DrawTool) -> None:
         """Select the active tool (freehand vs straight line). A switch
@@ -927,6 +953,11 @@ class _CameraGLWindow(QOpenGLWindow):
             self._layers[index].scale = max(0.01, scale)
             self._touch_overlay()
 
+    def set_layer_offset(self, index: int, x: float, y: float) -> None:
+        if 0 <= index < len(self._layers):
+            self._layers[index].offset = QPointF(x, y)
+            self._touch_overlay()
+
     def move_layer(self, index: int, delta: int) -> None:
         """Reorder a layer by `delta` in the draw stack (+1 = toward front)."""
         j = index + delta
@@ -971,7 +1002,33 @@ class _CameraGLWindow(QOpenGLWindow):
         inv, ok = layer_transform(self._active_layer_obj()).inverted()
         return inv.map(n) if ok else n
 
+    def _pos_to_world(self, pos: QPointF) -> QPointF | None:
+        """Map widget px → aspect-correct world coords (no layer transform).
+        Unlike `_pos_to_normalized` this does not require the point to be
+        inside the camera rect — a move-drag can run past the edges."""
+        rect = self._target_rect
+        if rect is None:
+            return None
+        inv, ok = aspect_to_px(rect).inverted()
+        return inv.map(pos) if ok else None
+
+    def _begin_move(self, pos: QPointF) -> bool:
+        world = self._pos_to_world(pos)
+        if world is None:
+            return False
+        self._move_press_world = world
+        self._move_start_offset = QPointF(self._active_layer_obj().offset)
+        self._moving = True
+        return True
+
     def mousePressEvent(self, event) -> None:
+        if (
+            self._move_enabled
+            and event.button() == Qt.MouseButton.LeftButton
+            and self._begin_move(event.position())
+        ):
+            event.accept()
+            return
         if (
             self._drawing_enabled
             and event.button() == Qt.MouseButton.LeftButton
@@ -990,6 +1047,17 @@ class _CameraGLWindow(QOpenGLWindow):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        if self._moving:
+            world = self._pos_to_world(event.position())
+            if world is not None:
+                delta = world - self._move_press_world
+                self.set_layer_offset(
+                    self._active_layer,
+                    self._move_start_offset.x() + delta.x(),
+                    self._move_start_offset.y() + delta.y(),
+                )
+            event.accept()
+            return
         if self._active is not None:
             n = self._pos_to_normalized(event.position())
             if n is not None:
@@ -1005,6 +1073,10 @@ class _CameraGLWindow(QOpenGLWindow):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if self._moving and event.button() == Qt.MouseButton.LeftButton:
+            self._moving = False
+            event.accept()
+            return
         if (
             self._active is not None
             and event.button() == Qt.MouseButton.LeftButton
@@ -1210,9 +1282,14 @@ class CameraDisplay(QWidget):
     handle and proper Win32 z-order above the GL container.
     """
 
+    # Re-exposes the GL window's overlay_mutated so a layer panel can
+    # live-sync (e.g. offset fields during a canvas drag).
+    overlay_mutated = Signal()
+
     def __init__(self) -> None:
         super().__init__()
         self._gl_window = _CameraGLWindow()
+        self._gl_window.overlay_mutated.connect(self.overlay_mutated)
         self._gl_container = QWidget.createWindowContainer(self._gl_window, self)
         self._gl_container.setAttribute(Qt.WidgetAttribute.WA_NativeWindow, True)
         self._gl_container.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -1235,6 +1312,9 @@ class CameraDisplay(QWidget):
 
     def set_drawing_enabled(self, enabled: bool) -> None:
         self._gl_window.set_drawing_enabled(enabled)
+
+    def set_move_enabled(self, enabled: bool) -> None:
+        self._gl_window.set_move_enabled(enabled)
 
     def set_tool(self, tool: DrawTool) -> None:
         self._gl_window.set_tool(tool)
@@ -1269,6 +1349,9 @@ class CameraDisplay(QWidget):
 
     def set_layer_scale(self, index: int, scale: float) -> None:
         self._gl_window.set_layer_scale(index, scale)
+
+    def set_layer_offset(self, index: int, x: float, y: float) -> None:
+        self._gl_window.set_layer_offset(index, x, y)
 
     def move_layer(self, index: int, delta: int) -> None:
         self._gl_window.move_layer(index, delta)

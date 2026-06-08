@@ -149,9 +149,12 @@ operator can see/drive layers early):**
   raw coords. Input is inverse-mapped so drawing on a transformed layer
   lands under the cursor. Panel gains rotation + scale (slider + spinbox)
   under a "Layer Settings" header. Transform math is unit-tested.
-- **2d — translation**: move tool (`DrawTool.MOVE`, drag translates the
-  active layer's `offset`, reusing the transform inverse) and/or panel
-  translate controls.
+- **2d — translation** ✅: a `✥ Move` tool (status-bar toggle, mutually
+  exclusive with Draw) drags the active layer on the canvas — works in
+  aspect-correct world space so it follows the cursor regardless of the
+  layer's rotate/scale. Panel gains typeable Offset X/Y (slider + spinbox).
+  `overlay_mutated` signal live-syncs the panel offset fields during a drag.
+  Move always targets the active layer (no canvas layer hit-testing).
 
 **Opacity render note (decided in 2b):** the overlay is **rasterized to an
 offscreen ARGB image** (CPU raster engine), cached + dirty-flagged, and
@@ -212,7 +215,7 @@ path (not QPainter) — fold the layer `QTransform` into the blit matrix.
 
 1. Line tool (typed primitives; rubber-band; keep freehand). ✅ shipped
 1a. Aspect-correct coords (`IMAGE_ASPECT=4/3`; foundation for rigid rotation). ✅
-2. Layers — 2a model+render ✅, 2b management UI + offscreen opacity ✅,
-   2c rotate/scale transform + UI ✅, 2d translation (move tool / controls).
+2. Layers ✅ — 2a model+render, 2b management UI + offscreen opacity,
+   2c rotate/scale transform + UI, 2d translation (move tool + offset).
 3. Image-import layer (GL-textured; reuses the Phase 2 transform on the blit
    path; trace then hide).

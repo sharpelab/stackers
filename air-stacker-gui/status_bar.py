@@ -27,6 +27,7 @@ class StatusBar(QFrame):
     webcam_toggled = Signal(bool)
     pencil_toggled = Signal(bool)
     tool_changed = Signal(object)  # emits a DrawTool
+    move_toggled = Signal(bool)
     clear_drawing_clicked = Signal()
 
     def __init__(self) -> None:
@@ -55,7 +56,7 @@ class StatusBar(QFrame):
         self.pencil_button = QPushButton("✎ Draw")
         self.pencil_button.setCheckable(True)
         self.pencil_button.setFlat(True)
-        self.pencil_button.toggled.connect(self.pencil_toggled.emit)
+        self.pencil_button.toggled.connect(self._on_pencil_toggled)
         self.add_right_slot(self.pencil_button)
 
         # Tool selector: two mutually-exclusive checkable buttons in one
@@ -88,10 +89,29 @@ class StatusBar(QFrame):
         self.pencil_button.toggled.connect(self.tool_group_widget.setEnabled)
         self.add_right_slot(self.tool_group_widget)
 
+        # Move tool: a distinct mode (drag the active layer), mutually
+        # exclusive with Draw — see _on_pencil_toggled / _on_move_toggled.
+        self.move_button = QPushButton("✥ Move")
+        self.move_button.setCheckable(True)
+        self.move_button.setFlat(True)
+        self.move_button.toggled.connect(self._on_move_toggled)
+        self.add_right_slot(self.move_button)
+
         self.clear_drawing_button = QPushButton("🗑 Clear")
         self.clear_drawing_button.setFlat(True)
         self.clear_drawing_button.clicked.connect(self.clear_drawing_clicked.emit)
         self.add_right_slot(self.clear_drawing_button)
+
+    def _on_pencil_toggled(self, checked: bool) -> None:
+        # Draw and Move are mutually exclusive modes.
+        if checked and self.move_button.isChecked():
+            self.move_button.setChecked(False)
+        self.pencil_toggled.emit(checked)
+
+    def _on_move_toggled(self, checked: bool) -> None:
+        if checked and self.pencil_button.isChecked():
+            self.pencil_button.setChecked(False)
+        self.move_toggled.emit(checked)
 
     def _on_tool_button_toggled(self, button, checked: bool) -> None:
         # Exclusive group fires twice per switch (one off, one on); only

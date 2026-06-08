@@ -72,6 +72,7 @@ def main() -> None:
 
     # Same wiring as CameraWindow.
     bar.pencil_toggled.connect(disp.set_drawing_enabled)
+    bar.move_toggled.connect(disp.set_move_enabled)
     bar.tool_changed.connect(disp.set_tool)
     bar.clear_drawing_clicked.connect(disp.clear_strokes)
 
@@ -96,6 +97,11 @@ def main() -> None:
         disp.move_layer(i, delta)
         refresh()
 
+    def on_overlay_mutated() -> None:
+        # Live-sync the settings controls (e.g. offset fields during a
+        # canvas Move drag) without rebuilding the row list.
+        panel.sync_active_values(disp.layers(), disp.active_layer_index())
+
     panel.add_layer_requested.connect(on_add)
     panel.remove_layer_requested.connect(on_remove)
     panel.select_layer_requested.connect(on_select)
@@ -104,6 +110,8 @@ def main() -> None:
     panel.opacity_changed.connect(disp.set_layer_opacity)
     panel.rotation_changed.connect(disp.set_layer_rotation)
     panel.scale_changed.connect(disp.set_layer_scale)
+    panel.offset_changed.connect(disp.set_layer_offset)
+    disp.overlay_mutated.connect(on_overlay_mutated)
     refresh()
 
     win.resize(1300, 800)

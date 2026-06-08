@@ -18,6 +18,7 @@ from overlay import (
     FreehandStroke,
     LineSegment,
     OverlayLayer,
+    aspect_to_px,
     layer_transform,
     normalize_pos,
     to_widget,
@@ -170,6 +171,27 @@ def test_layer_transform_rotation_about_center() -> None:
 def test_layer_transform_offset() -> None:
     t = layer_transform(OverlayLayer(name="L", offset=QPointF(0.2, -0.1)))
     assert _pt_approx(t.map(QPointF(0.3, 0.4)), 0.5, 0.3)
+
+
+def test_aspect_to_px_matches_to_widget() -> None:
+    rect = QRectF(10, 20, 400, 300)
+    t = aspect_to_px(rect)
+    for p in (QPointF(0.0, 0.0), QPointF(IMAGE_ASPECT, 1.0), QPointF(0.5, 0.7)):
+        m = t.map(p)
+        w = to_widget(p, rect)
+        assert _pt_approx(m, w.x(), w.y())
+
+
+def test_aspect_to_px_inverse_delta() -> None:
+    # The Move tool maps a px drag delta → world offset via this inverse.
+    rect = QRectF(10, 20, 400, 300)  # 4:3
+    inv, ok = aspect_to_px(rect).inverted()
+    assert ok
+    # A 100px horizontal drag on a 400px-wide 4:3 rect = 100/400 of the
+    # x-extent = 0.25 * IMAGE_ASPECT in world units.
+    d = inv.map(QPointF(110.0, 20.0)) - inv.map(QPointF(10.0, 20.0))
+    assert _approx(d.x(), 0.25 * IMAGE_ASPECT)
+    assert _approx(d.y(), 0.0)
 
 
 def test_layer_transform_inverse_roundtrip() -> None:

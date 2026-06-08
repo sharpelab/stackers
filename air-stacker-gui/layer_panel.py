@@ -41,6 +41,7 @@ class LayerPanel(QWidget):
     opacity_changed = Signal(int, float)
     rotation_changed = Signal(int, float)  # (index, degrees)
     scale_changed = Signal(int, float)  # (index, scale factor)
+    offset_changed = Signal(int, float, float)  # (index, x, y)
     move_layer_requested = Signal(int, int)  # (index, delta: +1 toward front)
 
     def __init__(self) -> None:
@@ -108,6 +109,29 @@ class LayerPanel(QWidget):
         self._scale_spin.valueChanged.connect(self._on_scale_spin)
         root.addLayout(self._pair_row(self._scale_slider, self._scale_spin))
 
+        # Offset X / Y: aspect-correct world units; the canvas Move tool
+        # writes the same offset and live-syncs these via sync_active_values.
+        # Sliders work in hundredths (-200..200 ↔ -2.00..2.00).
+        root.addWidget(QLabel("Offset X"))
+        self._offx_slider = QSlider(Qt.Orientation.Horizontal)
+        self._offx_slider.setRange(-200, 200)
+        self._offx_spin = QDoubleSpinBox()
+        self._offx_spin.setRange(-2.0, 2.0)
+        self._offx_spin.setSingleStep(0.01)
+        self._offx_slider.valueChanged.connect(self._on_offx_slider)
+        self._offx_spin.valueChanged.connect(self._on_offx_spin)
+        root.addLayout(self._pair_row(self._offx_slider, self._offx_spin))
+
+        root.addWidget(QLabel("Offset Y"))
+        self._offy_slider = QSlider(Qt.Orientation.Horizontal)
+        self._offy_slider.setRange(-200, 200)
+        self._offy_spin = QDoubleSpinBox()
+        self._offy_spin.setRange(-2.0, 2.0)
+        self._offy_spin.setSingleStep(0.01)
+        self._offy_slider.valueChanged.connect(self._on_offy_slider)
+        self._offy_spin.valueChanged.connect(self._on_offy_spin)
+        root.addLayout(self._pair_row(self._offy_slider, self._offy_spin))
+
         root.addStretch(1)
 
     @staticmethod
@@ -147,6 +171,35 @@ class LayerPanel(QWidget):
         self._scale_slider.blockSignals(False)
         self.scale_changed.emit(self._active, value)
 
+    def _emit_offset(self) -> None:
+        self.offset_changed.emit(
+            self._active, self._offx_spin.value(), self._offy_spin.value()
+        )
+
+    def _on_offx_slider(self, value: int) -> None:
+        self._offx_spin.blockSignals(True)
+        self._offx_spin.setValue(value / 100.0)
+        self._offx_spin.blockSignals(False)
+        self._emit_offset()
+
+    def _on_offx_spin(self, value: float) -> None:
+        self._offx_slider.blockSignals(True)
+        self._offx_slider.setValue(round(value * 100))
+        self._offx_slider.blockSignals(False)
+        self._emit_offset()
+
+    def _on_offy_slider(self, value: int) -> None:
+        self._offy_spin.blockSignals(True)
+        self._offy_spin.setValue(value / 100.0)
+        self._offy_spin.blockSignals(False)
+        self._emit_offset()
+
+    def _on_offy_spin(self, value: float) -> None:
+        self._offy_slider.blockSignals(True)
+        self._offy_slider.setValue(round(value * 100))
+        self._offy_slider.blockSignals(False)
+        self._emit_offset()
+
     def _clear_rows(self) -> None:
         while self._rows_layout.count():
             item = self._rows_layout.takeAt(0)
@@ -172,8 +225,18 @@ class LayerPanel(QWidget):
                 self._build_row(idx, layer, active, n, name_group)
             )
 
-        # Transform controls reflect the active layer (without re-firing).
-        active_layer = layers[active]
+        self._sync_settings(layers[active])
+
+    def sync_active_values(self, layers: list[OverlayLayer], active: int) -> None:
+        """Refresh only the Layer Settings controls for the active layer —
+        no row rebuild. Cheap enough to call on every overlay mutation (e.g.
+        live-updating the offset fields while the layer is dragged)."""
+        self._active = active
+        self._sync_settings(layers[active])
+
+    def _sync_settings(self, active_layer: OverlayLayer) -> None:
+        """Load the active layer's values into the settings controls without
+        re-firing their change signals."""
         self._opacity_label.setText(f"Opacity — {active_layer.name}")
         self._opacity.blockSignals(True)
         self._opacity.setValue(round(active_layer.opacity * 100))
@@ -191,6 +254,17 @@ class LayerPanel(QWidget):
         self._scale_spin.blockSignals(True)
         self._scale_spin.setValue(active_layer.scale)
         self._scale_spin.blockSignals(False)
+
+        for slider, spin, val in (
+            (self._offx_slider, self._offx_spin, active_layer.offset.x()),
+            (self._offy_slider, self._offy_spin, active_layer.offset.y()),
+        ):
+            slider.blockSignals(True)
+            slider.setValue(round(val * 100))
+            slider.blockSignals(False)
+            spin.blockSignals(True)
+            spin.setValue(val)
+            spin.blockSignals(False)
 
     def _build_row(
         self,
