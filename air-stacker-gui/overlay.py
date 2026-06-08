@@ -102,3 +102,22 @@ class LineSegment(OverlayPrimitive):
 
     def draw(self, painter: QPainter, rect: QRectF) -> None:
         painter.drawLine(to_widget(self.start, rect), to_widget(self.end, rect))
+
+
+@dataclass
+class OverlayLayer:
+    """A named group of primitives drawn as a unit.
+
+    `visible` / `opacity` apply per-layer. `offset` / `rotation_deg` /
+    `scale` define the layer's transform about the fixed image center
+    (Phase 2b applies it; in 2a they're carried but identity). New drawing
+    lands on the active layer.
+    """
+
+    name: str
+    primitives: list[OverlayPrimitive] = field(default_factory=list)
+    visible: bool = True
+    opacity: float = 1.0
+    offset: QPointF = field(default_factory=lambda: QPointF(0.0, 0.0))
+    rotation_deg: float = 0.0
+    scale: float = 1.0

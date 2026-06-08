@@ -16,6 +16,7 @@ from overlay import (
     IMAGE_ASPECT,
     FreehandStroke,
     LineSegment,
+    OverlayLayer,
     normalize_pos,
     to_widget,
 )
@@ -122,6 +123,21 @@ def test_freehand_append() -> None:
     s.points.append(QPointF(0.5, 0.5))
     assert len(s.points) == 2
     assert _pt_approx(s.points[-1], 0.5, 0.5)
+
+
+def test_layer_defaults() -> None:
+    # A fresh layer is visible, opaque, identity transform, no primitives.
+    layer = OverlayLayer(name="Layer 1")
+    assert layer.primitives == []
+    assert layer.visible is True
+    assert layer.opacity == 1.0
+    assert _pt_approx(layer.offset, 0.0, 0.0)
+    assert layer.rotation_deg == 0.0
+    assert layer.scale == 1.0
+    # Distinct layers don't share the default mutable list/point.
+    other = OverlayLayer(name="Layer 2")
+    layer.primitives.append(FreehandStroke([QPointF(0.1, 0.1)]))
+    assert other.primitives == []
 
 
 if __name__ == "__main__":

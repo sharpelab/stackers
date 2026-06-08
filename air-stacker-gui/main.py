@@ -57,6 +57,7 @@ from overlay import (
     DrawTool,
     FreehandStroke,
     LineSegment,
+    OverlayLayer,
     OverlayPrimitive,
     normalize_pos,
 )
@@ -809,8 +810,12 @@ class _CameraGLWindow(QOpenGLWindow):
         # camera-content rect (refreshed every paintGL) so mouse handlers
         # can map widget coords → normalized without re-running the
         # letterbox math. `_active` is the in-progress primitive during a
-        # drag; `_tool` selects what a press starts.
-        self._strokes: list[OverlayPrimitive] = []
+        # drag; `_tool` selects what a press starts. Primitives are grouped
+        # into layers; new drawing lands on the active layer. (Layer
+        # transforms / UI arrive in later Phase 2 steps; 2a seeds one layer
+        # so behavior matches the pre-layer single list.)
+        self._layers: list[OverlayLayer] = [OverlayLayer(name="Layer 1")]
+        self._active_layer = 0
         self._active: OverlayPrimitive | None = None
         self._drawing_enabled = False
         self._tool: DrawTool = DrawTool.FREEHAND
@@ -849,10 +854,17 @@ class _CameraGLWindow(QOpenGLWindow):
             self._active = None
             self.update()
 
+    def _active_layer_obj(self) -> OverlayLayer:
+        return self._layers[self._active_layer]
+
     def clear_strokes(self) -> None:
-        """Drop all finalized + in-progress primitives."""
-        had_anything = bool(self._strokes) or self._active is not None
-        self._strokes = []
+        """Drop the active layer's primitives + any in-progress one.
+
+        (Single-layer today, so this clears everything; per-layer vs
+        clear-all semantics is a layer-panel decision in a later step.)"""
+        layer = self._active_layer_obj()
+        had_anything = bool(layer.primitives) or self._active is not None
+        layer.primitives = []
         self._active = None
         if had_anything:
             self.update()
@@ -914,7 +926,7 @@ class _CameraGLWindow(QOpenGLWindow):
             ):
                 self._active = None
             else:
-                self._strokes.append(self._active)
+                self._active_layer_obj().primitives.append(self._active)
                 self._active = None
             self.update()
             event.accept()
@@ -1020,16 +1032,19 @@ class _CameraGLWindow(QOpenGLWindow):
             self._paint_cycle_max = 0.0
 
     def _paint_overlay(self, target: QRectF) -> None:
-        """Draw the overlay primitives on top of the camera blit.
+        """Draw the overlay layers on top of the camera blit.
 
         Early-outs when there's nothing to paint, so when drawing mode is
         off and no primitives exist we add zero per-frame cost. QPainter on
         a QOpenGLWindow uses the GL paint engine and co-exists with the
         texture blitter as long as the blitter has already released. Each
         primitive maps its normalized coords through `target` itself (see
-        overlay.py), so the render path stays a flat per-primitive loop.
+        overlay.py). Layers draw back-to-front; hidden layers are skipped
+        and each layer's opacity is applied to its primitives. The
+        in-progress primitive draws last, at full opacity, on top.
         """
-        if not self._strokes and self._active is None:
+        any_prims = any(layer.primitives for layer in self._layers)
+        if not any_prims and self._active is None:
             return
         # Pen width in display pixels: 0.2% of the displayed camera-rect
         # width. Scales with the rect rather than the source frame so the
@@ -1044,9 +1059,14 @@ class _CameraGLWindow(QOpenGLWindow):
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             painter.setPen(pen)
-            for prim in self._strokes:
-                prim.draw(painter, target)
+            for layer in self._layers:
+                if not layer.visible:
+                    continue
+                painter.setOpacity(layer.opacity)
+                for prim in layer.primitives:
+                    prim.draw(painter, target)
             if self._active is not None:
+                painter.setOpacity(1.0)
                 self._active.draw(painter, target)
         finally:
             painter.end()
