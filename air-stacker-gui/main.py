@@ -816,10 +816,20 @@ class _CameraGLWindow(QOpenGLWindow):
         # so behavior matches the pre-layer single list.)
         self._layers: list[OverlayLayer] = [OverlayLayer(name="Layer 1")]
         self._active_layer = 0
+        self._layer_seq = 1  # monotonic, for auto-naming new layers
         self._active: OverlayPrimitive | None = None
         self._drawing_enabled = False
         self._tool: DrawTool = DrawTool.FREEHAND
         self._target_rect: QRectF | None = None
+        # The overlay is rasterized to an offscreen ARGB image (CPU raster
+        # engine) and blitted as a finished image, rather than stroked
+        # straight onto the GL surface: the GL paint engine misrenders
+        # semi-transparent antialiased wide strokes (per-layer opacity came
+        # out as a flat bounding-box blob). Cached + dirty-flagged so the
+        # re-raster happens on overlay edits, not every camera frame.
+        self._overlay_img: QImage | None = None
+        self._overlay_dirty = True
+        self._overlay_target: QRectF | None = None
 
     def set_frame(self, frame_ref: np.ndarray) -> None:
         self._frame_ref = frame_ref
@@ -829,6 +839,13 @@ class _CameraGLWindow(QOpenGLWindow):
     def clear_frame(self) -> None:
         self._frame_ref = None
         self._frame_dirty = False
+        self.update()
+
+    def _touch_overlay(self) -> None:
+        """Mark the overlay image stale and request a repaint. Used by every
+        overlay mutation so the offscreen image re-rasters; plain camera
+        frames call `update()` only, reusing the cached overlay image."""
+        self._overlay_dirty = True
         self.update()
 
     def set_drawing_enabled(self, enabled: bool) -> None:
@@ -843,7 +860,7 @@ class _CameraGLWindow(QOpenGLWindow):
             self.unsetCursor()
             if self._active is not None:
                 self._active = None
-                self.update()
+                self._touch_overlay()
 
     def set_tool(self, tool: DrawTool) -> None:
         """Select the active tool (freehand vs straight line). A switch
@@ -852,10 +869,64 @@ class _CameraGLWindow(QOpenGLWindow):
         self._tool = tool
         if self._active is not None:
             self._active = None
-            self.update()
+            self._touch_overlay()
 
     def _active_layer_obj(self) -> OverlayLayer:
         return self._layers[self._active_layer]
+
+    # --- Layer management (driven by the layer panel) -------------------
+
+    def layers(self) -> list[OverlayLayer]:
+        return self._layers
+
+    def active_layer_index(self) -> int:
+        return self._active_layer
+
+    def add_layer(self, name: str | None = None) -> None:
+        """Append a new layer and make it active."""
+        self._layer_seq += 1
+        self._layers.append(OverlayLayer(name=name or f"Layer {self._layer_seq}"))
+        self._active_layer = len(self._layers) - 1
+        self._touch_overlay()
+
+    def remove_layer(self, index: int) -> None:
+        """Drop a layer. Never removes the last one (always ≥1 layer)."""
+        if len(self._layers) <= 1 or not (0 <= index < len(self._layers)):
+            return
+        self._layers.pop(index)
+        # Keep the active index valid and pointing at the same-or-nearest layer.
+        if self._active_layer >= len(self._layers):
+            self._active_layer = len(self._layers) - 1
+        elif self._active_layer > index:
+            self._active_layer -= 1
+        self._touch_overlay()
+
+    def set_active_layer(self, index: int) -> None:
+        if 0 <= index < len(self._layers):
+            self._active_layer = index
+
+    def set_layer_visible(self, index: int, visible: bool) -> None:
+        if 0 <= index < len(self._layers):
+            self._layers[index].visible = visible
+            self._touch_overlay()
+
+    def set_layer_opacity(self, index: int, opacity: float) -> None:
+        if 0 <= index < len(self._layers):
+            self._layers[index].opacity = max(0.0, min(1.0, opacity))
+            self._touch_overlay()
+
+    def move_layer(self, index: int, delta: int) -> None:
+        """Reorder a layer by `delta` in the draw stack (+1 = toward front)."""
+        j = index + delta
+        if not (0 <= index < len(self._layers) and 0 <= j < len(self._layers)):
+            return
+        self._layers[index], self._layers[j] = self._layers[j], self._layers[index]
+        # Keep `active` pointing at the same layer object after the swap.
+        if self._active_layer == index:
+            self._active_layer = j
+        elif self._active_layer == j:
+            self._active_layer = index
+        self._touch_overlay()
 
     def clear_strokes(self) -> None:
         """Drop the active layer's primitives + any in-progress one.
@@ -867,7 +938,7 @@ class _CameraGLWindow(QOpenGLWindow):
         layer.primitives = []
         self._active = None
         if had_anything:
-            self.update()
+            self._touch_overlay()
 
     def _pos_to_normalized(self, pos: QPointF) -> QPointF | None:
         """Map widget coords → (nx, ny) in aspect-correct image space
@@ -893,7 +964,7 @@ class _CameraGLWindow(QOpenGLWindow):
                     self._active = LineSegment(n, QPointF(n))
                 else:
                     self._active = FreehandStroke([n])
-                self.update()
+                self._touch_overlay()
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -907,7 +978,7 @@ class _CameraGLWindow(QOpenGLWindow):
                     self._active.end = n
                 elif isinstance(self._active, FreehandStroke):
                     self._active.points.append(n)
-                self.update()
+                self._touch_overlay()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -928,7 +999,7 @@ class _CameraGLWindow(QOpenGLWindow):
             else:
                 self._active_layer_obj().primitives.append(self._active)
                 self._active = None
-            self.update()
+            self._touch_overlay()
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -1032,25 +1103,50 @@ class _CameraGLWindow(QOpenGLWindow):
             self._paint_cycle_max = 0.0
 
     def _paint_overlay(self, target: QRectF) -> None:
-        """Draw the overlay layers on top of the camera blit.
+        """Composite the overlay layers over the camera blit.
 
-        Early-outs when there's nothing to paint, so when drawing mode is
-        off and no primitives exist we add zero per-frame cost. QPainter on
-        a QOpenGLWindow uses the GL paint engine and co-exists with the
-        texture blitter as long as the blitter has already released. Each
-        primitive maps its normalized coords through `target` itself (see
-        overlay.py). Layers draw back-to-front; hidden layers are skipped
-        and each layer's opacity is applied to its primitives. The
-        in-progress primitive draws last, at full opacity, on top.
+        The overlay is rasterized to an offscreen ARGB image with the CPU
+        raster engine — where semi-transparent antialiased strokes (per-layer
+        opacity) render correctly — then drawn onto the GL surface as one
+        finished image. Drawing straight onto the GL paint engine instead
+        made per-layer opacity come out as a flat bounding-box blob. The
+        image is cached and only re-rasterized when the overlay changed
+        (`_overlay_dirty`) or the widget/target geometry changed; ordinary
+        camera frames just re-blit the cached image.
         """
         any_prims = any(layer.primitives for layer in self._layers)
         if not any_prims and self._active is None:
             return
-        # Pen width in display pixels: 0.2% of the displayed camera-rect
-        # width. Scales with the rect rather than the source frame so the
-        # visual weight stays consistent across binning + window resizes.
-        pen_w = max(1.0, 0.002 * target.width())
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+        if (
+            self._overlay_img is None
+            or self._overlay_img.width() != w
+            or self._overlay_img.height() != h
+            or self._overlay_dirty
+            or self._overlay_target != target
+        ):
+            self._overlay_img = self._render_overlay_image(w, h, target)
+            self._overlay_target = QRectF(target)
+            self._overlay_dirty = False
         painter = QPainter(self)
+        try:
+            painter.drawImage(0, 0, self._overlay_img)
+        finally:
+            painter.end()
+
+    def _render_overlay_image(self, w: int, h: int, target: QRectF) -> QImage:
+        """Rasterize visible layers + the in-progress primitive to a
+        transparent ARGB image. Layers draw back-to-front, hidden ones
+        skipped; per-layer opacity via `setOpacity` is correct on the raster
+        engine. The active primitive draws last at full opacity."""
+        # Pen width in display pixels: 0.2% of the displayed camera-rect
+        # width, so visual weight stays consistent across binning + resize.
+        pen_w = max(1.0, 0.002 * target.width())
+        img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
+        img.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(img)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
             painter.setClipRect(target)
@@ -1065,11 +1161,12 @@ class _CameraGLWindow(QOpenGLWindow):
                 painter.setOpacity(layer.opacity)
                 for prim in layer.primitives:
                     prim.draw(painter, target)
+            painter.setOpacity(1.0)
             if self._active is not None:
-                painter.setOpacity(1.0)
                 self._active.draw(painter, target)
         finally:
             painter.end()
+        return img
 
 
 class CameraDisplay(QWidget):
@@ -1112,6 +1209,31 @@ class CameraDisplay(QWidget):
 
     def clear_strokes(self) -> None:
         self._gl_window.clear_strokes()
+
+    # Layer management — delegated to the GL window, driven by LayerPanel.
+    def layers(self) -> list[OverlayLayer]:
+        return self._gl_window.layers()
+
+    def active_layer_index(self) -> int:
+        return self._gl_window.active_layer_index()
+
+    def add_layer(self, name: str | None = None) -> None:
+        self._gl_window.add_layer(name)
+
+    def remove_layer(self, index: int) -> None:
+        self._gl_window.remove_layer(index)
+
+    def set_active_layer(self, index: int) -> None:
+        self._gl_window.set_active_layer(index)
+
+    def set_layer_visible(self, index: int, visible: bool) -> None:
+        self._gl_window.set_layer_visible(index, visible)
+
+    def set_layer_opacity(self, index: int, opacity: float) -> None:
+        self._gl_window.set_layer_opacity(index, opacity)
+
+    def move_layer(self, index: int, delta: int) -> None:
+        self._gl_window.move_layer(index, delta)
 
     def setText(self, text: str) -> None:
         self.text_label.setText(text)

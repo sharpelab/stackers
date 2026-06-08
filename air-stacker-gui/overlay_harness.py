@@ -25,10 +25,12 @@ sys.modules.setdefault("PySpin", types.ModuleType("PySpin"))
 
 from PySide6.QtWidgets import (  # noqa: E402  (after the PySpin stub)
     QApplication,
+    QHBoxLayout,
     QVBoxLayout,
     QWidget,
 )
 
+from layer_panel import LayerPanel  # noqa: E402
 from main import CameraDisplay  # noqa: E402
 from status_bar import StatusBar  # noqa: E402
 
@@ -50,21 +52,59 @@ def main() -> None:
 
     win = QWidget()
     win.setWindowTitle("overlay harness — alignment_overlay_phase1 (no camera)")
-    lay = QVBoxLayout(win)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(0)
+    outer = QHBoxLayout(win)
+    outer.setContentsMargins(0, 0, 0, 0)
+    outer.setSpacing(0)
 
     disp = CameraDisplay()
     bar = StatusBar()
+    left = QWidget()
+    lay = QVBoxLayout(left)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(0)
     lay.addWidget(disp, 1)
     lay.addWidget(bar)
+    outer.addWidget(left, stretch=1)
+
+    panel = LayerPanel()
+    panel.setFixedWidth(240)
+    outer.addWidget(panel)
 
     # Same wiring as CameraWindow.
     bar.pencil_toggled.connect(disp.set_drawing_enabled)
     bar.tool_changed.connect(disp.set_tool)
     bar.clear_drawing_clicked.connect(disp.clear_strokes)
 
-    win.resize(1200, 800)
+    # Layer panel ⇄ display. Structural changes (add/remove/move/select)
+    # rebuild the panel rows; visibility/opacity only mutate the layer.
+    def refresh() -> None:
+        panel.set_layers(disp.layers(), disp.active_layer_index())
+
+    def on_add() -> None:
+        disp.add_layer()
+        refresh()
+
+    def on_remove(i: int) -> None:
+        disp.remove_layer(i)
+        refresh()
+
+    def on_select(i: int) -> None:
+        disp.set_active_layer(i)
+        refresh()
+
+    def on_move(i: int, delta: int) -> None:
+        disp.move_layer(i, delta)
+        refresh()
+
+    panel.add_layer_requested.connect(on_add)
+    panel.remove_layer_requested.connect(on_remove)
+    panel.select_layer_requested.connect(on_select)
+    panel.move_layer_requested.connect(on_move)
+    panel.visibility_toggled.connect(disp.set_layer_visible)
+    panel.opacity_changed.connect(disp.set_layer_opacity)
+    refresh()
+
+    win.resize(1300, 800)
     win.show()
 
     # The GL window keeps its own reference to the frame buffer, so a

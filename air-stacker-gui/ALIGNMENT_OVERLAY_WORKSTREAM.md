@@ -134,8 +134,30 @@ translate/rotate/scale a whole set into place without redrawing.
   panel-driven (no on-canvas handles this phase). Status bar's pencil/trash
   grows into the overlay toolbar.
 
-**Open questions:** layer management scope (add/delete/reorder/rename) — lean
-minimal first; on-canvas rotate/scale handles deferred.
+**Build sub-steps (reordered — management UI before transforms, so the
+operator can see/drive layers early):**
+- **2a — model + render plumbing** ✅: `OverlayLayer` + `_layers` + active
+  index; paint loop walks layers, skips hidden, per-layer opacity. Visual
+  no-op (one seeded layer).
+- **2b — layer management UI** ✅: `LayerPanel` (visibility, opacity,
+  add/remove, reorder ▲/▼, active-select), front-most-at-top. Wired into the
+  harness; full-app placement still pending. Includes the offscreen-raster
+  opacity fix (below).
+- **2c — layer transform**: translate/rotate/scale about the fixed image
+  center as one `QTransform`; inverse for hit-testing.
+- **2d — move tool**: `DrawTool.MOVE`, drag translates the active layer.
+
+**Opacity render note (decided in 2b):** the overlay is **rasterized to an
+offscreen ARGB image** (CPU raster engine), cached + dirty-flagged, and
+blitted onto the GL surface as a finished image — rather than stroked
+straight onto the GL paint engine, which rendered semi-transparent
+antialiased wide strokes as a flat bounding-box blob. Re-raster happens on
+overlay edits only; camera frames re-blit the cache. *Future perf:* if the
+rig's paint log spikes, hold the overlay in a persistent `QOpenGLTexture`
+and blend-blit (re-upload only on dirty) instead of per-frame `drawImage`.
+
+**Open questions:** layer management scope (rename) — lean minimal; on-canvas
+rotate/scale handles deferred; clear (🗑) currently wipes the active layer.
 
 ## Phase 3 — Import an image layer to trace, then hide
 
@@ -183,8 +205,8 @@ path (not QPainter) — fold the layer `QTransform` into the blit matrix.
 ## Build order summary
 
 1. Line tool (typed primitives; rubber-band; keep freehand). ✅ shipped
-1a. Aspect-correct coords (`IMAGE_ASPECT=4/3`; foundation for rigid rotation).
-2. Layer model + panel (visibility, opacity, translate, rotate, scale about
-   the fixed image center; active-layer drawing + move tool).
+1a. Aspect-correct coords (`IMAGE_ASPECT=4/3`; foundation for rigid rotation). ✅
+2. Layers — 2a model+render ✅, 2b management UI + offscreen opacity ✅,
+   2c transform (translate/rotate/scale about center), 2d move tool.
 3. Image-import layer (GL-textured; reuses the Phase 2 transform on the blit
    path; trace then hide).
