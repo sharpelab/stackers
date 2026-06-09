@@ -3629,23 +3629,30 @@ class CameraWindow(QMainWindow):
         self.layer_panel = LayerPanel()
         self.layer_panel.setFixedWidth(240)
 
-        # Top row: settings | camera view | layers | devices. The status bar
-        # is a full-width row beneath them all, so its buttons stay put when
-        # the layers panel is toggled (the view reclaims the freed space).
-        top = QWidget()
-        top_layout = QHBoxLayout(top)
-        top_layout.setContentsMargins(0, 0, 0, 0)
-        top_layout.addWidget(settings_panel)
-        top_layout.addWidget(self.label, stretch=1)
-        top_layout.addWidget(self.layer_panel)
-        top_layout.addWidget(right_panel)
+        # Middle column = camera view + layers panel, with the status bar
+        # spanning just those two beneath them. The settings (left) and device
+        # (right) panels flank it at full height, so the bar covers only the
+        # camera+layers region — and because that region keeps a fixed total
+        # width, the bar's buttons don't move when the layers panel toggles.
+        view_row = QWidget()
+        view_row_layout = QHBoxLayout(view_row)
+        view_row_layout.setContentsMargins(0, 0, 0, 0)
+        view_row_layout.setSpacing(0)
+        view_row_layout.addWidget(self.label, stretch=1)
+        view_row_layout.addWidget(self.layer_panel)
+
+        middle = QWidget()
+        middle_layout = QVBoxLayout(middle)
+        middle_layout.setContentsMargins(0, 0, 0, 0)
+        middle_layout.setSpacing(0)
+        middle_layout.addWidget(view_row, stretch=1)
+        middle_layout.addWidget(self.status_bar)
 
         central = QWidget()
-        outer = QVBoxLayout(central)
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.setSpacing(0)
-        outer.addWidget(top, stretch=1)
-        outer.addWidget(self.status_bar)
+        layout = QHBoxLayout(central)
+        layout.addWidget(settings_panel)
+        layout.addWidget(middle, stretch=1)
+        layout.addWidget(right_panel)
         self.setCentralWidget(central)
 
         if self.camera_options_panel is not None:
