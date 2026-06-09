@@ -848,6 +848,10 @@ class _CameraGLWindow(QOpenGLWindow):
         self._overlay_img: QImage | None = None
         self._overlay_dirty = True
         self._overlay_target: QRectF | None = None
+        # The overlay image is uploaded to this persistent GL texture only
+        # when it (re)rasterizes; the texture is alpha-blitted over the
+        # camera every frame, so a static overlay costs no per-frame upload.
+        self._overlay_tex: QOpenGLTexture | None = None
 
     def set_frame(self, frame_ref: np.ndarray) -> None:
         self._frame_ref = frame_ref
@@ -1224,12 +1228,13 @@ class _CameraGLWindow(QOpenGLWindow):
 
         The overlay is rasterized to an offscreen ARGB image with the CPU
         raster engine — where semi-transparent antialiased strokes (per-layer
-        opacity) render correctly — then drawn onto the GL surface as one
-        finished image. Drawing straight onto the GL paint engine instead
-        made per-layer opacity come out as a flat bounding-box blob. The
-        image is cached and only re-rasterized when the overlay changed
-        (`_overlay_dirty`) or the widget/target geometry changed; ordinary
-        camera frames just re-blit the cached image.
+        opacity) render correctly; drawing straight onto the GL paint engine
+        instead made per-layer opacity come out as a flat bounding-box blob.
+        That image is re-rasterized AND uploaded to a persistent GL texture
+        only when the overlay changed (`_overlay_dirty`) or the geometry
+        changed. Every frame just alpha-blits that texture over the camera —
+        so a static overlay costs one textured-quad blit, not a full-surface
+        re-upload (the per-frame `drawImage` upload was doubling paintGL ms).
         """
         has_content = any(
             layer.primitives or layer.image is not None for layer in self._layers
@@ -1237,7 +1242,7 @@ class _CameraGLWindow(QOpenGLWindow):
         if not has_content and self._active is None:
             return
         w, h = self.width(), self.height()
-        if w <= 0 or h <= 0:
+        if w <= 0 or h <= 0 or self._blitter is None:
             return
         if (
             self._overlay_img is None
@@ -1249,11 +1254,41 @@ class _CameraGLWindow(QOpenGLWindow):
             self._overlay_img = self._render_overlay_image(w, h, target)
             self._overlay_target = QRectF(target)
             self._overlay_dirty = False
-        painter = QPainter(self)
-        try:
-            painter.drawImage(0, 0, self._overlay_img)
-        finally:
-            painter.end()
+            self._upload_overlay_texture()
+        if self._overlay_tex is None:
+            return
+        # Alpha-blit the overlay texture over the camera. The image is
+        # premultiplied ARGB, so blend with (ONE, ONE_MINUS_SRC_ALPHA).
+        gl = self.context().functions()
+        gl.glEnable(0x0BE2)  # GL_BLEND
+        gl.glBlendFunc(1, 0x0303)  # GL_ONE, GL_ONE_MINUS_SRC_ALPHA
+        viewport = QRect(0, 0, w, h)
+        transform = QOpenGLTextureBlitter.targetTransform(QRectF(0, 0, w, h), viewport)
+        self._blitter.bind()
+        self._blitter.blit(
+            self._overlay_tex.textureId(),
+            transform,
+            QOpenGLTextureBlitter.Origin.OriginTopLeft,
+        )
+        self._blitter.release()
+        gl.glDisable(0x0BE2)  # GL_BLEND
+
+    def _upload_overlay_texture(self) -> None:
+        """(Re)create the overlay GL texture from the current overlay image.
+        Called only when the image was (re)rasterized — never per frame."""
+        if self._overlay_tex is not None:
+            self._overlay_tex.destroy()
+            self._overlay_tex = None
+        if self._overlay_img is None:
+            return
+        tex = QOpenGLTexture(
+            self._overlay_img,
+            QOpenGLTexture.MipMapGeneration.DontGenerateMipMaps,
+        )
+        tex.setMinificationFilter(QOpenGLTexture.Filter.Linear)
+        tex.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
+        tex.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
+        self._overlay_tex = tex
 
     def _render_overlay_image(self, w: int, h: int, target: QRectF) -> QImage:
         """Rasterize visible layers + the in-progress primitive to a

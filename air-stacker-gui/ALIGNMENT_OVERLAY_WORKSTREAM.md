@@ -163,9 +163,13 @@ offscreen ARGB image** (CPU raster engine), cached + dirty-flagged, and
 blitted onto the GL surface as a finished image — rather than stroked
 straight onto the GL paint engine, which rendered semi-transparent
 antialiased wide strokes as a flat bounding-box blob. Re-raster happens on
-overlay edits only; camera frames re-blit the cache. *Future perf:* if the
-rig's paint log spikes, hold the overlay in a persistent `QOpenGLTexture`
-and blend-blit (re-upload only on dirty) instead of per-frame `drawImage`.
+overlay edits only. **Perf pass ✅:** the cached image is uploaded to a
+persistent `QOpenGLTexture` only when it re-rasters, and that texture is
+alpha-blitted (premultiplied: `GL_ONE, GL_ONE_MINUS_SRC_ALPHA`) over the
+camera every frame via the existing blitter — so a *static* overlay costs a
+textured-quad blit, not a per-frame full-surface `drawImage` upload (which
+on the rig had ~doubled `paintGL` ms and caused edit-time hitches at large
+window sizes).
 
 **Open questions:** layer management scope (rename) — lean minimal; on-canvas
 rotate/scale handles deferred; clear (🗑) currently wipes the active layer.
