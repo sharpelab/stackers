@@ -23,8 +23,10 @@ import numpy as np
 # Stub the camera SDK — never invoked on the overlay path.
 sys.modules.setdefault("PySpin", types.ModuleType("PySpin"))
 
-from PySide6.QtWidgets import (  # noqa: E402  (after the PySpin stub)
+from PySide6.QtGui import QImage  # noqa: E402  (after the PySpin stub)
+from PySide6.QtWidgets import (  # noqa: E402
     QApplication,
+    QFileDialog,
     QHBoxLayout,
     QVBoxLayout,
     QWidget,
@@ -97,12 +99,28 @@ def main() -> None:
         disp.move_layer(i, delta)
         refresh()
 
+    def on_import() -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            win,
+            "Import reference image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)",
+        )
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            return
+        disp.add_image_layer(img, path.rsplit("/", 1)[-1])
+        refresh()
+
     def on_overlay_mutated() -> None:
         # Live-sync the settings controls (e.g. offset fields during a
         # canvas Move drag) without rebuilding the row list.
         panel.sync_active_values(disp.layers(), disp.active_layer_index())
 
     panel.add_layer_requested.connect(on_add)
+    panel.import_image_requested.connect(on_import)
     panel.remove_layer_requested.connect(on_remove)
     panel.select_layer_requested.connect(on_select)
     panel.move_layer_requested.connect(on_move)

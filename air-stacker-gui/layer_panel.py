@@ -35,6 +35,7 @@ from overlay import OverlayLayer
 
 class LayerPanel(QWidget):
     add_layer_requested = Signal()
+    import_image_requested = Signal()
     remove_layer_requested = Signal(int)
     select_layer_requested = Signal(int)
     visibility_toggled = Signal(int, bool)
@@ -67,6 +68,10 @@ class LayerPanel(QWidget):
         self._add_button = QPushButton("+ Add Layer")
         self._add_button.clicked.connect(self.add_layer_requested.emit)
         root.addWidget(self._add_button)
+
+        self._import_button = QPushButton("⬇ Import Image…")
+        self._import_button.clicked.connect(self.import_image_requested.emit)
+        root.addWidget(self._import_button)
 
         divider = QFrame()
         divider.setFrameShape(QFrame.Shape.HLine)

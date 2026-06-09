@@ -60,6 +60,7 @@ from overlay import (
     OverlayLayer,
     OverlayPrimitive,
     aspect_to_px,
+    image_fit_rect,
     layer_transform,
     normalize_pos,
 )
@@ -917,6 +918,26 @@ class _CameraGLWindow(QOpenGLWindow):
         self._active_layer = len(self._layers) - 1
         self._touch_overlay()
 
+    def add_image_layer(self, image: QImage, name: str | None = None) -> None:
+        """Insert an imported reference image as a new back-most layer (so
+        you trace in front of it) and make it active for positioning. Large
+        sources are downscaled once with a smooth (area-averaging) filter so
+        they don't alias when shrunk into the frame."""
+        max_side = 2048
+        if max(image.width(), image.height()) > max_side:
+            image = image.scaled(
+                max_side,
+                max_side,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self._layer_seq += 1
+        self._layers.insert(
+            0, OverlayLayer(name=name or f"Image {self._layer_seq}", image=image)
+        )
+        self._active_layer = 0
+        self._touch_overlay()
+
     def remove_layer(self, index: int) -> None:
         """Drop a layer. Never removes the last one (always ≥1 layer)."""
         if len(self._layers) <= 1 or not (0 <= index < len(self._layers)):
@@ -1032,6 +1053,7 @@ class _CameraGLWindow(QOpenGLWindow):
         if (
             self._drawing_enabled
             and event.button() == Qt.MouseButton.LeftButton
+            and self._active_layer_obj().image is None  # image layers aren't drawable
         ):
             n = self._pos_to_normalized(event.position())
             if n is not None:
@@ -1207,8 +1229,10 @@ class _CameraGLWindow(QOpenGLWindow):
         (`_overlay_dirty`) or the widget/target geometry changed; ordinary
         camera frames just re-blit the cached image.
         """
-        any_prims = any(layer.primitives for layer in self._layers)
-        if not any_prims and self._active is None:
+        has_content = any(
+            layer.primitives or layer.image is not None for layer in self._layers
+        )
+        if not has_content and self._active is None:
             return
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0:
@@ -1248,6 +1272,7 @@ class _CameraGLWindow(QOpenGLWindow):
         painter = QPainter(img)
         try:
             painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
             painter.setClipRect(target)  # device-px clip, set before transforms
             pen = QPen(QColor(255, 0, 0))
             pen.setWidthF(pen_w)
@@ -1260,6 +1285,13 @@ class _CameraGLWindow(QOpenGLWindow):
                     continue
                 painter.setOpacity(layer.opacity)
                 painter.setTransform(layer_transform(layer) * base)
+                if layer.image is not None:
+                    # Image drawn behind the layer's primitives, fit-contained
+                    # in the frame; the layer transform then positions it.
+                    painter.drawImage(
+                        image_fit_rect(layer.image.width(), layer.image.height()),
+                        layer.image,
+                    )
                 for prim in layer.primitives:
                     prim.draw(painter)
             if self._active is not None:
@@ -1331,6 +1363,9 @@ class CameraDisplay(QWidget):
 
     def add_layer(self, name: str | None = None) -> None:
         self._gl_window.add_layer(name)
+
+    def add_image_layer(self, image: QImage, name: str | None = None) -> None:
+        self._gl_window.add_image_layer(image, name)
 
     def remove_layer(self, index: int) -> None:
         self._gl_window.remove_layer(index)

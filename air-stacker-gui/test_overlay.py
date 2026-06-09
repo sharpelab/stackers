@@ -19,6 +19,7 @@ from overlay import (
     LineSegment,
     OverlayLayer,
     aspect_to_px,
+    image_fit_rect,
     layer_transform,
     normalize_pos,
     to_widget,
@@ -192,6 +193,33 @@ def test_aspect_to_px_inverse_delta() -> None:
     d = inv.map(QPointF(110.0, 20.0)) - inv.map(QPointF(10.0, 20.0))
     assert _approx(d.x(), 0.25 * IMAGE_ASPECT)
     assert _approx(d.y(), 0.0)
+
+
+def test_image_fit_rect_matching_aspect() -> None:
+    # A 4:3 image fills the whole frame [0,IMAGE_ASPECT]×[0,1].
+    r = image_fit_rect(1440, 1080)
+    assert _approx(r.x(), 0.0) and _approx(r.y(), 0.0)
+    assert _approx(r.width(), IMAGE_ASPECT) and _approx(r.height(), 1.0)
+
+
+def test_image_fit_rect_square_centered_x() -> None:
+    # A square image is height-limited, centered horizontally.
+    r = image_fit_rect(500, 500)
+    assert _approx(r.height(), 1.0) and _approx(r.width(), 1.0)
+    assert _approx(r.x(), (IMAGE_ASPECT - 1.0) / 2.0) and _approx(r.y(), 0.0)
+
+
+def test_image_fit_rect_wide_centered_y() -> None:
+    # A 16:9 image is width-limited, centered vertically.
+    r = image_fit_rect(1920, 1080)
+    assert _approx(r.width(), IMAGE_ASPECT)
+    assert _approx(r.height(), IMAGE_ASPECT / (1920 / 1080))
+    assert _approx(r.x(), 0.0) and _approx(r.y(), (1.0 - r.height()) / 2.0)
+
+
+def test_image_fit_rect_degenerate() -> None:
+    r = image_fit_rect(0, 0)
+    assert _approx(r.width(), IMAGE_ASPECT) and _approx(r.height(), 1.0)
 
 
 def test_layer_transform_inverse_roundtrip() -> None:

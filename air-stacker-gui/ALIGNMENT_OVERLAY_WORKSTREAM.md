@@ -168,7 +168,7 @@ and blend-blit (re-upload only on dirty) instead of per-frame `drawImage`.
 **Open questions:** layer management scope (rename) — lean minimal; on-canvas
 rotate/scale handles deferred; clear (🗑) currently wipes the active layer.
 
-## Phase 3 — Import an image layer to trace, then hide
+## Phase 3 — Import an image layer to trace, then hide  ✅ shipped
 
 **What:** a layer whose content is an **imported image** (PNG/JPG) — load it,
 position/scale it, trace over it on a drawing layer, then toggle it hidden.
@@ -176,22 +176,24 @@ position/scale it, trace over it on a drawing layer, then toggle it hidden.
 **Why:** trace a reference (target pattern, prior flake, an alignment
 template) directly on the live view.
 
-**Where / how:**
-- Extend the layer model so a layer's content can be an image instead of
-  primitives. Honor the same visibility / opacity / offset from Phase 2.
-- **Render perf matters:** the overlay repaints every `paintGL` (~60 Hz).
-  `QPainter.drawImage` of a large bitmap every frame is expensive — prefer
-  uploading the image **once as a GL texture and blitting it** (same path as
-  the camera frame, with alpha for opacity). QPainter is fine for the line
-  primitives; reserve the texture path for image layers.
-- **Placement:** decide how the image maps into the aspect-correct space
-  (fit / native + offset). The Phase 2 layer transform already provides
-  translate + rotate + scale about the image center, so an image layer just
-  reuses it — no new transform work expected.
-
-**Open question:** image layers honor the same `offset/rotation_deg/scale`,
-but a GL-textured image needs that transform applied on the **texture blit**
-path (not QPainter) — fold the layer `QTransform` into the blit matrix.
+**As built:**
+- `OverlayLayer` gains an `image: QImage | None`. A layer is image XOR
+  drawing — `image is None` is the discriminator; drawing on an image layer
+  is blocked (formal tagged union deferred to persistence — see Cross-cutting).
+- **No separate GL path needed:** because 2b made the overlay an offscreen
+  raster composite, an image layer just `drawImage`s into the same cached
+  image under its `layer_transform` + opacity, re-rastered only on edits
+  (not per frame). The earlier perf worry was about drawing the image every
+  frame onto the GL surface — the cache sidesteps it. The deferred
+  persistent-texture pass still applies if heavy dragging spikes the rig.
+- **Placement:** `image_fit_rect()` fit-contains the image in the frame at
+  its native aspect, centered; the layer transform takes it from there.
+  Imports go to the **back** of the stack (trace in front) and become active
+  for positioning. Large sources are downscaled once with a smooth
+  (area-averaging) filter so they don't alias when shrunk.
+- **Trace then hide** reuses the Phase 2 per-layer visibility toggle.
+- UI: a `⬇ Import Image…` button in the panel; the owner opens the file
+  dialog and calls `add_image_layer`.
 
 ## Cross-cutting
 
@@ -217,5 +219,5 @@ path (not QPainter) — fold the layer `QTransform` into the blit matrix.
 1a. Aspect-correct coords (`IMAGE_ASPECT=4/3`; foundation for rigid rotation). ✅
 2. Layers ✅ — 2a model+render, 2b management UI + offscreen opacity,
    2c rotate/scale transform + UI, 2d translation (move tool + offset).
-3. Image-import layer (GL-textured; reuses the Phase 2 transform on the blit
-   path; trace then hide).
+3. Image-import layer ✅ — reuses the offscreen-raster composite + Phase 2
+   transform; fit-contained, back-most, non-editable; trace then hide.

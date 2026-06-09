@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from PySide6.QtCore import QPointF, QRectF
-from PySide6.QtGui import QPainter, QTransform
+from PySide6.QtGui import QImage, QPainter, QTransform
 
 # Source pixel aspect (width / height). Flea3 = 1440×1080 = 4:3.
 IMAGE_ASPECT = 4 / 3
@@ -133,12 +133,18 @@ def aspect_to_px(rect: QRectF) -> QTransform:
 
 @dataclass
 class OverlayLayer:
-    """A named group of primitives drawn as a unit.
+    """A named layer drawn as a unit under one transform.
 
     `visible` / `opacity` apply per-layer. `offset` / `rotation_deg` /
-    `scale` define the layer's transform about the fixed image center
-    (Phase 2b applies it; in 2a they're carried but identity). New drawing
-    lands on the active layer.
+    `scale` define the layer's transform about the fixed image center.
+
+    Invariant — a layer is EITHER a drawing layer OR an image layer:
+      - drawing layer: `image is None`, holds `primitives`;
+      - image layer:   `image` set, `primitives` stays empty (drawing on it
+        is blocked) — an imported reference to trace over.
+    `image is None` is the discriminator. (A formal tagged union is deferred
+    until persistence needs explicit kinds; see the workstream doc.) New
+    drawing lands on the active layer.
     """
 
     name: str
@@ -148,3 +154,18 @@ class OverlayLayer:
     offset: QPointF = field(default_factory=lambda: QPointF(0.0, 0.0))
     rotation_deg: float = 0.0
     scale: float = 1.0
+    image: QImage | None = None
+
+
+def image_fit_rect(img_w: int, img_h: int) -> QRectF:
+    """Aspect-correct rect that fit-contains an `img_w`×`img_h` image within
+    the full frame [0, IMAGE_ASPECT] × [0, 1], centered, preserving the
+    image's aspect ratio. The layer transform adjusts it from there."""
+    if img_w <= 0 or img_h <= 0:
+        return QRectF(0.0, 0.0, IMAGE_ASPECT, 1.0)
+    ai = img_w / img_h
+    if ai >= IMAGE_ASPECT:  # wider than frame → limited by width
+        w, h = IMAGE_ASPECT, IMAGE_ASPECT / ai
+    else:  # taller than frame → limited by height
+        w, h = ai, 1.0
+    return QRectF((IMAGE_ASPECT - w) / 2.0, (1.0 - h) / 2.0, w, h)
