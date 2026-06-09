@@ -141,7 +141,9 @@ operator can see/drive layers early):**
   no-op (one seeded layer).
 - **2b — layer management UI** ✅: `LayerPanel` (visibility, opacity,
   add/remove, reorder ▲/▼, active-select), front-most-at-top. Wired into the
-  harness; full-app placement still pending. Includes the offscreen-raster
+  harness AND the real `CameraWindow` (240px column left of the device
+  panels; same signal wiring via `_wire_layer_panel`). Includes the
+  offscreen-raster
   opacity fix (below).
 - **2c — layer transform (rotate/scale)** ✅: `layer_transform()` composes
   translate/rotate/scale about the fixed image center as one `QTransform`,

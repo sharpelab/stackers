@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -64,6 +65,7 @@ from overlay import (
     layer_transform,
     normalize_pos,
 )
+from layer_panel import LayerPanel
 from smc100_panel import SMC100Panel
 from status_bar import StatusBar
 from webcam import WebcamConfig
@@ -3601,6 +3603,10 @@ class CameraWindow(QMainWindow):
         middle_layout.addWidget(self.status_bar)
         layout.addWidget(middle, stretch=1)
 
+        self.layer_panel = LayerPanel()
+        self.layer_panel.setFixedWidth(240)
+        layout.addWidget(self.layer_panel)
+
         layout.addWidget(right_panel)
         self.setCentralWidget(central)
 
@@ -3621,12 +3627,14 @@ class CameraWindow(QMainWindow):
             self.status_bar.webcam_button.setToolTip("disabled in config.toml [webcam]")
 
         # Drawing overlay: pencil toggles draw mode on the FLIR GL surface,
-        # the Freehand/Line group selects the active tool, trash clears.
-        # Primitives live in the GL window (normalized camera-image coords);
-        # see _CameraGLWindow / overlay.py.
+        # the Freehand/Line group selects the active tool, Move drags the
+        # active layer, trash clears. Primitives/layers live in the GL window
+        # (aspect-correct coords); see _CameraGLWindow / overlay.py.
         self.status_bar.pencil_toggled.connect(self.label.set_drawing_enabled)
         self.status_bar.tool_changed.connect(self.label.set_tool)
+        self.status_bar.move_toggled.connect(self.label.set_move_enabled)
         self.status_bar.clear_drawing_clicked.connect(self.label.clear_strokes)
+        self._wire_layer_panel()
 
         # Pipeline state — workers and mailboxes are recreated every time
         # acquisition (re)starts, e.g. on a binning swap.
@@ -3639,6 +3647,67 @@ class CameraWindow(QMainWindow):
         self.proc_worker: CameraProcessWorker | None = None
         self.hist_worker: HistWorker | None = None
         self._spawn_workers()
+
+    def _wire_layer_panel(self) -> None:
+        """Connect the LayerPanel ⇄ overlay (mirrors the dev harness).
+        Structural changes (add/import/remove/move/select) rebuild the rows;
+        visibility/opacity/transform mutate the layer; overlay_mutated
+        live-syncs the settings controls (e.g. offset during a canvas drag)."""
+        p = self.layer_panel
+        p.add_layer_requested.connect(self._on_add_layer)
+        p.import_image_requested.connect(self._on_import_image)
+        p.remove_layer_requested.connect(self._on_remove_layer)
+        p.select_layer_requested.connect(self._on_select_layer)
+        p.move_layer_requested.connect(self._on_move_layer)
+        p.visibility_toggled.connect(self.label.set_layer_visible)
+        p.opacity_changed.connect(self.label.set_layer_opacity)
+        p.rotation_changed.connect(self.label.set_layer_rotation)
+        p.scale_changed.connect(self.label.set_layer_scale)
+        p.offset_changed.connect(self.label.set_layer_offset)
+        self.label.overlay_mutated.connect(self._sync_layer_panel)
+        self._refresh_layer_panel()
+
+    def _refresh_layer_panel(self) -> None:
+        self.layer_panel.set_layers(
+            self.label.layers(), self.label.active_layer_index()
+        )
+
+    def _sync_layer_panel(self) -> None:
+        self.layer_panel.sync_active_values(
+            self.label.layers(), self.label.active_layer_index()
+        )
+
+    def _on_add_layer(self) -> None:
+        self.label.add_layer()
+        self._refresh_layer_panel()
+
+    def _on_import_image(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import reference image",
+            "",
+            "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)",
+        )
+        if not path:
+            return
+        img = QImage(path)
+        if img.isNull():
+            QMessageBox.warning(self, "Import failed", f"Could not load:\n{path}")
+            return
+        self.label.add_image_layer(img, path.rsplit("/", 1)[-1])
+        self._refresh_layer_panel()
+
+    def _on_remove_layer(self, index: int) -> None:
+        self.label.remove_layer(index)
+        self._refresh_layer_panel()
+
+    def _on_select_layer(self, index: int) -> None:
+        self.label.set_active_layer(index)
+        self._refresh_layer_panel()
+
+    def _on_move_layer(self, index: int, delta: int) -> None:
+        self.label.move_layer(index, delta)
+        self._refresh_layer_panel()
 
     def _spawn_workers(self) -> None:
         """Build the three-stage pipeline and start its threads.
