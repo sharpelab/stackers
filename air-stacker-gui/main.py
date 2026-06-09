@@ -3591,23 +3591,26 @@ class CameraWindow(QMainWindow):
             yoko_cfg=config.get("yoko"),
         )
 
-        central = QWidget()
-        layout = QHBoxLayout(central)
-        layout.addWidget(settings_panel)
-
-        middle = QWidget()
-        middle_layout = QVBoxLayout(middle)
-        middle_layout.setContentsMargins(0, 0, 0, 0)
-        middle_layout.setSpacing(0)
-        middle_layout.addWidget(self.label, stretch=1)
-        middle_layout.addWidget(self.status_bar)
-        layout.addWidget(middle, stretch=1)
-
         self.layer_panel = LayerPanel()
         self.layer_panel.setFixedWidth(240)
-        layout.addWidget(self.layer_panel)
 
-        layout.addWidget(right_panel)
+        # Top row: settings | camera view | layers | devices. The status bar
+        # is a full-width row beneath them all, so its buttons stay put when
+        # the layers panel is toggled (the view reclaims the freed space).
+        top = QWidget()
+        top_layout = QHBoxLayout(top)
+        top_layout.setContentsMargins(0, 0, 0, 0)
+        top_layout.addWidget(settings_panel)
+        top_layout.addWidget(self.label, stretch=1)
+        top_layout.addWidget(self.layer_panel)
+        top_layout.addWidget(right_panel)
+
+        central = QWidget()
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(top, stretch=1)
+        outer.addWidget(self.status_bar)
         self.setCentralWidget(central)
 
         if self.camera_options_panel is not None:
@@ -3634,6 +3637,7 @@ class CameraWindow(QMainWindow):
         self.status_bar.tool_changed.connect(self.label.set_tool)
         self.status_bar.move_toggled.connect(self.label.set_move_enabled)
         self.status_bar.clear_drawing_clicked.connect(self.label.clear_strokes)
+        self.status_bar.layers_toggled.connect(self.layer_panel.setVisible)
         self._wire_layer_panel()
 
         # Pipeline state — workers and mailboxes are recreated every time

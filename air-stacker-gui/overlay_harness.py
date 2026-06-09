@@ -54,29 +54,32 @@ def main() -> None:
 
     win = QWidget()
     win.setWindowTitle("overlay harness — alignment_overlay_phase1 (no camera)")
-    outer = QHBoxLayout(win)
+    outer = QVBoxLayout(win)
     outer.setContentsMargins(0, 0, 0, 0)
     outer.setSpacing(0)
 
     disp = CameraDisplay()
     bar = StatusBar()
-    left = QWidget()
-    lay = QVBoxLayout(left)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(0)
-    lay.addWidget(disp, 1)
-    lay.addWidget(bar)
-    outer.addWidget(left, stretch=1)
-
     panel = LayerPanel()
     panel.setFixedWidth(240)
-    outer.addWidget(panel)
+
+    # Camera view | layers panel on top; full-width status bar beneath, so
+    # the bar's buttons don't move when the layers panel is toggled.
+    top = QWidget()
+    top_layout = QHBoxLayout(top)
+    top_layout.setContentsMargins(0, 0, 0, 0)
+    top_layout.setSpacing(0)
+    top_layout.addWidget(disp, stretch=1)
+    top_layout.addWidget(panel)
+    outer.addWidget(top, stretch=1)
+    outer.addWidget(bar)
 
     # Same wiring as CameraWindow.
     bar.pencil_toggled.connect(disp.set_drawing_enabled)
     bar.move_toggled.connect(disp.set_move_enabled)
     bar.tool_changed.connect(disp.set_tool)
     bar.clear_drawing_clicked.connect(disp.clear_strokes)
+    bar.layers_toggled.connect(panel.setVisible)
 
     # Layer panel ⇄ display. Structural changes (add/remove/move/select)
     # rebuild the panel rows; visibility/opacity only mutate the layer.

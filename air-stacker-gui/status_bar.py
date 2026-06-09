@@ -25,6 +25,7 @@ class StatusBar(QFrame):
     """Thin horizontal strip: left-anchored slots, trailing stretch, right-anchored slots."""
 
     webcam_toggled = Signal(bool)
+    layers_toggled = Signal(bool)
     pencil_toggled = Signal(bool)
     tool_changed = Signal(object)  # emits a DrawTool
     move_toggled = Signal(bool)
@@ -52,6 +53,15 @@ class StatusBar(QFrame):
         self.webcam_button.setFlat(True)
         self.webcam_button.toggled.connect(self.webcam_toggled.emit)
         self.add_right_slot(self.webcam_button)
+
+        # Toggle the docked Layers panel's visibility. Default checked
+        # (panel shown); connect after setChecked so init fires no signal.
+        self.layers_button = QPushButton("▦ Layers")
+        self.layers_button.setCheckable(True)
+        self.layers_button.setFlat(True)
+        self.layers_button.setChecked(True)
+        self.layers_button.toggled.connect(self.layers_toggled.emit)
+        self.add_right_slot(self.layers_button)
 
         self.pencil_button = QPushButton("✎ Draw")
         self.pencil_button.setCheckable(True)
