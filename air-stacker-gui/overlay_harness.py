@@ -80,6 +80,7 @@ def main() -> None:
     bar.tool_changed.connect(disp.set_tool)
     bar.clear_drawing_clicked.connect(disp.clear_strokes)
     bar.layers_toggled.connect(panel.setVisible)
+    panel.setVisible(bar.layers_button.isChecked())
 
     # Layer panel ⇄ display. Structural changes (add/remove/move/select)
     # rebuild the panel rows; visibility/opacity only mutate the layer.

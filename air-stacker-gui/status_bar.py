@@ -54,12 +54,12 @@ class StatusBar(QFrame):
         self.webcam_button.toggled.connect(self.webcam_toggled.emit)
         self.add_right_slot(self.webcam_button)
 
-        # Toggle the docked Layers panel's visibility. Default checked
-        # (panel shown); connect after setChecked so init fires no signal.
+        # Toggle the docked Layers panel's visibility. Default unchecked
+        # (panel hidden); the owner syncs the panel's initial visibility from
+        # this button's state.
         self.layers_button = QPushButton("▦ Layers")
         self.layers_button.setCheckable(True)
         self.layers_button.setFlat(True)
-        self.layers_button.setChecked(True)
         self.layers_button.toggled.connect(self.layers_toggled.emit)
         self.add_right_slot(self.layers_button)
 

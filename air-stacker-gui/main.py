@@ -3638,6 +3638,7 @@ class CameraWindow(QMainWindow):
         self.status_bar.move_toggled.connect(self.label.set_move_enabled)
         self.status_bar.clear_drawing_clicked.connect(self.label.clear_strokes)
         self.status_bar.layers_toggled.connect(self.layer_panel.setVisible)
+        self.layer_panel.setVisible(self.status_bar.layers_button.isChecked())
         self._wire_layer_panel()
 
         # Pipeline state — workers and mailboxes are recreated every time
