@@ -151,6 +151,10 @@ move_stale_ms = 1000
 # V-feedback rate (predictive trip + move/jog staleness). 0 = as fast as the
 # 617 emits (old default — hammered the bus; see the recurring GPIB-wedge
 # investigation 2026-06-03).
+# GPIB primary 27 is the 617's factory default. It reverted from the
+# previously-set 29 on a cold power-cycle (2026-06-10) — likely a dead NVRAM
+# backup battery, so it boots to 27 every time. Config tracks 27 rather than
+# re-setting 29 at the front panel after each power-cycle.
 [yoko.keithley617]
-resource = "GPIB0::29::INSTR"
+resource = "GPIB0::27::INSTR"
 poll_interval_ms = 50
