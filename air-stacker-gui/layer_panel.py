@@ -16,9 +16,11 @@ so the owner's handlers stay simple.
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
+    QColorDialog,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
@@ -40,6 +42,7 @@ class LayerPanel(QWidget):
     select_layer_requested = Signal(int)
     visibility_toggled = Signal(int, bool)
     opacity_changed = Signal(int, float)
+    color_changed = Signal(int, QColor)  # (index, stroke color)
     rotation_changed = Signal(int, float)  # (index, degrees)
     scale_changed = Signal(int, float)  # (index, scale factor)
     offset_changed = Signal(int, float, float)  # (index, x, y)
@@ -89,6 +92,15 @@ class LayerPanel(QWidget):
         self._opacity.setRange(0, 100)
         self._opacity.valueChanged.connect(self._on_opacity)
         root.addWidget(self._opacity)
+
+        # Stroke color: a swatch button showing the layer's color; click
+        # opens a color dialog. Disabled for image layers (no strokes).
+        root.addWidget(QLabel("Color"))
+        self._color = QColor(255, 0, 0)
+        self._color_button = QPushButton()
+        self._color_button.setFixedHeight(22)
+        self._color_button.clicked.connect(self._on_color_clicked)
+        root.addWidget(self._color_button)
 
         # Rotation + scale: each a slider (drag) paired with a spinbox
         # (type), kept in sync. Slider values are integers, so scale's
@@ -150,6 +162,12 @@ class LayerPanel(QWidget):
 
     def _on_opacity(self, value: int) -> None:
         self.opacity_changed.emit(self._active, value / 100.0)
+
+    def _on_color_clicked(self) -> None:
+        color = QColorDialog.getColor(self._color, self, "Layer stroke color")
+        if color.isValid():
+            # The swatch syncs back via overlay_mutated → sync_active_values.
+            self.color_changed.emit(self._active, color)
 
     def _on_rotation_slider(self, value: int) -> None:
         self._rotation_spin.blockSignals(True)
@@ -246,6 +264,18 @@ class LayerPanel(QWidget):
         self._opacity.blockSignals(True)
         self._opacity.setValue(round(active_layer.opacity * 100))
         self._opacity.blockSignals(False)
+
+        self._color = QColor(active_layer.color)
+        is_image = active_layer.image is not None
+        self._color_button.setEnabled(not is_image)
+        self._color_button.setStyleSheet(
+            f"background-color: {self._color.name()};"
+        )
+        self._color_button.setToolTip(
+            "Image layers have no stroke color"
+            if is_image
+            else "Stroke color for this layer's drawing"
+        )
 
         deg = round(active_layer.rotation_deg) % 360
         for w in (self._rotation_slider, self._rotation_spin):

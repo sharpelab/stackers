@@ -11,6 +11,7 @@ and the primitive data model.
 from __future__ import annotations
 
 from PySide6.QtCore import QPointF, QRectF
+from PySide6.QtGui import QColor
 
 from overlay import (
     IMAGE_ASPECT,
@@ -135,6 +136,7 @@ def test_layer_defaults() -> None:
     assert layer.primitives == []
     assert layer.visible is True
     assert layer.opacity == 1.0
+    assert layer.color == QColor(255, 0, 0)  # default stroke color is red
     assert _pt_approx(layer.offset, 0.0, 0.0)
     assert layer.rotation_deg == 0.0
     assert layer.scale == 1.0

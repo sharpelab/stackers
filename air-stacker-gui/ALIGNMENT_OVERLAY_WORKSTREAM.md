@@ -158,18 +158,42 @@ operator can see/drive layers early):**
   `overlay_mutated` signal live-syncs the panel offset fields during a drag.
   Move always targets the active layer (no canvas layer hit-testing).
 
-**Opacity render note (decided in 2b):** the overlay is **rasterized to an
-offscreen ARGB image** (CPU raster engine), cached + dirty-flagged, and
-blitted onto the GL surface as a finished image — rather than stroked
+**Opacity render note (decided in 2b):** the overlay is **rasterized to
+offscreen ARGB images** (CPU raster engine), cached + dirty-flagged, and
+blitted onto the GL surface as finished images — rather than stroked
 straight onto the GL paint engine, which rendered semi-transparent
 antialiased wide strokes as a flat bounding-box blob. Re-raster happens on
-overlay edits only. **Perf pass ✅:** the cached image is uploaded to a
+overlay edits only. **Perf pass ✅:** each raster is uploaded to a
 persistent `QOpenGLTexture` only when it re-rasters, and that texture is
 alpha-blitted (premultiplied: `GL_ONE, GL_ONE_MINUS_SRC_ALPHA`) over the
 camera every frame via the existing blitter — so a *static* overlay costs a
 textured-quad blit, not a per-frame full-surface `drawImage` upload (which
 on the rig had ~doubled `paintGL` ms and caused edit-time hitches at large
 window sizes).
+
+**Per-layer textures ✅ (opacity-smoothness fix):** the single composite
+raster baked per-layer opacity into the image, so *every opacity slider
+tick* re-rastered all layers (including a smooth-transformed imported
+image) + re-uploaded a full-window texture — on the rig the GUI thread
+saturated during a drag and opacity advanced in coarse, discrete jumps.
+Now each layer rasters **at full opacity into its own persistent texture**
+(dirty-flagged per layer, keyed by layer identity, pruned on removal) and
+opacity is applied at blit time via `QOpenGLTextureBlitter.setOpacity` —
+source-over is associative, so per-layer GL compositing is mathematically
+identical to the single-image composite. Opacity / visibility / reorder
+changes re-raster **nothing**; content / transform / color changes
+re-raster only the touched layer. The in-progress stroke rasters alone
+into its own texture (blitted last, always at full opacity), so drawing in
+front of a big image layer no longer re-rasters the image per mouse-move.
+
+**Layer stroke color ✅:** `OverlayLayer.color` (default red — the prior
+hardcoded pen), applied as the cosmetic pen color in the layer's raster;
+the in-progress stroke uses the active layer's color. Per-layer rather
+than per-stroke: visibility/opacity/transform are already layer
+properties, and "a different color" in the alignment workflow means "a
+different reference set" — which wants its own layer (independent
+opacity/visibility/move) anyway. UI: a **Color** swatch button in Layer
+Settings (opens `QColorDialog`; disabled for image layers).
 
 **Open questions:** layer management scope (rename) — lean minimal; on-canvas
 rotate/scale handles deferred; clear (🗑) currently wipes the active layer.

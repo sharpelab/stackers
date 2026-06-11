@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 
 from PySide6.QtCore import QPointF, QRectF
-from PySide6.QtGui import QImage, QPainter, QTransform
+from PySide6.QtGui import QColor, QImage, QPainter, QTransform
 
 # Source pixel aspect (width / height). Flea3 = 1440×1080 = 4:3.
 IMAGE_ASPECT = 4 / 3
@@ -135,8 +135,10 @@ def aspect_to_px(rect: QRectF) -> QTransform:
 class OverlayLayer:
     """A named layer drawn as a unit under one transform.
 
-    `visible` / `opacity` apply per-layer. `offset` / `rotation_deg` /
-    `scale` define the layer's transform about the fixed image center.
+    `visible` / `opacity` apply per-layer. `color` is the stroke color for
+    the layer's primitives (image layers ignore it). `offset` /
+    `rotation_deg` / `scale` define the layer's transform about the fixed
+    image center.
 
     Invariant — a layer is EITHER a drawing layer OR an image layer:
       - drawing layer: `image is None`, holds `primitives`;
@@ -151,6 +153,7 @@ class OverlayLayer:
     primitives: list[OverlayPrimitive] = field(default_factory=list)
     visible: bool = True
     opacity: float = 1.0
+    color: QColor = field(default_factory=lambda: QColor(255, 0, 0))
     offset: QPointF = field(default_factory=lambda: QPointF(0.0, 0.0))
     rotation_deg: float = 0.0
     scale: float = 1.0

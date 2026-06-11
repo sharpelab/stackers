@@ -775,6 +775,19 @@ def render_hist_image(
     return qimg
 
 
+@dataclass
+class _LayerCache:
+    """Persistent raster of one overlay layer: the GL texture plus the
+    geometry it was rastered for (so a resize / camera-rect change forces a
+    re-raster). `dirty` marks content/transform/color changes; opacity and
+    visibility never dirty a cache — they're applied at blit time."""
+
+    tex: QOpenGLTexture
+    target: QRectF
+    size: tuple[int, int]
+    dirty: bool = False
+
+
 class _CameraGLWindow(QOpenGLWindow):
     """Direct-rendered GL surface for one camera frame at a time.
 
@@ -839,19 +852,25 @@ class _CameraGLWindow(QOpenGLWindow):
         self._moving = False
         self._move_press_world = QPointF()
         self._move_start_offset = QPointF()
-        # The overlay is rasterized to an offscreen ARGB image (CPU raster
-        # engine) and blitted as a finished image, rather than stroked
-        # straight onto the GL surface: the GL paint engine misrenders
-        # semi-transparent antialiased wide strokes (per-layer opacity came
-        # out as a flat bounding-box blob). Cached + dirty-flagged so the
-        # re-raster happens on overlay edits, not every camera frame.
-        self._overlay_img: QImage | None = None
-        self._overlay_dirty = True
-        self._overlay_target: QRectF | None = None
-        # The overlay image is uploaded to this persistent GL texture only
-        # when it (re)rasterizes; the texture is alpha-blitted over the
-        # camera every frame, so a static overlay costs no per-frame upload.
-        self._overlay_tex: QOpenGLTexture | None = None
+        # Layers are rasterized to offscreen ARGB images (CPU raster engine)
+        # and blitted as finished images, rather than stroked straight onto
+        # the GL surface: the GL paint engine misrenders semi-transparent
+        # antialiased wide strokes. Each layer gets its OWN persistent
+        # texture, rastered at FULL opacity; per-layer opacity is applied at
+        # blit time (QOpenGLTextureBlitter.setOpacity), so an opacity drag
+        # never re-rasters — only content/transform/color changes do, and
+        # only for the touched layer. Caches are keyed by id(layer) (stable
+        # across reorders); removal queues the texture for destruction in
+        # paintGL, where a GL context is current.
+        self._layer_caches: dict[int, _LayerCache] = {}
+        self._dead_textures: list[QOpenGLTexture] = []
+        # The in-progress primitive rasters separately (it draws at full
+        # opacity regardless of the layer's opacity) and re-rasters on every
+        # stroke update — but alone, without the committed layers.
+        self._active_tex: QOpenGLTexture | None = None
+        self._active_dirty = True
+        self._active_cache_target: QRectF | None = None
+        self._active_cache_size: tuple[int, int] = (0, 0)
 
     def set_frame(self, frame_ref: np.ndarray) -> None:
         self._frame_ref = frame_ref
@@ -863,11 +882,24 @@ class _CameraGLWindow(QOpenGLWindow):
         self._frame_dirty = False
         self.update()
 
-    def _touch_overlay(self) -> None:
-        """Mark the overlay image stale and request a repaint. Used by every
-        overlay mutation so the offscreen image re-rasters; plain camera
-        frames call `update()` only, reusing the cached overlay image."""
-        self._overlay_dirty = True
+    def _touch_layer(self, index: int) -> None:
+        """A layer's content/transform/color changed — mark its raster cache
+        stale and request a repaint."""
+        entry = self._layer_caches.get(id(self._layers[index]))
+        if entry is not None:
+            entry.dirty = True
+        self.update()
+        self.overlay_mutated.emit()
+
+    def _touch_composite(self) -> None:
+        """Only how layers composite changed (opacity / visibility / order /
+        add / remove) — repaint reusing the cached per-layer rasters."""
+        self.update()
+        self.overlay_mutated.emit()
+
+    def _touch_active(self) -> None:
+        """The in-progress primitive changed — re-raster just it."""
+        self._active_dirty = True
         self.update()
         self.overlay_mutated.emit()
 
@@ -883,7 +915,7 @@ class _CameraGLWindow(QOpenGLWindow):
             self.unsetCursor()
             if self._active is not None:
                 self._active = None
-                self._touch_overlay()
+                self._touch_composite()
 
     def set_move_enabled(self, enabled: bool) -> None:
         """Toggle move mode — drag translates the active layer. Mutually
@@ -904,7 +936,7 @@ class _CameraGLWindow(QOpenGLWindow):
         self._tool = tool
         if self._active is not None:
             self._active = None
-            self._touch_overlay()
+            self._touch_composite()
 
     def _active_layer_obj(self) -> OverlayLayer:
         return self._layers[self._active_layer]
@@ -922,7 +954,7 @@ class _CameraGLWindow(QOpenGLWindow):
         self._layer_seq += 1
         self._layers.append(OverlayLayer(name=name or f"Layer {self._layer_seq}"))
         self._active_layer = len(self._layers) - 1
-        self._touch_overlay()
+        self._touch_composite()
 
     def add_image_layer(self, image: QImage, name: str | None = None) -> None:
         """Insert an imported reference image as a new back-most layer (so
@@ -942,19 +974,25 @@ class _CameraGLWindow(QOpenGLWindow):
             0, OverlayLayer(name=name or f"Image {self._layer_seq}", image=image)
         )
         self._active_layer = 0
-        self._touch_overlay()
+        self._touch_composite()
 
     def remove_layer(self, index: int) -> None:
         """Drop a layer. Never removes the last one (always ≥1 layer)."""
         if len(self._layers) <= 1 or not (0 <= index < len(self._layers)):
             return
-        self._layers.pop(index)
+        removed = self._layers.pop(index)
+        # Evict the raster cache eagerly (so a reused id() can't resurrect
+        # stale content); the texture is destroyed next paintGL, where a GL
+        # context is current.
+        entry = self._layer_caches.pop(id(removed), None)
+        if entry is not None:
+            self._dead_textures.append(entry.tex)
         # Keep the active index valid and pointing at the same-or-nearest layer.
         if self._active_layer >= len(self._layers):
             self._active_layer = len(self._layers) - 1
         elif self._active_layer > index:
             self._active_layer -= 1
-        self._touch_overlay()
+        self._touch_composite()
 
     def set_active_layer(self, index: int) -> None:
         if 0 <= index < len(self._layers):
@@ -963,27 +1001,32 @@ class _CameraGLWindow(QOpenGLWindow):
     def set_layer_visible(self, index: int, visible: bool) -> None:
         if 0 <= index < len(self._layers):
             self._layers[index].visible = visible
-            self._touch_overlay()
+            self._touch_composite()
 
     def set_layer_opacity(self, index: int, opacity: float) -> None:
         if 0 <= index < len(self._layers):
             self._layers[index].opacity = max(0.0, min(1.0, opacity))
-            self._touch_overlay()
+            self._touch_composite()
+
+    def set_layer_color(self, index: int, color: QColor) -> None:
+        if 0 <= index < len(self._layers):
+            self._layers[index].color = QColor(color)
+            self._touch_layer(index)
 
     def set_layer_rotation(self, index: int, degrees: float) -> None:
         if 0 <= index < len(self._layers):
             self._layers[index].rotation_deg = degrees
-            self._touch_overlay()
+            self._touch_layer(index)
 
     def set_layer_scale(self, index: int, scale: float) -> None:
         if 0 <= index < len(self._layers):
             self._layers[index].scale = max(0.01, scale)
-            self._touch_overlay()
+            self._touch_layer(index)
 
     def set_layer_offset(self, index: int, x: float, y: float) -> None:
         if 0 <= index < len(self._layers):
             self._layers[index].offset = QPointF(x, y)
-            self._touch_overlay()
+            self._touch_layer(index)
 
     def move_layer(self, index: int, delta: int) -> None:
         """Reorder a layer by `delta` in the draw stack (+1 = toward front)."""
@@ -996,7 +1039,7 @@ class _CameraGLWindow(QOpenGLWindow):
             self._active_layer = j
         elif self._active_layer == j:
             self._active_layer = index
-        self._touch_overlay()
+        self._touch_composite()
 
     def clear_strokes(self) -> None:
         """Drop the active layer's primitives + any in-progress one.
@@ -1008,7 +1051,7 @@ class _CameraGLWindow(QOpenGLWindow):
         layer.primitives = []
         self._active = None
         if had_anything:
-            self._touch_overlay()
+            self._touch_layer(self._active_layer)
 
     def _pos_to_normalized(self, pos: QPointF) -> QPointF | None:
         """Map widget coords → (nx, ny) in aspect-correct image space
@@ -1069,7 +1112,7 @@ class _CameraGLWindow(QOpenGLWindow):
                     self._active = LineSegment(n, QPointF(n))
                 else:
                     self._active = FreehandStroke([n])
-                self._touch_overlay()
+                self._touch_active()
                 event.accept()
                 return
         super().mousePressEvent(event)
@@ -1095,7 +1138,7 @@ class _CameraGLWindow(QOpenGLWindow):
                     self._active.end = n
                 elif isinstance(self._active, FreehandStroke):
                     self._active.points.append(n)
-                self._touch_overlay()
+                self._touch_active()
             event.accept()
             return
         super().mouseMoveEvent(event)
@@ -1117,10 +1160,11 @@ class _CameraGLWindow(QOpenGLWindow):
                 and self._active.start == self._active.end
             ):
                 self._active = None
+                self._touch_composite()
             else:
                 self._active_layer_obj().primitives.append(self._active)
                 self._active = None
-            self._touch_overlay()
+                self._touch_layer(self._active_layer)
             event.accept()
             return
         super().mouseReleaseEvent(event)
@@ -1226,117 +1270,175 @@ class _CameraGLWindow(QOpenGLWindow):
     def _paint_overlay(self, target: QRectF) -> None:
         """Composite the overlay layers over the camera blit.
 
-        The overlay is rasterized to an offscreen ARGB image with the CPU
-        raster engine — where semi-transparent antialiased strokes (per-layer
-        opacity) render correctly; drawing straight onto the GL paint engine
-        instead made per-layer opacity come out as a flat bounding-box blob.
-        That image is re-rasterized AND uploaded to a persistent GL texture
-        only when the overlay changed (`_overlay_dirty`) or the geometry
-        changed. Every frame just alpha-blits that texture over the camera —
-        so a static overlay costs one textured-quad blit, not a full-surface
-        re-upload (the per-frame `drawImage` upload was doubling paintGL ms).
+        Each layer is rasterized to its own offscreen ARGB image with the
+        CPU raster engine — where semi-transparent antialiased strokes
+        render correctly; drawing straight onto the GL paint engine instead
+        made per-layer opacity come out as a flat bounding-box blob. A
+        layer re-rasterizes (and re-uploads its persistent texture) only
+        when ITS content/transform/color changed or the geometry changed.
+        Every frame alpha-blits the cached textures back-to-front with the
+        layer's opacity applied AT BLIT TIME (`blitter.setOpacity`) — so an
+        opacity drag costs zero raster work and stays smooth, and a static
+        overlay costs only textured-quad blits. The in-progress primitive
+        blits last from its own texture, always at full opacity.
         """
-        has_content = any(
-            layer.primitives or layer.image is not None for layer in self._layers
-        )
-        if not has_content and self._active is None:
-            return
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0 or self._blitter is None:
             return
-        if (
-            self._overlay_img is None
-            or self._overlay_img.width() != w
-            or self._overlay_img.height() != h
-            or self._overlay_dirty
-            or self._overlay_target != target
-        ):
-            self._overlay_img = self._render_overlay_image(w, h, target)
-            self._overlay_target = QRectF(target)
-            self._overlay_dirty = False
-            self._upload_overlay_texture()
-        if self._overlay_tex is None:
-            return
-        # Alpha-blit the overlay texture over the camera. The image is
-        # premultiplied ARGB, so blend with (ONE, ONE_MINUS_SRC_ALPHA).
+        if self._dead_textures:
+            # Textures evicted by remove_layer — destroy now, with a context.
+            for tex in self._dead_textures:
+                tex.destroy()
+            self._dead_textures.clear()
+
         gl = self.context().functions()
-        gl.glEnable(0x0BE2)  # GL_BLEND
-        gl.glBlendFunc(1, 0x0303)  # GL_ONE, GL_ONE_MINUS_SRC_ALPHA
         viewport = QRect(0, 0, w, h)
         transform = QOpenGLTextureBlitter.targetTransform(QRectF(0, 0, w, h), viewport)
-        self._blitter.bind()
-        self._blitter.blit(
-            self._overlay_tex.textureId(),
-            transform,
-            QOpenGLTextureBlitter.Origin.OriginTopLeft,
-        )
-        self._blitter.release()
-        gl.glDisable(0x0BE2)  # GL_BLEND
+        size = (w, h)
+        blitting = False
 
-    def _upload_overlay_texture(self) -> None:
-        """(Re)create the overlay GL texture from the current overlay image.
-        Called only when the image was (re)rasterized — never per frame."""
-        if self._overlay_tex is not None:
-            self._overlay_tex.destroy()
-            self._overlay_tex = None
-        if self._overlay_img is None:
-            return
+        for layer in self._layers:
+            if not layer.visible or layer.opacity <= 0.0:
+                continue
+            if not layer.primitives and layer.image is None:
+                continue
+            entry = self._layer_caches.get(id(layer))
+            if (
+                entry is None
+                or entry.dirty
+                or entry.size != size
+                or entry.target != target
+            ):
+                tex = self._make_overlay_texture(
+                    self._render_layer_image(layer, w, h, target)
+                )
+                if entry is not None:
+                    entry.tex.destroy()
+                entry = _LayerCache(tex=tex, target=QRectF(target), size=size)
+                self._layer_caches[id(layer)] = entry
+            if not blitting:
+                # STRAIGHT-alpha blend: QOpenGLTexture(QImage) converts the
+                # premultiplied raster to straight RGBA8888 on upload, and
+                # the blitter's setOpacity multiplies ONLY the alpha channel
+                # in its shader — so the blend must scale RGB by src alpha.
+                # (With GL_ONE here, opacity changed the background mix but
+                # never dimmed the stroke color.)
+                gl.glEnable(0x0BE2)  # GL_BLEND
+                gl.glBlendFunc(0x0302, 0x0303)  # GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA
+                self._blitter.bind()
+                blitting = True
+            self._blitter.setOpacity(layer.opacity)
+            self._blitter.blit(
+                entry.tex.textureId(),
+                transform,
+                QOpenGLTextureBlitter.Origin.OriginTopLeft,
+            )
+
+        # In-progress primitive: own texture, re-rastered on stroke updates
+        # (without the committed layers), always blitted at full opacity so
+        # the operator sees what they're drawing even on a dimmed layer.
+        if self._active is not None:
+            if (
+                self._active_tex is None
+                or self._active_dirty
+                or self._active_cache_size != size
+                or self._active_cache_target != target
+            ):
+                if self._active_tex is not None:
+                    self._active_tex.destroy()
+                self._active_tex = self._make_overlay_texture(
+                    self._render_active_image(w, h, target)
+                )
+                self._active_cache_target = QRectF(target)
+                self._active_cache_size = size
+                self._active_dirty = False
+            if not blitting:
+                gl.glEnable(0x0BE2)
+                gl.glBlendFunc(0x0302, 0x0303)
+                self._blitter.bind()
+                blitting = True
+            self._blitter.setOpacity(1.0)
+            self._blitter.blit(
+                self._active_tex.textureId(),
+                transform,
+                QOpenGLTextureBlitter.Origin.OriginTopLeft,
+            )
+        elif self._active_tex is not None:
+            # Stroke committed/dropped — the texture is stale; drop it.
+            self._active_tex.destroy()
+            self._active_tex = None
+
+        if blitting:
+            # The blitter is shared with the camera blit — restore opacity.
+            self._blitter.setOpacity(1.0)
+            self._blitter.release()
+            gl.glDisable(0x0BE2)  # GL_BLEND
+
+    @staticmethod
+    def _make_overlay_texture(img: QImage) -> QOpenGLTexture:
+        """Upload a rasterized overlay image to a GL texture."""
         tex = QOpenGLTexture(
-            self._overlay_img,
+            img,
             QOpenGLTexture.MipMapGeneration.DontGenerateMipMaps,
         )
         tex.setMinificationFilter(QOpenGLTexture.Filter.Linear)
         tex.setMagnificationFilter(QOpenGLTexture.Filter.Linear)
         tex.setWrapMode(QOpenGLTexture.WrapMode.ClampToEdge)
-        self._overlay_tex = tex
+        return tex
 
-    def _render_overlay_image(self, w: int, h: int, target: QRectF) -> QImage:
-        """Rasterize visible layers + the in-progress primitive to a
-        transparent ARGB image. Each layer draws under its own transform
-        (layer-local → aspect-correct via `layer_transform`, then
-        aspect-correct → px via `base`), so rotate/scale about the image
-        center is rigid. Primitives draw in raw coords; the pen is cosmetic
-        so line weight is constant regardless of layer scale. Layers draw
-        back-to-front, hidden skipped, per-layer opacity via `setOpacity`
-        (correct on the raster engine). The active primitive draws last, at
-        full opacity, under the active layer's transform."""
-        # Cosmetic pen width in display px: 0.2% of the camera-rect width,
-        # so visual weight stays consistent across binning + resize + scale.
-        pen_w = max(1.0, 0.002 * target.width())
-        base = aspect_to_px(target)
+    def _new_overlay_raster(
+        self, w: int, h: int, target: QRectF, layer: OverlayLayer
+    ) -> tuple[QImage, QPainter]:
+        """Transparent ARGB image + painter configured for `layer`: clipped
+        to the camera rect, cosmetic pen in the layer's stroke color, and
+        the layer transform composed with aspect-correct → px (so rotate/
+        scale about the image center is rigid and primitives draw in raw
+        coords). The cosmetic pen keeps line weight constant regardless of
+        layer scale; its width is 0.2% of the camera-rect width so visual
+        weight stays consistent across binning + resize."""
         img = QImage(w, h, QImage.Format.Format_ARGB32_Premultiplied)
         img.fill(Qt.GlobalColor.transparent)
         painter = QPainter(img)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setClipRect(target)  # device-px clip, set before transforms
+        pen = QPen(layer.color)
+        pen.setWidthF(max(1.0, 0.002 * target.width()))
+        pen.setCosmetic(True)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setTransform(layer_transform(layer) * aspect_to_px(target))
+        return img, painter
+
+    def _render_layer_image(
+        self, layer: OverlayLayer, w: int, h: int, target: QRectF
+    ) -> QImage:
+        """Rasterize ONE layer at full opacity (opacity applies at blit)."""
+        img, painter = self._new_overlay_raster(w, h, target, layer)
         try:
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-            painter.setClipRect(target)  # device-px clip, set before transforms
-            pen = QPen(QColor(255, 0, 0))
-            pen.setWidthF(pen_w)
-            pen.setCosmetic(True)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-            painter.setPen(pen)
-            for layer in self._layers:
-                if not layer.visible:
-                    continue
-                painter.setOpacity(layer.opacity)
-                painter.setTransform(layer_transform(layer) * base)
-                if layer.image is not None:
-                    # Image drawn behind the layer's primitives, fit-contained
-                    # in the frame; the layer transform then positions it.
-                    painter.drawImage(
-                        image_fit_rect(layer.image.width(), layer.image.height()),
-                        layer.image,
-                    )
-                for prim in layer.primitives:
-                    prim.draw(painter)
-            if self._active is not None:
-                painter.setOpacity(1.0)
-                painter.setTransform(
-                    layer_transform(self._active_layer_obj()) * base
+            if layer.image is not None:
+                # Image drawn behind the layer's primitives, fit-contained
+                # in the frame; the layer transform then positions it.
+                painter.drawImage(
+                    image_fit_rect(layer.image.width(), layer.image.height()),
+                    layer.image,
                 )
-                self._active.draw(painter)
+            for prim in layer.primitives:
+                prim.draw(painter)
+        finally:
+            painter.end()
+        return img
+
+    def _render_active_image(self, w: int, h: int, target: QRectF) -> QImage:
+        """Rasterize just the in-progress primitive, under the active
+        layer's transform and stroke color."""
+        img, painter = self._new_overlay_raster(
+            w, h, target, self._active_layer_obj()
+        )
+        try:
+            assert self._active is not None  # guarded by the caller
+            self._active.draw(painter)
         finally:
             painter.end()
         return img
@@ -1415,6 +1517,9 @@ class CameraDisplay(QWidget):
 
     def set_layer_opacity(self, index: int, opacity: float) -> None:
         self._gl_window.set_layer_opacity(index, opacity)
+
+    def set_layer_color(self, index: int, color: QColor) -> None:
+        self._gl_window.set_layer_color(index, color)
 
     def set_layer_rotation(self, index: int, degrees: float) -> None:
         self._gl_window.set_layer_rotation(index, degrees)
@@ -3708,6 +3813,7 @@ class CameraWindow(QMainWindow):
         p.move_layer_requested.connect(self._on_move_layer)
         p.visibility_toggled.connect(self.label.set_layer_visible)
         p.opacity_changed.connect(self.label.set_layer_opacity)
+        p.color_changed.connect(self.label.set_layer_color)
         p.rotation_changed.connect(self.label.set_layer_rotation)
         p.scale_changed.connect(self.label.set_layer_scale)
         p.offset_changed.connect(self.label.set_layer_offset)

@@ -130,6 +130,7 @@ def main() -> None:
     panel.move_layer_requested.connect(on_move)
     panel.visibility_toggled.connect(disp.set_layer_visible)
     panel.opacity_changed.connect(disp.set_layer_opacity)
+    panel.color_changed.connect(disp.set_layer_color)
     panel.rotation_changed.connect(disp.set_layer_rotation)
     panel.scale_changed.connect(disp.set_layer_scale)
     panel.offset_changed.connect(disp.set_layer_offset)
