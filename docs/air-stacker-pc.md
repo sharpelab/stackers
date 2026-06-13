@@ -2,6 +2,10 @@
 
 Workstation that drives the **Air Stacker** (the simpler in-use stacker, **not** Ranger).
 
+Wide view of the bench — microscope + stamp stage on the isolation table (left), the Keithley 617 / Yokogawa 7651 GPIB stack with the Omega temp controller and the Yoko-output toggle box on the blue mat (center), and the PC running `air-stacker-gui` (camera feed on the left monitor, log on the right):
+
+![Air Stacker bench, wide view](img/air-stacker-bench-wide.jpeg)
+
 ## Connectivity
 
 - **Tailscale**: `air-stacker.tail737ca5.ts.net` (100.92.166.118), Windows, owned by `dgglab@`. *(Rename in the admin panel may still be pending — local hostname pref is set; if DNS still resolves only `stacker.tail737ca5.ts.net`, force-rename via https://login.tailscale.com/admin/machines.)*
