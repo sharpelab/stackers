@@ -60,9 +60,16 @@ backend = "qt"
 #                           # e.g. 10 for smaller files / timelapse runs;
 #                           # paced skips are counted in run.json
 #                           # frame_count_skipped_pacing, not as drops.
-# codec = "auto"            # "auto" | "h264_qsv" | "libx264"
+# Software encode forced on this PC: the UHD 630 driver kills the QSV
+# encode session (MFX_ERR_DEVICE_FAILED -17) within seconds whenever
+# the GUI is live-rendering GL on the same iGPU — QSV passes every
+# headless test but dies in-app (isolated 2026-07-28). A driver update
+# might fix it; until then libx264 it is. ultrafast is the only preset
+# that sustains camera rate on the i5-8400 under worst-case sensor
+# noise (59 fps; superfast manages 21).
+codec = "libx264"
+x264_preset = "ultrafast"
 # qsv_global_quality = 22   # ≈ visually lossless (QSV scale ≠ x264 CRF)
-# x264_preset = "veryfast"
 # x264_crf = 17
 # max_run_gb = 50           # finalize the run at this file size
 # free_space_floor_gb = 5   # refuse to start / stop when disk free drops below
