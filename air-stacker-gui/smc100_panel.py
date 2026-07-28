@@ -19,6 +19,10 @@ in ``config.toml``):
   - ``baud`` (int, default 57600)
   - ``units`` (str, default ``"mm"``)
   - ``step`` (float, default 0.1) — initial step-size for ± buttons
+  - ``step_presets_um`` (list of floats, default ``[1.0, 0.3, 0.1]``) —
+    step sizes (µm) offered as one-click preset buttons. Always enabled,
+    even mid-move: they only set the Step spinbox, which the next jog
+    reads. ``[]`` hides the row.
   - ``poll_interval_ms`` (int, default 100)
   - ``position_limits`` (list of two floats, optional) — operational software
     cap; passed through to :class:`SMC100Axis`. The air-stacker rig sets
@@ -88,6 +92,13 @@ _UM_PER_MM = 1000.0
 # count, so sending a non-count-aligned distance moves less than asked.
 # Real value gets read from the controller at open() time.
 _FALLBACK_ENCODER_MM = 3.539e-5
+
+
+def _format_step_um(um: float) -> str:
+    """Preset-button label: sub-µm sizes read better in nm (300 nm, not 0.3 µm)."""
+    if um >= 1.0:
+        return f"{um:g} µm"
+    return f"{um * 1000:g} nm"
 
 
 class _PollWorker(QObject):
@@ -210,6 +221,16 @@ class SMC100Panel(QGroupBox):
 
         self.jog_minus_btn = QPushButton("−")
         self.jog_plus_btn = QPushButton("+")
+
+        # One-click step-size presets. Deliberately NOT state-gated (see
+        # _refresh_button_enables): they only write the Step spinbox, so
+        # the operator can queue up a new size mid-move.
+        self._step_presets_um = [
+            float(x) for x in cfg.get("step_presets_um", [1.0, 0.3, 0.1])
+        ]
+        self.step_preset_btns: list[QPushButton] = [
+            action_button(_format_step_um(um)) for um in self._step_presets_um
+        ]
 
         self.velocity_spin = QDoubleSpinBox()
         self.velocity_spin.setKeyboardTracking(False)
@@ -380,6 +401,12 @@ class SMC100Panel(QGroupBox):
         step_speed_row.addWidget(self.velocity_spin, stretch=1)
         outer.addLayout(step_speed_row)
 
+        if self.step_preset_btns:
+            preset_row = QHBoxLayout()
+            for btn in self.step_preset_btns:
+                preset_row.addWidget(btn, stretch=1)
+            outer.addLayout(preset_row)
+
         jog_row = QHBoxLayout()
         jog_row.addWidget(self.jog_minus_btn, stretch=1)
         jog_row.addWidget(self.jog_plus_btn, stretch=1)
@@ -407,6 +434,11 @@ class SMC100Panel(QGroupBox):
         self.jog_plus_btn.released.connect(self._on_jog_released)
 
         self.velocity_spin.editingFinished.connect(self._on_set_velocity)
+
+        for btn, um in zip(self.step_preset_btns, self._step_presets_um):
+            btn.clicked.connect(
+                lambda _=False, v=um: self.step_spin.setValue(v)
+            )
 
         self.home_btn.clicked.connect(lambda: self._safe(self.axis.home))
         self.enable_btn.clicked.connect(lambda: self._safe(self.axis.enable))
@@ -467,23 +499,27 @@ class SMC100Panel(QGroupBox):
         self._jog_continuous = False
         self._jog_timer.start()
 
+    def click_jog(self, direction: int) -> None:
+        """Programmatic single-step jog — click the +/− button if enabled.
+
+        Shared by the spacebar-repeat shortcut and the main window's
+        arrow-key handler. Routing through ``btn.click()`` keeps the
+        request on the ``_on_jog_pressed`` / ``_on_jog_released`` path,
+        inheriting its encoder-snap + state gating (a disabled button —
+        e.g. motor still moving from a prior step — makes this a no-op).
+        """
+        btn = self.jog_plus_btn if direction > 0 else self.jog_minus_btn
+        if btn.isEnabled():
+            btn.click()
+
     def _on_space_repeat_jog(self) -> None:
         """Spacebar handler — repeats the last clicked +/− jog.
 
-        No-op if no jog has been clicked this session or if the target
-        button is currently disabled (e.g. motor still moving from a
-        prior step). Routes through ``btn.click()`` so the request
-        flows through ``_on_jog_pressed`` / ``_on_jog_released`` and
-        inherits the encoder-snap + state gating already on that path.
+        No-op until a jog has been clicked this session.
         """
         if self._last_jog_direction is None:
             return
-        btn = (
-            self.jog_plus_btn if self._last_jog_direction > 0
-            else self.jog_minus_btn
-        )
-        if btn.isEnabled():
-            btn.click()
+        self.click_jog(self._last_jog_direction)
 
     def _on_jog_continuous_fire(self) -> None:
         """Hold threshold elapsed — switch from step to continuous travel.
