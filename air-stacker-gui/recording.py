@@ -56,8 +56,8 @@ from fractions import Fraction
 from pathlib import Path
 
 import av
+import cv2
 import numpy as np
-from av.video.reformatter import ColorRange, Colorspace
 from av.video.stream import VideoStream
 from PySide6.QtCore import QObject, Signal, Slot
 
@@ -375,6 +375,7 @@ class RunWriter:
         self._csv = None
         self._codec_name = ""
         self._codec_opts: dict[str, str] = {}
+        self._pix_fmt = ""
         self._frame_count = 0
         self._adjustment_changes: list[dict] = []
         self._start_iso = ""
@@ -397,6 +398,10 @@ class RunWriter:
     def open(self) -> None:
         self._codec_name, self._codec_opts = select_codec(self.cfg)
         pix_fmt = _PIX_FMT[self._codec_name]
+        self._pix_fmt = pix_fmt
+        # write_frame's I420 layout math and 4:2:0 subsampling both
+        # need even dimensions; every Flea3 mode (binned or not) is.
+        assert self._width % 2 == 0 and self._height % 2 == 0
         self._container = av.open(
             str(self._video_path),
             mode="w",
@@ -415,11 +420,13 @@ class RunWriter:
             # across cores and needs them at this resolution.
             ctx.thread_count = 0  # auto
         ctx.time_base = Fraction(1, self._fps)
-        # Tag BT.709 / limited range explicitly — encoder defaults are
-        # "unspecified", which makes ffprobe/VLC guess (often 601).
-        ctx.color_primaries = 1
-        ctx.color_trc = 1
-        ctx.colorspace = 1
+        # Tag BT.601 / limited range explicitly — cv2's RGB→I420 in
+        # write_frame uses the 601 matrix, and the tags must match the
+        # actual conversion (encoder defaults are "unspecified", which
+        # makes players guess).
+        ctx.color_primaries = 6  # smpte170m
+        ctx.color_trc = 6
+        ctx.colorspace = 6
         ctx.color_range = 1  # MPEG / limited
         self._stream = stream
 
@@ -482,11 +489,32 @@ class RunWriter:
         assert self._csv is not None
         if not rgb.flags["C_CONTIGUOUS"]:
             rgb = np.ascontiguousarray(rgb)
-        frame = av.VideoFrame.from_ndarray(rgb, format="rgb24").reformat(
-            format=self._stream.pix_fmt,
-            dst_colorspace=Colorspace.ITU709,
-            dst_color_range=ColorRange.MPEG,
+        # cv2 SIMD conversion into a fresh numpy buffer + zero-copy
+        # AVFrame wrap. The from_ndarray + swscale-reformat path cost
+        # ~36 ms/frame on the rig (per-call AVFrame alloc + single-
+        # threaded swscale, bench 2026-07-28 in TODO.md); this is ~5 ms.
+        # Fresh buffer per frame, never reused — the encoder holds
+        # references to submitted frames (x264 lookahead, QSV async),
+        # so a recycled buffer would be mutated under it.
+        # astype(copy=False) is a no-op at runtime (already uint8); it
+        # narrows cv2's loosely-typed return for the checker.
+        i420 = cv2.cvtColor(rgb, cv2.COLOR_RGB2YUV_I420).astype(
+            np.uint8, copy=False
         )
+        if self._pix_fmt == "nv12":
+            # QSV wants NV12: same Y plane, U/V interleaved. Cheap
+            # strided shuffle vs. swscale's full reconversion.
+            h, w = self._height, self._width
+            nv12 = np.empty_like(i420)
+            nv12[:h] = i420[:h]
+            u = i420[h : h + h // 4].reshape(h // 2, w // 2)
+            v = i420[h + h // 4 :].reshape(h // 2, w // 2)
+            uv = nv12[h:].reshape(h // 2, w)
+            uv[:, 0::2] = u
+            uv[:, 1::2] = v
+            frame = av.VideoFrame.from_numpy_buffer(nv12, format="nv12")
+        else:
+            frame = av.VideoFrame.from_numpy_buffer(i420, format="yuv420p")
         # CFR: pts is just the frame index in a 1/fps time base.
         frame.pts = self._frame_count
         frame.time_base = Fraction(1, self._fps)

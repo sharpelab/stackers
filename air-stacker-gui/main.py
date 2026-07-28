@@ -1853,10 +1853,13 @@ class HistWorker(QObject):
         (25, 113, 194),  # B
     )
 
+    SHARPNESS_PERIOD_S = 0.25  # readout refresh cadence (see _update_fps)
+
     def __init__(self, source: FrameMailbox) -> None:
         super().__init__()
         self._source = source
         self._running = False
+        self._last_sharpness_t = 0.0
 
     @Slot()
     def run(self) -> None:
@@ -1889,10 +1892,15 @@ class HistWorker(QObject):
                 continue
             t3 = time.perf_counter()
             self.images_ready.emit(*images)
-            try:
-                self.metrics_ready.emit(compute_sharpness(rgb))
-            except Exception as e:  # noqa: BLE001
-                log.warning("sharpness compute err: %s", e)
+            # Sharpness at the readout cadence, not the frame rate — the
+            # status-bar label only refreshes 4×/s, and the metric was
+            # ~9% of total CPU when computed per frame (py-spy 2026-07-28).
+            if t3 - self._last_sharpness_t >= self.SHARPNESS_PERIOD_S:
+                self._last_sharpness_t = t3
+                try:
+                    self.metrics_ready.emit(compute_sharpness(rgb))
+                except Exception as e:  # noqa: BLE001
+                    log.warning("sharpness compute err: %s", e)
             comp_ms.append((t2 - t1) * 1000)
             rend_ms.append((t3 - t2) * 1000)
             if t3 - log_start > 2.0:
