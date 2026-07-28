@@ -3716,6 +3716,16 @@ class CameraWindow(QMainWindow):
         self.label.setText("connecting…")
         self.label.setMinimumSize(640, 480)
         self.status_bar = StatusBar()
+        # Gutter slots for capture/recording readouts ("saved …png",
+        # "⏺ 123 frames · 45 MB"). Transient button text carries the
+        # in-flight state; these carry the persistent result. Hidden
+        # (with their dividers) when there's nothing to say.
+        self.capture_msg_label = QLabel("")
+        self._capture_msg_divider = self.status_bar.add_slot(self.capture_msg_label)
+        self.record_msg_label = QLabel("")
+        self._record_msg_divider = self.status_bar.add_slot(self.record_msg_label)
+        self._set_capture_msg("")
+        self._set_record_msg("")
         self._frame_times: deque[float] = deque(maxlen=60)
         self._fps_last_update = 0.0
         self._proc_total = 0.0
@@ -4188,31 +4198,28 @@ class CameraWindow(QMainWindow):
         capture_row.addWidget(self.capture_btn)
         capture_row.addWidget(self.record_btn)
         capture_layout.addLayout(capture_row)
-        # One-line result of the last save ("saved capture_….png" / error).
-        self.capture_status_label = QLabel("")
-        self.capture_status_label.setWordWrap(True)
-        capture_layout.addWidget(self.capture_status_label)
-        # Live recording readout: frames · MB · drops, then final status.
-        self.record_status_label = QLabel("")
-        self.record_status_label.setWordWrap(True)
-        capture_layout.addWidget(self.record_status_label)
-        # Open-in-file-manager shortcuts for the two output dirs. Flat so
-        # they read as secondary next to the action buttons above.
+        # Open-in-file-manager shortcuts for the two output dirs. Styled
+        # as secondary link-like buttons; the explicit hover/pressed
+        # states matter because flat buttons get none on Windows.
+        folder_style = (
+            "QPushButton { border: none; padding: 3px 6px; }"
+            "QPushButton:hover { background-color: palette(midlight);"
+            " border-radius: 3px; }"
+            "QPushButton:pressed { background-color: palette(mid); }"
+        )
         folder_row = QHBoxLayout()
-        captures_folder_btn = QPushButton("📂 Captures")
-        captures_folder_btn.setFlat(True)
-        captures_folder_btn.setToolTip(str(self._capture_dir))
-        captures_folder_btn.clicked.connect(
-            lambda: self._open_folder(self._capture_dir)
-        )
-        recordings_folder_btn = QPushButton("📂 Recordings")
-        recordings_folder_btn.setFlat(True)
-        recordings_folder_btn.setToolTip(str(self._recording_cfg.base_dir))
-        recordings_folder_btn.clicked.connect(
-            lambda: self._open_folder(self._recording_cfg.base_dir)
-        )
-        folder_row.addWidget(captures_folder_btn)
-        folder_row.addWidget(recordings_folder_btn)
+        for text, target in (
+            ("📂 Captures", self._capture_dir),
+            ("📂 Recordings", self._recording_cfg.base_dir),
+        ):
+            btn = QPushButton(text)
+            btn.setStyleSheet(folder_style)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setToolTip(str(target))
+            btn.clicked.connect(
+                lambda _=False, p=target: self._open_folder(p)
+            )
+            folder_row.addWidget(btn)
         capture_layout.addLayout(folder_row)
         layout.addWidget(capture)
 
@@ -4252,8 +4259,7 @@ class CameraWindow(QMainWindow):
             return
         stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.capture_btn.setEnabled(False)
-        self.capture_status_label.setStyleSheet("color: #888;")
-        self.capture_status_label.setText("saving…")
+        self.capture_btn.setText("📷 Saving…")
         threading.Thread(
             target=self._write_capture, args=(frame, stamp), daemon=True
         ).start()
@@ -4283,14 +4289,24 @@ class CameraWindow(QMainWindow):
     @Slot(str)
     def _on_capture_saved(self, path: str) -> None:
         self.capture_btn.setEnabled(True)
-        self.capture_status_label.setStyleSheet("color: #2e7d32;")
-        self.capture_status_label.setText(f"saved {Path(path).name}")
+        self.capture_btn.setText("📷 Save Image")
+        self._set_capture_msg(f"saved {Path(path).name}")
 
     @Slot(str)
     def _on_capture_failed(self, msg: str) -> None:
         self.capture_btn.setEnabled(True)
-        self.capture_status_label.setStyleSheet("color: #b04040;")
-        self.capture_status_label.setText(f"save failed: {msg}")
+        self.capture_btn.setText("📷 Save Image")
+        self._set_capture_msg(f"save failed: {msg}", error=True)
+
+    def _set_capture_msg(self, text: str, error: bool = False) -> None:
+        """Capture result in the bottom gutter; hidden when empty."""
+        self.capture_msg_label.setStyleSheet(
+            "color: #b04040;" if error else "color: #2e7d32;"
+        )
+        self.capture_msg_label.setText(text)
+        self.capture_msg_label.setVisible(bool(text))
+        if self._capture_msg_divider is not None:
+            self._capture_msg_divider.setVisible(bool(text))
 
     # --- video recording ----------------------------------------------------
     #
@@ -4329,26 +4345,28 @@ class CameraWindow(QMainWindow):
             log.debug("git sha probe failed: %s", e)
         return meta
 
-    def _set_record_status(self, text: str, error: bool = False) -> None:
-        self.record_status_label.setStyleSheet(
-            "color: #b04040;" if error else "color: #888;"
-        )
-        self.record_status_label.setText(text)
+    def _set_record_msg(self, text: str, error: bool = False) -> None:
+        """Recording readout in the bottom gutter; hidden when empty."""
+        self.record_msg_label.setStyleSheet("color: #b04040;" if error else "")
+        self.record_msg_label.setText(text)
+        self.record_msg_label.setVisible(bool(text))
+        if self._record_msg_divider is not None:
+            self._record_msg_divider.setVisible(bool(text))
 
     def _start_recording(self) -> None:
         frame = self._last_frame
         if frame is None or self.proc_worker is None:
-            self._set_record_status("no frames yet — camera not running", error=True)
+            self._set_record_msg("no frames yet — camera not running", error=True)
             return
         cfg = self._recording_cfg
         try:
             cfg.base_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
-            self._set_record_status(f"can't create {cfg.base_dir}: {e}", error=True)
+            self._set_record_msg(f"can't create {cfg.base_dir}: {e}", error=True)
             return
         free = free_space_gb(cfg.base_dir)
         if free < cfg.free_space_floor_gb:
-            self._set_record_status(
+            self._set_record_msg(
                 f"disk full: {free:.1f} GB free (floor {cfg.free_space_floor_gb:g})",
                 error=True,
             )
@@ -4363,17 +4381,20 @@ class CameraWindow(QMainWindow):
                 )
             run_dir = new_run_dir(self._record_session_dir)
         except OSError as e:
-            self._set_record_status(f"can't create run dir: {e}", error=True)
+            self._set_record_msg(f"can't create run dir: {e}", error=True)
             return
 
         h, w = frame.shape[:2]
         # fps hint for the encoder clock: live measured display rate,
-        # falling back to the Flea3's nominal 60.
+        # falling back to the Flea3's nominal 60 — capped at the pacing
+        # target, else a paced recording would play back sped-up.
         fps = 60.0
         if len(self._frame_times) >= 2:
             span = self._frame_times[-1] - self._frame_times[0]
             if span > 0:
                 fps = (len(self._frame_times) - 1) / span
+        if cfg.record_fps and cfg.record_fps > 0:
+            fps = min(fps, cfg.record_fps)
         metadata = {
             "session_id": self._record_session_dir.name,
             "camera_settings": (
@@ -4400,7 +4421,7 @@ class CameraWindow(QMainWindow):
         self._record_state = "starting"
         self.record_btn.setEnabled(False)
         self.record_btn.setText("starting…")
-        self._set_record_status("")
+        self._set_record_msg("")
         # Camera settings are locked for the whole run: mid-stream
         # exposure/gain changes produce ugly seams in the encode, and a
         # binning swap would restart the pipeline under the recorder.
@@ -4442,10 +4463,10 @@ class CameraWindow(QMainWindow):
 
     @Slot(int, int, float)
     def _on_record_progress(self, frames: int, dropped: int, mb: float) -> None:
-        text = f"{frames} frames · {mb:.0f} MB"
+        text = f"⏺ {frames} frames · {mb:.0f} MB"
         if dropped:
             text += f" · {dropped} dropped"
-        self._set_record_status(text)
+        self._set_record_msg(text)
 
     def _on_record_tick(self) -> None:
         if self._record_state != "running" or self._record_started_monotonic is None:
@@ -4474,7 +4495,7 @@ class CameraWindow(QMainWindow):
         self.record_btn.setText("● Record")
         if self.camera_options_panel is not None:
             self.camera_options_panel.setEnabled(True)
-        self._set_record_status(message, error=(status != "completed"))
+        self._set_record_msg(message, error=(status != "completed"))
         log.info("recording finished: %s — %s", status, message)
 
     def _build_right_panel(

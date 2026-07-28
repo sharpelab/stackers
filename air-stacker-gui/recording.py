@@ -19,6 +19,11 @@ Settings come from the ``[recording]`` table in ``config.toml`` via
   - ``max_run_gb`` (float, default 50) — hard stop per run
   - ``free_space_floor_gb`` (float, default 5) — abort below this
   - ``queue_size`` (int, default 120) — record-queue depth (~2 s @ 60 fps)
+  - ``record_fps`` (float, default 20) — pacing target: frames arriving
+    faster than this are skipped *by design* (counted separately from
+    queue drops). The air-stacker PC tops out ~25 fps through the
+    convert+encode path at 1600×1200 (bench 2026-07-28), so recording
+    the full ~54 fps camera rate is not achievable; 0 disables pacing.
 
 Filesystem layout (Windows-safe names, no colons)::
 
@@ -114,6 +119,7 @@ class RecordingConfig:
     max_run_gb: float = 50.0
     free_space_floor_gb: float = 5.0
     queue_size: int = 120
+    record_fps: float = 20.0
 
     @classmethod
     def from_toml(cls, section: dict | None) -> "RecordingConfig":
@@ -147,6 +153,7 @@ class RecordingConfig:
             max_run_gb=_num("max_run_gb", float, 50.0),
             free_space_floor_gb=_num("free_space_floor_gb", float, 5.0),
             queue_size=_num("queue_size", int, 120),
+            record_fps=_num("record_fps", float, 20.0),
         )
 
 
@@ -357,6 +364,7 @@ class RunWriter:
         self.run_dir = Path(run_dir)
         self.cfg = cfg
         self.frame_count_dropped_queue = 0
+        self.frame_count_skipped_pacing = 0
         self._width = int(width)
         self._height = int(height)
         self._fps = self._clamp_fps(fps_hint)
@@ -402,6 +410,10 @@ class RunWriter:
         stream.pix_fmt = pix_fmt
         ctx = stream.codec_context
         ctx.options = dict(self._codec_opts)
+        if self._codec_name == "libx264":
+            # PyAV defaults to a single encode thread; x264 scales well
+            # across cores and needs them at this resolution.
+            ctx.thread_count = 0  # auto
         ctx.time_base = Fraction(1, self._fps)
         # Tag BT.709 / limited range explicitly — encoder defaults are
         # "unspecified", which makes ffprobe/VLC guess (often 601).
@@ -450,6 +462,7 @@ class RunWriter:
                 "fps_target": self._fps,
                 "frame_count_written": self._frame_count,
                 "frame_count_dropped_queue": self.frame_count_dropped_queue,
+                "frame_count_skipped_pacing": self.frame_count_skipped_pacing,
                 "frame_count_dropped_encoder": 0,
                 "adjustment_changes": self._adjustment_changes,
                 # Captured once at open() — recomputing here would make
@@ -570,6 +583,15 @@ class RecordingWorker(QObject):
         self._probe = state_probe
         self._stop_event = threading.Event()
         self._stop_status = "completed"
+        # Pacing: skip frames arriving faster than record_fps. The
+        # air-stacker PC can't push full camera rate through the
+        # convert+encode path (~25 fps ceiling at 1600×1200), so v0
+        # records a paced subset by design rather than dropping at the
+        # queue under pressure.
+        fps = writer.cfg.record_fps
+        self._pace_interval_ns = int(1e9 / fps) if fps and fps > 0 else 0
+        self._next_due_ns = 0
+        self._skipped_pacing = 0
 
     @Slot()
     def run(self) -> None:
@@ -600,7 +622,7 @@ class RecordingWorker(QObject):
 
         while not self._stop_event.is_set():
             item = self._queue.take(timeout=0.5)
-            if item is not None:
+            if item is not None and self._should_write(item[1]):
                 if not self._write_one(item):
                     return  # ENOSPC path already finished the run
                 state = self._probe_state()
@@ -638,13 +660,30 @@ class RecordingWorker(QObject):
             item = self._queue.take(timeout=0.05)
             if item is None:
                 break
-            if not self._write_one(item):
+            if self._should_write(item[1]) and not self._write_one(item):
                 return
         self._finish(
             self._stop_status,
             f"Recording stopped: {writer.frame_count} frames, "
             f"{self._queue.dropped_count} dropped",
         )
+
+    def _should_write(self, host_ns: int) -> bool:
+        """Pacing gate. Schedule-based (next-due, not last-written) so the
+        effective rate averages record_fps instead of one camera-frame
+        slower; catch-up after a stall is capped at one interval so a
+        pause never causes a burst of consecutive writes."""
+        if self._pace_interval_ns == 0:
+            return True
+        if host_ns < self._next_due_ns:
+            self._skipped_pacing += 1
+            return False
+        self._next_due_ns += self._pace_interval_ns
+        if self._next_due_ns < host_ns:
+            # Fell behind schedule (stall / slow encode) — re-anchor at
+            # now instead of letting the backlog admit a write burst.
+            self._next_due_ns = host_ns + self._pace_interval_ns
+        return True
 
     def _write_one(self, item: tuple[np.ndarray, int]) -> bool:
         """Encode one frame; on ENOSPC finish the run as aborted_disk_full
@@ -676,6 +715,7 @@ class RecordingWorker(QObject):
     def _close_best_effort(self, status: str) -> None:
         try:
             self._writer.frame_count_dropped_queue = self._queue.dropped_count
+            self._writer.frame_count_skipped_pacing = self._skipped_pacing
             self._writer.close(status)
         except Exception:
             log.exception("writer close failed")

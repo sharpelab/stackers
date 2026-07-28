@@ -42,7 +42,26 @@ W, H = 320, 240
 
 def _cfg(base: Path, codec: str = "libx264") -> RecordingConfig:
     # codec="libx264" skips the QSV probe so most tests stay fast.
-    return RecordingConfig(base_dir=base, codec=codec)
+    # record_fps=0 disables pacing — these tests feed synthetic host_ns
+    # values far denser than any real pacing interval and assert exact
+    # frame counts. Pacing itself is covered by test_pacing.
+    return RecordingConfig(base_dir=base, codec=codec, record_fps=0.0)
+
+
+def test_pacing(tmp_path: Path) -> None:
+    """Schedule-based pacing gate: 40 fps input, 20 fps target → half
+    written; a stall doesn't cause a catch-up burst afterwards."""
+    cfg = RecordingConfig(base_dir=tmp_path, codec="libx264", record_fps=20.0)
+    writer = RunWriter(tmp_path / "r", cfg, W, H, fps_hint=20, metadata={})
+    worker = RecordingWorker(RecordQueue(4), writer)
+    step = 25_000_000  # 25 ms = 40 fps input
+    written = sum(worker._should_write((i + 1) * step) for i in range(40))
+    assert 19 <= written <= 21
+    assert worker._skipped_pacing == 40 - written
+    # 2 s stall, then 40 fps resumes: at most one immediate write, no burst.
+    resume = 41 * step + 2_000_000_000
+    burst = sum(worker._should_write(resume + i * step) for i in range(4))
+    assert burst <= 2
 
 
 def _red_frame() -> np.ndarray:

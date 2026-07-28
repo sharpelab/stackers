@@ -129,14 +129,17 @@ class StatusBar(QFrame):
         if checked:
             self.tool_changed.emit(self._tool_for_button[button])
 
-    def add_slot(self, widget: QLabel) -> None:
+    def add_slot(self, widget: QLabel) -> QFrame | None:
         """Insert a widget as a new left-anchored slot.
 
         Each slot is followed by a sunken VLine divider, so successive
         slots line up with the same visual cadence regardless of which
-        order they're added.
+        order they're added. Returns the divider created ahead of this
+        widget (None for the first slot) so callers with transient slots
+        can hide label + divider together.
         """
         idx = self._stretch_index
+        divider: QFrame | None = None
         if idx > 0:
             divider = QFrame()
             divider.setFrameShape(QFrame.Shape.VLine)
@@ -147,6 +150,7 @@ class StatusBar(QFrame):
         widget.setAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         self._layout.insertWidget(idx, widget)
         self._stretch_index += 1
+        return divider
 
     def add_right_slot(self, widget) -> None:
         """Insert a widget as a new right-anchored slot (after the stretch).
