@@ -3,8 +3,7 @@
 * Fix heater
   * also manual mode (maybe)
 * rig-validate: still capture, video recording (QSV confirmed working 2026-07-28), Z step presets, arrow-key jog
-* recording at full camera rate: currently paced to 20 fps (`record_fps`) because the rig's frame-prep path caps at ~25 fps for 1600×1200 (bench 2026-07-28, `C:\temp\bench_rec.py`): `VideoFrame.from_ndarray(rgb24)` alone is 19 ms/frame (per-call AVFrame alloc+zero — copy bandwidth itself is fine: cv2 I420 conversion is 4.7 ms), swscale rgb→nv12 adds ~17 ms, all end-to-end paths ≈ 22–27 fps. Candidate fix: pre-allocated rotating AVFrame pool + `plane.update()` instead of from_ndarray; note h264_qsv rejects bgra input on this driver (no GPU CSC shortcut).
-* idle CPU (~1.7 cores at 54 fps live view, py-spy 2026-07-28): PySpin GetNDArray 13%, paintGL 11%, to_rgb debayer 10%, sharpness 9%, hist ~6%. Cheap win if wanted: compute sharpness at ~10 Hz instead of every frame (readout only updates 4×/s).
+* idle CPU (~1.5 cores at 54 fps live view, py-spy 2026-07-28): PySpin GetNDArray 13%, paintGL 11%, to_rgb debayer 10%, hist ~6% (sharpness now computes at readout cadence). Further wins need pipeline changes — hist could throttle the same way if it ever matters.
 * session-level event streams alongside recordings (SESSION_LOG_PROPOSAL.md — deferred from recording v0, as are camera timestamps in timestamps.csv)
 * add camera controls (gain, exposure)
 * implement "start" - fill out form, write to gdrive, start recording

@@ -19,11 +19,12 @@ Settings come from the ``[recording]`` table in ``config.toml`` via
   - ``max_run_gb`` (float, default 50) — hard stop per run
   - ``free_space_floor_gb`` (float, default 5) — abort below this
   - ``queue_size`` (int, default 120) — record-queue depth (~2 s @ 60 fps)
-  - ``record_fps`` (float, default 20) — pacing target: frames arriving
-    faster than this are skipped *by design* (counted separately from
-    queue drops). The air-stacker PC tops out ~25 fps through the
-    convert+encode path at 1600×1200 (bench 2026-07-28), so recording
-    the full ~54 fps camera rate is not achievable; 0 disables pacing.
+  - ``record_fps`` (float, default 0 = record every frame) — optional
+    pacing target: frames arriving faster than this are skipped *by
+    design* (counted separately from queue drops). Useful for smaller
+    files / timelapse-style runs; the zero-copy write path sustains
+    full camera rate on the rig (~194 fps capability at 1600×1200,
+    bench 2026-07-28).
 
 Filesystem layout (Windows-safe names, no colons)::
 
@@ -119,7 +120,7 @@ class RecordingConfig:
     max_run_gb: float = 50.0
     free_space_floor_gb: float = 5.0
     queue_size: int = 120
-    record_fps: float = 20.0
+    record_fps: float = 0.0
 
     @classmethod
     def from_toml(cls, section: dict | None) -> "RecordingConfig":
@@ -153,7 +154,7 @@ class RecordingConfig:
             max_run_gb=_num("max_run_gb", float, 50.0),
             free_space_floor_gb=_num("free_space_floor_gb", float, 5.0),
             queue_size=_num("queue_size", int, 120),
-            record_fps=_num("record_fps", float, 20.0),
+            record_fps=_num("record_fps", float, 0.0),
         )
 
 

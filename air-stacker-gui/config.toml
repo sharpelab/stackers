@@ -54,12 +54,12 @@ backend = "qt"
 # defaults shown. Design: RECORDING_PROPOSAL.md.
 [recording]
 # base_dir = "~/AirStackerRecordings"
-# record_fps = 20           # pacing target. This PC tops out ~25 fps through
-#                           # the convert+encode path at 1600×1200 (bench
-#                           # 2026-07-28) — camera-rate recording isn't
-#                           # achievable; frames beyond the target are skipped
-#                           # by design (run.json frame_count_skipped_pacing).
-#                           # 0 = record every frame the encoder can take.
+# record_fps = 0            # 0 (default) records every frame — the zero-copy
+#                           # write path sustains full camera rate (~194 fps
+#                           # capability at 1600×1200, bench 2026-07-28). Set
+#                           # e.g. 10 for smaller files / timelapse runs;
+#                           # paced skips are counted in run.json
+#                           # frame_count_skipped_pacing, not as drops.
 # codec = "auto"            # "auto" | "h264_qsv" | "libx264"
 # qsv_global_quality = 22   # ≈ visually lossless (QSV scale ≠ x264 CRF)
 # x264_preset = "veryfast"
