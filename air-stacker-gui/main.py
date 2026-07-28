@@ -4471,7 +4471,16 @@ class CameraWindow(QMainWindow):
 
     @Slot(int, int, float)
     def _on_record_progress(self, frames: int, dropped: int, mb: float) -> None:
-        text = f"⏺ {frames} frames · {mb:.0f} MB"
+        # Adaptive units: a static/dark scene encodes to ~200 B/frame,
+        # so a whole run can sit under 0.5 MB — "{:.0f} MB" reads as a
+        # frozen 0 there.
+        if mb >= 100:
+            size = f"{mb:.0f} MB"
+        elif mb >= 1:
+            size = f"{mb:.1f} MB"
+        else:
+            size = f"{mb * 1000:.0f} kB"
+        text = f"⏺ {frames} frames · {size}"
         if dropped:
             text += f" · {dropped} dropped"
         self._set_record_msg(text)
