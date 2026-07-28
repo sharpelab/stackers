@@ -31,9 +31,17 @@ Filesystem layout (Windows-safe names, no colons)::
     <base>/session_<YYYY-MM-DD_HH-MM-SS>/
         session.json
         run_NNN_<YYYY-MM-DD_HH-MM-SS>/
-            video.mp4
+            video.mp4          # seekable faststart MP4 (final)
+            video.part.mp4     # fragmented, exists while recording /
+                               # after a crash (VLC-playable; the
+                               # launch-time scan remuxes it)
             run.json
             timestamps.csv
+
+Recording writes the fragmented ``video.part.mp4`` (crash leaves a
+playable file); ``close()`` stream-copies it into a plain faststart
+``video.mp4`` because consumer players (Windows Media Player, Movies &
+TV) can't seek fragmented MP4 — no sample table in the header.
 """
 
 from __future__ import annotations
@@ -262,6 +270,32 @@ def select_codec(cfg: RecordingConfig) -> tuple[str, dict[str, str]]:
     return "h264_qsv", qsv_opts
 
 
+def _remux_faststart(src: Path, dst: Path) -> None:
+    """Stream-copy a fragmented MP4 into a plain faststart MP4.
+
+    No re-encode — runs at disk speed. Tolerates a truncated tail (the
+    crash case): every complete packet is copied, then the output is
+    finalized with a full moov, so the result seeks in any player.
+    Needs roughly the file's own size in free disk during the copy.
+    """
+    with av.open(str(src)) as inp:
+        vstream = inp.streams.video[0]
+        with av.open(
+            str(dst), mode="w", format="mp4",
+            options={"movflags": "+faststart"},
+        ) as out:
+            ost = out.add_stream_from_template(vstream)
+            try:
+                for packet in inp.demux(vstream):
+                    if packet.dts is None:
+                        continue  # demuxer flush sentinel
+                    packet.stream = ost
+                    out.mux(packet)
+            except Exception as e:  # noqa: BLE001 — truncated tail
+                log.warning("remux: stopped at truncation in %s: %s",
+                            src.name, e)
+
+
 def free_space_gb(path: Path) -> float:
     """Free space (decimal GB) on the filesystem holding ``path``.
 
@@ -332,13 +366,24 @@ def mark_stale_runs_aborted(base: Path) -> int:
                 if doc.get("status") != "running":
                     continue
                 doc["status"] = "aborted_crash"
-                video = run_json.parent / "video.mp4"
-                if doc.get("end_iso") is None and video.exists():
+                part = run_json.parent / "video.part.mp4"
+                final = run_json.parent / "video.mp4"
+                if doc.get("end_iso") is None and part.exists():
                     doc["end_iso"] = (
-                        datetime.fromtimestamp(video.stat().st_mtime)
+                        datetime.fromtimestamp(part.stat().st_mtime)
                         .astimezone()
                         .isoformat(timespec="milliseconds")
                     )
+                # Finish the crashed run's remux so the recovered video
+                # seeks in consumer players, not just VLC.
+                if part.exists() and not final.exists():
+                    try:
+                        _remux_faststart(part, final)
+                        part.unlink()
+                        doc.setdefault("video", {})["path"] = final.name
+                        doc["video"]["seekable"] = True
+                    except Exception:
+                        log.exception("crash-scan remux failed: %s", part)
                 _write_json_atomic(run_json, doc)
                 count += 1
                 log.warning("stale run marked aborted_crash: %s", run_json.parent)
@@ -375,7 +420,11 @@ class RunWriter:
         self._height = int(height)
         self._fps = self._clamp_fps(fps_hint)
         self._metadata = dict(metadata)
-        self._video_path = self.run_dir / "video.mp4"
+        # Fragmented while recording; remuxed to the seekable final
+        # name in close().
+        self._video_path = self.run_dir / "video.part.mp4"
+        self._final_video_path = self.run_dir / "video.mp4"
+        self._remuxed = False
         self._container: av.container.OutputContainer | None = None
         self._stream: VideoStream | None = None
         self._csv = None
@@ -472,7 +521,11 @@ class RunWriter:
                 "end_iso": None if status == "running" else _now_iso(),
                 "status": status,
                 "video": {
-                    "path": "video.mp4",
+                    "path": (
+                        self._final_video_path.name if self._remuxed
+                        else self._video_path.name
+                    ),
+                    "seekable": self._remuxed,
                     "codec": self._codec_name,
                     "options": self._codec_opts,
                     "pix_fmt": _PIX_FMT.get(self._codec_name),
@@ -567,6 +620,20 @@ class RunWriter:
                 self._csv.close()
             except Exception:
                 log.exception("timestamps.csv close failed (%s)", self.run_dir.name)
+        if self._opened:
+            # Remux the fragmented stream into a seekable faststart MP4
+            # (consumer players can't seek fragmented files). Best-
+            # effort: on failure the .part stays — VLC-playable, and
+            # the launch-time crash scan retries the remux.
+            try:
+                _remux_faststart(self._video_path, self._final_video_path)
+                self._video_path.unlink()
+                self._remuxed = True
+            except Exception:
+                log.exception(
+                    "remux failed (%s) — keeping fragmented %s",
+                    self.run_dir.name, self._video_path.name,
+                )
         if self._opened:
             try:
                 _write_json_atomic(self.run_dir / "run.json", self._run_doc(status))

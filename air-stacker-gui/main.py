@@ -4671,7 +4671,11 @@ class CameraWindow(QMainWindow):
             self._stop_recording("aborted_user")
             if self._record_thread is not None:
                 self._record_thread.quit()
-                if not self._record_thread.wait(5000):
+                # Generous wait: close() includes the seekable-remux
+                # pass, which runs at disk speed. On timeout the
+                # fragmented .part survives and the next launch's
+                # crash scan finishes the remux.
+                if not self._record_thread.wait(15000):
                     log.warning("recording thread did not exit on close")
         # Close the webcam first so its geometry gets persisted via the
         # `closed` signal before we tear down the main window.

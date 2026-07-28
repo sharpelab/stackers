@@ -95,6 +95,13 @@ def test_happy_path(tmp_path: Path) -> None:
 
     video = run_dir / "video.mp4"
     assert video.exists() and video.stat().st_size > 0
+    # Remux happened: fragmented .part gone, and the final file carries
+    # a full sample table (stream.frames == n) — the seekability that
+    # consumer players (WMP / Movies & TV) require. A fragmented file
+    # reports frames == 0 here.
+    assert not (run_dir / "video.part.mp4").exists()
+    with av.open(str(video)) as chk:
+        assert chk.streams.video[0].frames == n
     # Muxed-byte accounting: nonzero, and ≤ the final file (bytes_written
     # excludes container overhead).
     assert 0 < w.bytes_written <= video.stat().st_size
@@ -189,7 +196,8 @@ def test_mark_stale_runs_aborted(tmp_path: Path) -> None:
     run_dir = tmp_path / "session_x" / "run_001_y"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({"status": "running", "end_iso": None}))
-    (run_dir / "video.mp4").write_bytes(b"\x00" * 16)
+    # Garbage part: remux attempt fails (logged), scan still flips status.
+    (run_dir / "video.part.mp4").write_bytes(b"\x00" * 16)
     done_dir = tmp_path / "session_x" / "run_002_z"
     done_dir.mkdir()
     (done_dir / "run.json").write_text(json.dumps({"status": "completed"}))
@@ -198,7 +206,43 @@ def test_mark_stale_runs_aborted(tmp_path: Path) -> None:
     doc = json.loads((run_dir / "run.json").read_text())
     assert doc["status"] == "aborted_crash"
     assert doc["end_iso"] is not None
+    assert (run_dir / "video.part.mp4").exists()  # kept on failed remux
     assert json.loads((done_dir / "run.json").read_text())["status"] == "completed"
+
+
+def test_crash_scan_remuxes_part(tmp_path: Path) -> None:
+    """A crashed run's fragmented .part gets remuxed to a seekable
+    video.mp4 by the launch-time scan."""
+    n = 10
+    run_dir = tmp_path / "session_x" / "run_001_y"
+    run_dir.mkdir(parents=True)
+    part = run_dir / "video.part.mp4"
+    with av.open(
+        str(part), "w", format="mp4",
+        options={"movflags": "+frag_keyframe+empty_moov+default_base_moof"},
+    ) as out:
+        st = out.add_stream("libx264", rate=30)
+        assert isinstance(st, av.VideoStream)
+        st.width, st.height, st.pix_fmt = W, H, "yuv420p"
+        for i in range(n):
+            fr = av.VideoFrame.from_ndarray(
+                _red_frame(), format="rgb24"
+            ).reformat(format="yuv420p")
+            fr.pts = i
+            for p in st.encode(fr):
+                out.mux(p)
+        for p in st.encode(None):
+            out.mux(p)
+    (run_dir / "run.json").write_text(json.dumps({"status": "running"}))
+
+    assert mark_stale_runs_aborted(tmp_path) == 1
+    final = run_dir / "video.mp4"
+    assert final.exists() and not part.exists()
+    with av.open(str(final)) as chk:
+        assert chk.streams.video[0].frames == n  # full moov → seekable
+    doc = json.loads((run_dir / "run.json").read_text())
+    assert doc["status"] == "aborted_crash"
+    assert doc["video"]["seekable"] is True
 
     # Second scan finds nothing; missing base is a no-op.
     assert mark_stale_runs_aborted(tmp_path) == 0
