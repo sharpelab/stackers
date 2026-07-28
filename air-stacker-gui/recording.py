@@ -358,8 +358,6 @@ class RunWriter:
     attribute the worker fills from the queue before close().
     """
 
-    _BYTES_CACHE_S = 1.0
-
     def __init__(
         self,
         run_dir: Path,
@@ -390,8 +388,7 @@ class RunWriter:
         self._closed = False
         self._opened = False
         self._disk_at_start_gb: float | None = None
-        self._bytes_cached = 0
-        self._bytes_cached_at = 0.0
+        self._bytes_muxed = 0
 
     @staticmethod
     def _clamp_fps(fps_hint: float) -> int:
@@ -534,6 +531,7 @@ class RunWriter:
         frame.pts = self._frame_count
         frame.time_base = Fraction(1, self._fps)
         for packet in self._stream.encode(frame):
+            self._bytes_muxed += packet.size
             self._container.mux(packet)
         self._csv.write(f"{self._frame_count},{host_ns}\n")
         self._frame_count += 1
@@ -555,6 +553,7 @@ class RunWriter:
         if self._stream is not None and self._container is not None:
             try:
                 for packet in self._stream.encode(None):
+                    self._bytes_muxed += packet.size
                     self._container.mux(packet)
             except Exception:
                 log.exception("encoder flush failed (%s)", self.run_dir.name)
@@ -585,16 +584,12 @@ class RunWriter:
 
     @property
     def bytes_written(self) -> int:
-        """Size of video.mp4 on disk, stat cached ~1 s (called from the
-        progress tick and the size-cap check)."""
-        now = time.monotonic()
-        if now - self._bytes_cached_at >= self._BYTES_CACHE_S:
-            self._bytes_cached_at = now
-            try:
-                self._bytes_cached = os.stat(self._video_path).st_size
-            except OSError:
-                self._bytes_cached = 0
-        return self._bytes_cached
+        """Bytes of encoded stream muxed so far (excludes ~1% container
+        overhead). Counted from packet sizes rather than os.stat on the
+        path: NTFS doesn't refresh a file's directory-entry size while
+        the writer's handle is open, so a path stat reads 0 for the
+        whole run."""
+        return self._bytes_muxed
 
 
 class RecordingWorker(QObject):

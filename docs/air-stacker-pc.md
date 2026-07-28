@@ -255,6 +255,32 @@ GUI integration shipped: [`keithley617.py`](../air-stacker-gui/keithley617.py) m
 - **NI-VISA / NI MAX** installed.
 - **Git** in `C:\Program Files\Git\`.
 
+## Platform / firmware (surveyed 2026-07-28)
+
+- **CPU**: Intel Core i5-8400 (6C/6T, Coffee Lake) with UHD 630 iGPU.
+- **Motherboard**: ASRock Z370M Pro4. **BIOS P2.00 (2018-03-13)** — latest on
+  ASRock's [Z370M Pro4 page](https://www.asrock.com/mb/Intel/Z370M%20Pro4/) is
+  **4.20** (Intel microcode + ME updates).
+- **BIOS update procedure** (needs someone at the machine): download the 4.20
+  Instant Flash file from the ASRock page onto a FAT32 USB stick → reboot to
+  UEFI (F2/Del) → Instant Flash → keep power stable during the flash.
+  Caveats: **4.20 is one-way** (ASRock blocks downgrades after it), and BIOS
+  settings reset to defaults post-flash (check boot order; nothing else on
+  this rig depends on BIOS settings).
+- **OS**: Windows 10 Education 22H2 (build 19045).
+- **Intel graphics driver**: 31.0.101.2141 — the **terminal** release for
+  UHD 630 (7th–10th gen are on Intel's legacy support model; no newer driver
+  will ship). Relevant limits: h264_qsv hardware encode dies
+  (MFX_ERR_DEVICE_FAILED −17) whenever the GUI renders GL on the same iGPU,
+  so air-stacker-gui records via libx264 (see air-stacker-gui/TODO.md); a
+  BIOS update won't change this.
+- **Task Manager shows 100% CPU constantly** while true load is 2–3%
+  (Get-Counter / per-process figures agree) — a reporting artifact. Perf
+  counters were rebuilt (`lodctr /R` + WMI resync) 2026-07-28; if the
+  artifact persists across that and a reboot, broken CPU frequency/utility
+  reporting from the 2018 BIOS microcode is the prime suspect — another
+  reason for the 4.20 flash.
+
 ## Open questions / TBD
 
 - Confirm which of COM3/COM4 is Z vs spin (from CONEX controller IDs or the LabVIEW VI's bindings).

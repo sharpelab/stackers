@@ -95,6 +95,9 @@ def test_happy_path(tmp_path: Path) -> None:
 
     video = run_dir / "video.mp4"
     assert video.exists() and video.stat().st_size > 0
+    # Muxed-byte accounting: nonzero, and ≤ the final file (bytes_written
+    # excludes container overhead).
+    assert 0 < w.bytes_written <= video.stat().st_size
     assert len(_decode_frames(video)) >= n - 2
 
     doc = json.loads((run_dir / "run.json").read_text())
