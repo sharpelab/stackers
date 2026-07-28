@@ -1,6 +1,9 @@
 videos/*
 !videos/.gitkeep
 
+__pycache__/
+*.pyc
+
 # Per-machine GUI state — window geometries, user-created camera/image
 # presets. Lives next to config.toml so file paths stay local; not committed
 # because the contents diverge per checkout (lab PC, laptops, etc.).
