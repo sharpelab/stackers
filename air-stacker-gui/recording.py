@@ -239,7 +239,14 @@ def select_codec(cfg: RecordingConfig) -> tuple[str, dict[str, str]]:
     surfaces at record start (RuntimeError), not mid-run. Explicit
     ``"libx264"`` skips probing.
     """
-    qsv_opts = {"global_quality": str(cfg.qsv_global_quality)}
+    # look_ahead=0: global_quality alone enables LA-ICQ, which kills the
+    # rig's Intel driver mid-stream after ~20 s of sustained encode
+    # (MFX_ERR_DEVICE_FAILED -17, isolated 2026-07-28). Plain ICQ is
+    # stable at the same quality setting.
+    qsv_opts = {
+        "global_quality": str(cfg.qsv_global_quality),
+        "look_ahead": "0",
+    }
     x264_opts = {"preset": cfg.x264_preset, "crf": str(cfg.x264_crf)}
     codec = cfg.codec if cfg.codec in _VALID_CODECS else "auto"
 
@@ -415,7 +422,14 @@ class RunWriter:
         stream.height = self._height
         stream.pix_fmt = pix_fmt
         ctx = stream.codec_context
-        ctx.options = dict(self._codec_opts)
+        opts = dict(self._codec_opts)
+        # Explicit 2 s GOP for both codecs. frag_keyframe cuts a
+        # fragment per IDR, so this bounds both crash loss and the
+        # on-disk size staleness (bytes_written) to ~2 s — encoder
+        # default GOPs are long/adaptive enough that video.mp4 stayed
+        # at 0 bytes for an entire run.
+        opts["g"] = str(max(1, int(2 * self._fps)))
+        ctx.options = opts
         if self._codec_name == "libx264":
             # PyAV defaults to a single encode thread; x264 scales well
             # across cores and needs them at this resolution.
