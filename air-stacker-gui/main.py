@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import argparse
 import logging
+import platform
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
+from datetime import datetime
 from functools import lru_cache
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -16,19 +19,23 @@ from pathlib import Path
 import cv2
 import numpy as np
 import PySpin
-from PySide6.QtCore import QLockFile, QObject, QPointF, QRect, QRectF, Qt, QThread, QTimer, Signal, Slot
+from PySide6.QtCore import QEvent, QLockFile, QObject, QPointF, QRect, QRectF, Qt, QThread, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
     QIcon,
     QImage,
+    QKeyEvent,
     QPainter,
     QPen,
     QSurfaceFormat,
 )
 from PySide6.QtOpenGL import QOpenGLTexture, QOpenGLTextureBlitter, QOpenGLWindow
 from PySide6.QtWidgets import (
+    QAbstractSlider,
+    QAbstractSpinBox,
     QApplication,
     QCheckBox,
     QComboBox,
@@ -41,6 +48,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMessageBox,
     QPushButton,
@@ -66,6 +74,16 @@ from overlay import (
     normalize_pos,
 )
 from layer_panel import LayerPanel
+from recording import (
+    RecordingConfig,
+    RecordingWorker,
+    RecordQueue,
+    RunWriter,
+    free_space_gb,
+    mark_stale_runs_aborted,
+    new_run_dir,
+    new_session_dir,
+)
 from smc100_panel import SMC100Panel
 from status_bar import StatusBar
 from webcam import WebcamConfig
@@ -1728,6 +1746,9 @@ class CameraProcessWorker(QObject):
         self._source = source
         self._adjustments = adjustments
         self._hist_sink = hist_sink
+        # Recording fork — set/cleared from the GUI thread via
+        # set_record_sink (attribute assignment is atomic; no lock).
+        self._record_sink: RecordQueue | None = None
         self._running = False
         self._lock = threading.Lock()
         self._latest: np.ndarray | None = None
@@ -1765,6 +1786,13 @@ class CameraProcessWorker(QObject):
                     except Exception as e:  # noqa: BLE001
                         log.warning("adjustment err: %s", e)
             t3 = time.perf_counter()
+            # Post-adjustment fork to the recorder. Non-blocking: if the
+            # encoder falls behind, frames drop at the queue (counted
+            # there) — proc never stalls on encoding pressure. Safe to
+            # share the ndarray: neither side mutates published frames.
+            sink = self._record_sink
+            if sink is not None:
+                sink.put_nowait(rgb, time.perf_counter_ns())
             with self._lock:
                 self._latest = rgb
             self.frame_ready.emit()
@@ -1795,6 +1823,10 @@ class CameraProcessWorker(QObject):
             f = self._latest
             self._latest = None
             return f
+
+    def set_record_sink(self, sink: RecordQueue | None) -> None:
+        """GUI thread: attach/detach the recording queue."""
+        self._record_sink = sink
 
     def stop(self) -> None:
         self._running = False
@@ -3589,6 +3621,11 @@ class LaunchingDialog(QDialog):
 
 
 class CameraWindow(QMainWindow):
+    # Still-capture writer → GUI thread. Emitted from a short-lived
+    # daemon thread; cross-thread emit gives a queued delivery.
+    _capture_saved = Signal(str)
+    _capture_failed = Signal(str)
+
     def __init__(self, launch_dialog: LaunchingDialog | None = None) -> None:
         super().__init__()
         self._launch_dialog = launch_dialog
@@ -3693,6 +3730,37 @@ class CameraWindow(QMainWindow):
         settings = load_settings()
         camera_cfg = config.get("camera", {})
         device_index = int(camera_cfg.get("device_index", 0))
+        # Still-image capture (📷 Save Image). Post-adjustment frames —
+        # what the display shows. Dir override in config.toml [capture].
+        capture_cfg = config.get("capture", {})
+        self._capture_dir = Path(
+            str(capture_cfg.get("dir", "~/AirStackerCaptures"))
+        ).expanduser()
+        self._last_frame: np.ndarray | None = None
+        self._capture_saved.connect(self._on_capture_saved)
+        self._capture_failed.connect(self._on_capture_failed)
+
+        # Video recording (● Record). Settings are config-only by design
+        # (config.toml [recording]) — no GUI settings surface.
+        self._recording_cfg = RecordingConfig.from_toml(config.get("recording"))
+        self._record_state = "idle"  # idle | starting | running | stopping
+        self._record_queue: RecordQueue | None = None
+        self._record_worker: RecordingWorker | None = None
+        self._record_thread: QThread | None = None
+        self._record_session_dir: Path | None = None
+        self._record_started_monotonic: float | None = None
+        # 1 Hz elapsed-time tick on the Stop button while running.
+        self._record_timer = QTimer(self)
+        self._record_timer.setInterval(1000)
+        self._record_timer.timeout.connect(self._on_record_tick)
+        # Crash scan: runs left at status="running" by a dead process
+        # become "aborted_crash" (their fragmented MP4s are playable).
+        try:
+            stale = mark_stale_runs_aborted(self._recording_cfg.base_dir)
+            if stale:
+                log.info("marked %d stale recording run(s) aborted_crash", stale)
+        except Exception as e:  # noqa: BLE001 — never block startup on this
+            log.warning("stale-run scan failed: %s", e)
         # WebcamConfig draws project-level keys (device, format, defaults)
         # from config.toml's [webcam] section and per-machine window geometry
         # from settings.toml's [gui_state.webcam] section.
@@ -3799,6 +3867,16 @@ class CameraWindow(QMainWindow):
         self.proc_worker: CameraProcessWorker | None = None
         self.hist_worker: HistWorker | None = None
         self._spawn_workers()
+
+        # Up/Down arrow → Z jog, window-wide (see eventFilter). Installed
+        # on the application because the GL camera surface is a QWindow:
+        # keys it receives are delivered to the QWindow and never bubble
+        # into the QWidget hierarchy, so a keyPressEvent override here
+        # would miss the most common focus case (operator just clicked
+        # the camera view).
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
     def _wire_layer_panel(self) -> None:
         """Connect the LayerPanel ⇄ overlay (mirrors the dev harness).
@@ -4094,15 +4172,49 @@ class CameraWindow(QMainWindow):
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        recording = QGroupBox("Recording")
-        recording_layout = QHBoxLayout(recording)
-        record_btn = QPushButton("Record")
-        record_btn.setEnabled(False)
-        stop_btn = QPushButton("Stop")
-        stop_btn.setEnabled(False)
-        recording_layout.addWidget(record_btn)
-        recording_layout.addWidget(stop_btn)
-        layout.addWidget(recording)
+        capture = QGroupBox("Capture")
+        capture_layout = QVBoxLayout(capture)
+        capture_row = QHBoxLayout()
+        self.capture_btn = QPushButton("📷 Save Image")
+        self.capture_btn.setToolTip(
+            f"Save the current view as a PNG to {self._capture_dir}"
+        )
+        self.capture_btn.clicked.connect(self._on_capture_clicked)
+        self.record_btn = QPushButton("● Record")
+        self.record_btn.setToolTip(
+            f"Record video (H.264 MP4) to {self._recording_cfg.base_dir}"
+        )
+        self.record_btn.clicked.connect(self._on_record_clicked)
+        capture_row.addWidget(self.capture_btn)
+        capture_row.addWidget(self.record_btn)
+        capture_layout.addLayout(capture_row)
+        # One-line result of the last save ("saved capture_….png" / error).
+        self.capture_status_label = QLabel("")
+        self.capture_status_label.setWordWrap(True)
+        capture_layout.addWidget(self.capture_status_label)
+        # Live recording readout: frames · MB · drops, then final status.
+        self.record_status_label = QLabel("")
+        self.record_status_label.setWordWrap(True)
+        capture_layout.addWidget(self.record_status_label)
+        # Open-in-file-manager shortcuts for the two output dirs. Flat so
+        # they read as secondary next to the action buttons above.
+        folder_row = QHBoxLayout()
+        captures_folder_btn = QPushButton("📂 Captures")
+        captures_folder_btn.setFlat(True)
+        captures_folder_btn.setToolTip(str(self._capture_dir))
+        captures_folder_btn.clicked.connect(
+            lambda: self._open_folder(self._capture_dir)
+        )
+        recordings_folder_btn = QPushButton("📂 Recordings")
+        recordings_folder_btn.setFlat(True)
+        recordings_folder_btn.setToolTip(str(self._recording_cfg.base_dir))
+        recordings_folder_btn.clicked.connect(
+            lambda: self._open_folder(self._recording_cfg.base_dir)
+        )
+        folder_row.addWidget(captures_folder_btn)
+        folder_row.addWidget(recordings_folder_btn)
+        capture_layout.addLayout(folder_row)
+        layout.addWidget(capture)
 
         self.adjustments_panel = ImageAdjustmentsPanel(
             self.adjustments, ImagePresetStore(SETTINGS_PATH)
@@ -4116,6 +4228,254 @@ class CameraWindow(QMainWindow):
         layout.addWidget(self.adjustments_panel)
         layout.addStretch(1)
         return panel
+
+    def _open_folder(self, path: Path) -> None:
+        """Open an output dir in the OS file manager (Explorer on the
+        rig). Creates it first so the button works before the first
+        capture/recording ever lands."""
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            log.warning("could not create %s: %s", path, e)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+    def _on_capture_clicked(self) -> None:
+        """Save the most recent displayed frame as a PNG.
+
+        Encode + write happen on a short-lived daemon thread so a slow
+        disk never stalls the GUI; the button is disabled until the
+        writer reports back via _capture_saved / _capture_failed.
+        """
+        frame = self._last_frame
+        if frame is None:
+            self._on_capture_failed("no frame to save")
+            return
+        stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.capture_btn.setEnabled(False)
+        self.capture_status_label.setStyleSheet("color: #888;")
+        self.capture_status_label.setText("saving…")
+        threading.Thread(
+            target=self._write_capture, args=(frame, stamp), daemon=True
+        ).start()
+
+    def _write_capture(self, rgb: np.ndarray, stamp: str) -> None:
+        """Writer thread: PNG-encode `rgb` into the capture dir.
+
+        Collision suffix covers multiple captures within one second.
+        cvtColor also gives imwrite the contiguous BGR buffer it needs.
+        """
+        try:
+            self._capture_dir.mkdir(parents=True, exist_ok=True)
+            path = self._capture_dir / f"capture_{stamp}.png"
+            n = 2
+            while path.exists():
+                path = self._capture_dir / f"capture_{stamp}_{n}.png"
+                n += 1
+            if not cv2.imwrite(str(path), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)):
+                raise RuntimeError("imwrite returned False")
+        except Exception as e:  # noqa: BLE001 — surfaced to the UI
+            log.exception("capture save failed")
+            self._capture_failed.emit(str(e))
+        else:
+            log.info("capture saved: %s", path)
+            self._capture_saved.emit(str(path))
+
+    @Slot(str)
+    def _on_capture_saved(self, path: str) -> None:
+        self.capture_btn.setEnabled(True)
+        self.capture_status_label.setStyleSheet("color: #2e7d32;")
+        self.capture_status_label.setText(f"saved {Path(path).name}")
+
+    @Slot(str)
+    def _on_capture_failed(self, msg: str) -> None:
+        self.capture_btn.setEnabled(True)
+        self.capture_status_label.setStyleSheet("color: #b04040;")
+        self.capture_status_label.setText(f"save failed: {msg}")
+
+    # --- video recording ----------------------------------------------------
+    #
+    # State machine: idle → starting → running → stopping → idle. The
+    # button is disabled during the transient states, so clicks only ever
+    # land in idle (start) or running (stop). All slots below run on the
+    # GUI thread; RecordingWorker lives on its own QThread and reports in
+    # via queued signals.
+
+    def _on_record_clicked(self) -> None:
+        if self._record_state == "idle":
+            self._start_recording()
+        elif self._record_state == "running":
+            self._stop_recording("completed")
+
+    def _session_metadata(self) -> dict:
+        """session.json payload — every field best-effort."""
+        meta: dict = {
+            "hostname": platform.node(),
+            "app": {
+                "python": sys.version.split()[0],
+                "platform": platform.platform(),
+            },
+        }
+        try:
+            sha = subprocess.run(
+                ["git", "rev-parse", "--short", "HEAD"],
+                cwd=Path(__file__).resolve().parent,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            ).stdout.strip()
+            if sha:
+                meta["app"]["git_sha"] = sha
+        except Exception as e:  # noqa: BLE001
+            log.debug("git sha probe failed: %s", e)
+        return meta
+
+    def _set_record_status(self, text: str, error: bool = False) -> None:
+        self.record_status_label.setStyleSheet(
+            "color: #b04040;" if error else "color: #888;"
+        )
+        self.record_status_label.setText(text)
+
+    def _start_recording(self) -> None:
+        frame = self._last_frame
+        if frame is None or self.proc_worker is None:
+            self._set_record_status("no frames yet — camera not running", error=True)
+            return
+        cfg = self._recording_cfg
+        try:
+            cfg.base_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._set_record_status(f"can't create {cfg.base_dir}: {e}", error=True)
+            return
+        free = free_space_gb(cfg.base_dir)
+        if free < cfg.free_space_floor_gb:
+            self._set_record_status(
+                f"disk full: {free:.1f} GB free (floor {cfg.free_space_floor_gb:g})",
+                error=True,
+            )
+            return
+        try:
+            # Session dir is created lazily on the first record press of
+            # the app's lifetime — launching the GUI without recording
+            # never litters the data dir.
+            if self._record_session_dir is None:
+                self._record_session_dir = new_session_dir(
+                    cfg.base_dir, self._session_metadata()
+                )
+            run_dir = new_run_dir(self._record_session_dir)
+        except OSError as e:
+            self._set_record_status(f"can't create run dir: {e}", error=True)
+            return
+
+        h, w = frame.shape[:2]
+        # fps hint for the encoder clock: live measured display rate,
+        # falling back to the Flea3's nominal 60.
+        fps = 60.0
+        if len(self._frame_times) >= 2:
+            span = self._frame_times[-1] - self._frame_times[0]
+            if span > 0:
+                fps = (len(self._frame_times) - 1) / span
+        metadata = {
+            "session_id": self._record_session_dir.name,
+            "camera_settings": (
+                asdict(self.camera_options_panel._current_snapshot())
+                if self.camera_options_panel is not None
+                else None
+            ),
+            "adjustments_at_start": asdict(self.adjustments.get()),
+        }
+        writer = RunWriter(
+            run_dir, cfg, width=w, height=h, fps_hint=fps, metadata=metadata
+        )
+        self._record_queue = RecordQueue(cfg.queue_size)
+        self._record_worker = RecordingWorker(
+            self._record_queue, writer, state_probe=self.adjustments.get
+        )
+        self._record_thread = QThread()
+        self._record_worker.moveToThread(self._record_thread)
+        self._record_thread.started.connect(self._record_worker.run)
+        self._record_worker.started_run.connect(self._on_record_started)
+        self._record_worker.progress.connect(self._on_record_progress)
+        self._record_worker.finished.connect(self._on_record_finished)
+
+        self._record_state = "starting"
+        self.record_btn.setEnabled(False)
+        self.record_btn.setText("starting…")
+        self._set_record_status("")
+        # Camera settings are locked for the whole run: mid-stream
+        # exposure/gain changes produce ugly seams in the encode, and a
+        # binning swap would restart the pipeline under the recorder.
+        # Adjustment sliders stay live; changes land in the sidecar.
+        if self.camera_options_panel is not None:
+            self.camera_options_panel.setEnabled(False)
+        log.info(
+            "recording: starting %s (%dx%d, fps hint %.1f)", run_dir, w, h, fps
+        )
+        self._record_thread.start()
+
+    def _stop_recording(self, status: str) -> None:
+        if self._record_worker is None or self._record_state in ("idle", "stopping"):
+            return
+        self._record_state = "stopping"
+        self._record_timer.stop()
+        self.record_btn.setEnabled(False)
+        self.record_btn.setText("stopping…")
+        # Detach the fork first so nothing new lands in the queue; the
+        # worker drains what's already there, then finalizes.
+        if self.proc_worker is not None:
+            self.proc_worker.set_record_sink(None)
+        self._record_worker.stop(status)
+
+    @Slot(str)
+    def _on_record_started(self, run_dir: str) -> None:
+        if self._record_state != "starting":
+            return  # stale signal from a run already torn down
+        log.info("recording: running — %s", run_dir)
+        self._record_state = "running"
+        self._record_started_monotonic = time.monotonic()
+        # Hook the proc fork only now — no point queueing frames while
+        # the container was still opening.
+        if self.proc_worker is not None and self._record_queue is not None:
+            self.proc_worker.set_record_sink(self._record_queue)
+        self.record_btn.setText("■ Stop (00:00)")
+        self.record_btn.setEnabled(True)
+        self._record_timer.start()
+
+    @Slot(int, int, float)
+    def _on_record_progress(self, frames: int, dropped: int, mb: float) -> None:
+        text = f"{frames} frames · {mb:.0f} MB"
+        if dropped:
+            text += f" · {dropped} dropped"
+        self._set_record_status(text)
+
+    def _on_record_tick(self) -> None:
+        if self._record_state != "running" or self._record_started_monotonic is None:
+            return
+        s = int(time.monotonic() - self._record_started_monotonic)
+        self.record_btn.setText(f"■ Stop ({s // 60:02d}:{s % 60:02d})")
+
+    @Slot(str, str)
+    def _on_record_finished(self, status: str, message: str) -> None:
+        """Terminal for every run, however it ended (user stop, disk
+        full, size cap, camera loss, error). Tears down the worker
+        thread and returns the UI to idle."""
+        self._record_timer.stop()
+        if self.proc_worker is not None:
+            self.proc_worker.set_record_sink(None)
+        if self._record_thread is not None:
+            self._record_thread.quit()
+            if not self._record_thread.wait(5000):
+                log.warning("recording thread did not exit cleanly")
+        self._record_queue = None
+        self._record_worker = None
+        self._record_thread = None
+        self._record_started_monotonic = None
+        self._record_state = "idle"
+        self.record_btn.setEnabled(True)
+        self.record_btn.setText("● Record")
+        if self.camera_options_panel is not None:
+            self.camera_options_panel.setEnabled(True)
+        self._set_record_status(message, error=(status != "completed"))
+        log.info("recording finished: %s — %s", status, message)
 
     def _build_right_panel(
         self,
@@ -4160,6 +4520,34 @@ class CameraWindow(QMainWindow):
         layout.addStretch(1)
         return panel
 
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        """App-level filter: Up/Down arrows step the Z stage (SMC100).
+
+        Fires only while this window is active, and only when keyboard
+        focus is somewhere that doesn't use arrow keys natively —
+        spinboxes, sliders, combos and text fields keep them. Key
+        auto-repeat is intentionally allowed: holding an arrow repeats
+        steps, gated per-step by the jog button's enabled state.
+        """
+        if (
+            event.type() == QEvent.Type.KeyPress
+            and self.smc100_panel is not None
+            and self.isActiveWindow()
+        ):
+            assert isinstance(event, QKeyEvent)  # guaranteed by KeyPress type
+            key = event.key()
+            if key in (Qt.Key.Key_Up, Qt.Key.Key_Down):
+                fw = QApplication.focusWidget()
+                if not isinstance(
+                    fw,
+                    (QAbstractSpinBox, QAbstractSlider, QComboBox, QLineEdit),
+                ):
+                    self.smc100_panel.click_jog(
+                        +1 if key == Qt.Key.Key_Up else -1
+                    )
+                    return True
+        return super().eventFilter(obj, event)
+
     def _on_frame(self) -> None:
         self._on_frame_calls += 1
         if self.proc_worker is None:
@@ -4170,6 +4558,10 @@ class CameraWindow(QMainWindow):
             self._maybe_log_on_frame_rates()
             return  # drained by a previous slot run
         t0 = time.perf_counter()
+        # Keep a ref for still capture. Safe to hold: the pipeline
+        # allocates a fresh output buffer per frame (apply_adjustments'
+        # final pass never writes into its reused scratch).
+        self._last_frame = rgb
         # GL display: hand the numpy array straight to paintGL — no
         # QImage build, no CPU pre-scale. paintGL uploads to texture.
         self.label.set_frame(rgb)
@@ -4211,6 +4603,11 @@ class CameraWindow(QMainWindow):
     def _on_frame_error(self, msg: str) -> None:
         self.label.clear_frame()
         self.label.setText(f"frame error: {msg}")
+        self._last_frame = None
+        # Camera gone mid-record: finalize what we have. Fragmented MP4
+        # means the file is playable up to the last written fragment.
+        if self._record_state in ("starting", "running"):
+            self._stop_recording("aborted_camera")
         self._frame_times.clear()
         self.status_bar.set_fps(None)
         self.status_bar.set_sharpness(None)
@@ -4227,6 +4624,17 @@ class CameraWindow(QMainWindow):
             self.status_bar.set_fps(fps)
 
     def closeEvent(self, event) -> None:
+        # Finalize any active recording before the pipeline goes away.
+        # The queued _on_record_finished slot won't run inside
+        # closeEvent, so join the thread directly — worker.run()
+        # returning is what closes the container.
+        if self._record_state != "idle":
+            log.info("close: stopping active recording")
+            self._stop_recording("aborted_user")
+            if self._record_thread is not None:
+                self._record_thread.quit()
+                if not self._record_thread.wait(5000):
+                    log.warning("recording thread did not exit on close")
         # Close the webcam first so its geometry gets persisted via the
         # `closed` signal before we tear down the main window.
         if self._webcam_window is not None:

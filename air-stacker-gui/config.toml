@@ -41,6 +41,27 @@ backend = "qt"
 # lives in the untracked sibling file settings.toml, not here. See
 # .gitignore.
 
+# Still-image capture (📷 Save Image button). Saves the post-adjustment
+# frame (what the display shows) as capture_<timestamp>.png.
+[capture]
+# dir = "~/AirStackerCaptures"   # default
+
+# Video recording (● Record button). Post-adjustment frames, H.264 in
+# fragmented MP4 (crash leaves a playable file) + per-run sidecar JSON
+# and per-frame timestamps CSV. Camera settings lock while recording;
+# adjustment-slider changes stay live and are logged to the sidecar.
+# Settings are config-only by design — no GUI panel. All keys optional;
+# defaults shown. Design: RECORDING_PROPOSAL.md.
+[recording]
+# base_dir = "~/AirStackerRecordings"
+# codec = "auto"            # "auto" | "h264_qsv" | "libx264"
+# qsv_global_quality = 22   # ≈ visually lossless (QSV scale ≠ x264 CRF)
+# x264_preset = "veryfast"
+# x264_crf = 17
+# max_run_gb = 50           # finalize the run at this file size
+# free_space_floor_gb = 5   # refuse to start / stop when disk free drops below
+# queue_size = 120          # encoder buffer, frames (~2 s @ 60 fps)
+
 # CONEX-CC axes. Each entry is one controller on its own COM port (address 1 by convention).
 # Axis A on COM3 is currently disconnected — re-add a [[axis]] entry when it's wired up:
 #   name = "Axis A", port = "COM3", baud = 921600, units = "mm", step = 0.01
@@ -71,6 +92,9 @@ port = "COM5"
 baud = 57600
 units = "mm"
 step = 0.1
+# One-click step-size presets (µm) shown under the Step box. Usable
+# mid-move — they only set the spinbox, read at the next jog.
+step_presets_um = [1.0, 0.3, 0.1]
 poll_interval_ms = 100
 position_limits = [0.0, 30.0]
 # LTA-HS RMS-current-trip floor. At velocities below ~5 µm/s the servo

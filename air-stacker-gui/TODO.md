@@ -2,7 +2,8 @@
 
 * Fix heater
   * also manual mode (maybe)
-* add recording
+* rig-validate recording: still capture, video (h264_qsv path especially — only the libx264 fallback is verifiable off-rig; synthetic-frame tests in test_recording.py), Z step presets, arrow-key jog
+* session-level event streams alongside recordings (SESSION_LOG_PROPOSAL.md — deferred from recording v0, as are camera timestamps in timestamps.csv)
 * add camera controls (gain, exposure)
 * implement "start" - fill out form, write to gdrive, start recording
 * clean up `docs/air-stacker-pc.md` once SMC100 has fully replaced the CONEX-CC Z axis (drop "Z and spin" wording, remove the COM3/COM4 Z-vs-spin open question)
