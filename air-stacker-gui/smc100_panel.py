@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 
 from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QFont, QKeySequence, QShortcut
@@ -270,6 +271,11 @@ class SMC100Panel(QGroupBox):
         # click-vs-hold continuous-fire path so it doesn't have to do a
         # synchronous serial query on the GUI thread.
         self._last_position: float | None = None
+        # Last command sent through _safe, for the fault-context log
+        # line. The command is already logged when sent; keeping it here
+        # lets a fault line stand alone without cross-referencing.
+        self._last_cmd: str | None = None
+        self._last_cmd_monotonic: float = 0.0
 
         # Click-vs-hold state for the ± jog buttons. _jog_direction is
         # 0 when idle, ±1 while a button is held. _jog_continuous flips
@@ -607,11 +613,37 @@ class SMC100Panel(QGroupBox):
     def _safe(self, fn, *args) -> None:
         name = fn.__name__
         log.info("smc100: %s(%s)", name, args if args else "")
+        self._last_cmd = f"{name}{args if args else '()'}"
+        self._last_cmd_monotonic = time.monotonic()
         try:
             fn(*args)
         except _SMC100_ERRORS as e:
             log.exception("smc100: %s failed", name)
             self.status_label.setText(f"err: {e}")
+
+    def _fault_context(self) -> str:
+        """One-line snapshot appended to fault logs.
+
+        Reads only GUI-side caches (safe in the poll slot). Deliberately
+        the *operator's* view, not the controller's: after a trip the
+        controller may already have reverted (e.g. VA to the stage
+        default after Reset), and what we want on record is the setting
+        that produced the fault.
+        """
+        pos = (
+            f"{self._last_position * _UM_PER_MM:.2f}"
+            if self._last_position is not None
+            else "?"
+        )
+        parts = [
+            f"pos={pos} µm",
+            f"vel={self.velocity_spin.value():g} µm/s",
+            f"step={self.step_spin.value():g} µm",
+        ]
+        if self._last_cmd is not None:
+            age = time.monotonic() - self._last_cmd_monotonic
+            parts.append(f"last_cmd={self._last_cmd} {age:.1f}s ago")
+        return ", ".join(parts)
 
     # --- worker / state plumbing --------------------------------------------
 
@@ -669,6 +701,8 @@ class SMC100Panel(QGroupBox):
             if sc != prev_state:
                 prev = prev_state or "—"
                 log.info("smc100: state %s → %s (%s)", prev, sc, state_label(sc))
+                if sc in _FAULT_STATES and prev_state is not None:
+                    log.warning("smc100: fault context — %s", self._fault_context())
                 # Re-sync the velocity spinbox on any transition INTO
                 # READY from outside READY. A Reset (RS) reloads the
                 # ESP defaults — including VA — so the spinbox would
@@ -697,7 +731,10 @@ class SMC100Panel(QGroupBox):
             # directly here, not via the error_label widget, so the
             # forensic record doesn't depend on UI state.
             if ec != "0000":
-                log.warning("smc100: error 0x%s — %s", ec, error_label(ec))
+                log.warning(
+                    "smc100: error 0x%s — %s; %s",
+                    ec, error_label(ec), self._fault_context(),
+                )
             self._last_state_code = sc
             self.status_label.setText(state_label(sc))
             if ec != "0000":
