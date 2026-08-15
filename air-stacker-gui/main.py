@@ -3441,6 +3441,12 @@ class HeaterPanel(QGroupBox):
         self._worker: PollWorker | None = None
         self._worker_thread: QThread | None = None
 
+        # Telemetry-log throttle state — see _maybe_log_telemetry.
+        self._log_last_pv: float | None = None
+        self._log_last_sp: float | None = None
+        self._log_last_state: SystemState | None = None
+        self._log_last_monotonic: float = 0.0
+
         try:
             self.heater.open()
         except Exception as e:
@@ -3465,27 +3471,37 @@ class HeaterPanel(QGroupBox):
         self._worker_thread.start()
 
     def _on_set(self) -> None:
+        value = self.setpoint_spin.value()
+        log.info("heater: set_setpoint(%s)", value)
         try:
-            self.heater.set_setpoint(self.setpoint_spin.value())
+            self.heater.set_setpoint(value)
         except Exception as e:
+            log.exception("heater: set_setpoint failed")
             self.status_label.setText(f"set err: {e}")
 
     def _on_set_max_output(self) -> None:
+        value = self.max_output_spin.value()
+        log.info("heater: set_output_limit_high(%s)", value)
         try:
-            self.heater.set_output_limit_high(self.max_output_spin.value())
+            self.heater.set_output_limit_high(value)
         except Exception as e:
+            log.exception("heater: set_output_limit_high failed")
             self.status_label.setText(f"max-output err: {e}")
 
     def _on_run(self) -> None:
+        log.info("heater: run()")
         try:
             self.heater.run()
         except Exception as e:
+            log.exception("heater: run failed")
             self.status_label.setText(f"run err: {e}")
 
     def _on_stop(self) -> None:
+        log.info("heater: stop()")
         try:
             self.heater.stop()
         except Exception as e:
+            log.exception("heater: stop failed")
             self.status_label.setText(f"stop err: {e}")
 
     def _read_state(self) -> dict:
@@ -3522,9 +3538,61 @@ class HeaterPanel(QGroupBox):
         "idle": "#888888",
     }
 
+    # PV movement below this (in display units) doesn't force a log line
+    # on its own — bounds log volume to ~1 line/s during the fastest ramp.
+    _LOG_PV_DEADBAND = 1.0
+    # A line goes out at least this often while connected, so a steady
+    # plateau (or an idle room-temperature rig) still leaves a record.
+    _LOG_HEARTBEAT_S = 60.0
+
+    def _maybe_log_telemetry(self, payload: dict) -> None:
+        """Low-rate pv/sp/state/output record in the session log.
+
+        Logs on state or setpoint change, PV movement past the deadband,
+        or the heartbeat — whichever comes first. Lines are
+        self-contained so faults elsewhere (e.g. an SMC100 current trip)
+        can be correlated against heater conditions without cross-
+        referencing.
+        """
+        if "_worker_err" in payload:
+            return
+        pv = payload.get("pv")
+        sp = payload.get("sp")
+        state = payload.get("state")
+        now = time.monotonic()
+        due = (
+            state != self._log_last_state
+            or sp != self._log_last_sp
+            or (pv is not None and (
+                self._log_last_pv is None
+                or abs(pv - self._log_last_pv) >= self._LOG_PV_DEADBAND
+            ))
+            or now - self._log_last_monotonic >= self._LOG_HEARTBEAT_S
+        )
+        if not due:
+            return
+        parts = []
+        if pv is not None:
+            parts.append(f"pv={pv:.2f}")
+        if sp is not None:
+            parts.append(f"sp={sp:.2f}")
+        if state is not None:
+            parts.append(f"state={state.name}")
+        if "out" in payload:
+            parts.append(f"out={payload['out']:.1f}%")
+        if "out_hi" in payload:
+            parts.append(f"cap={payload['out_hi']:.0f}%")
+        log.info("heater: %s", ", ".join(parts) or "no readings")
+        if pv is not None:
+            self._log_last_pv = pv
+        self._log_last_sp = sp
+        self._log_last_state = state
+        self._log_last_monotonic = now
+
     @Slot(object)
     def _apply_state(self, payload: dict) -> None:
         """Main-thread: render a payload from the polling worker."""
+        self._maybe_log_telemetry(payload)
         if "pv" in payload:
             self.pv_label.setText(f"{payload['pv']:.2f} {self.units}")
         elif "pv_err" in payload:
