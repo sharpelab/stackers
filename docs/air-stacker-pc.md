@@ -231,6 +231,13 @@ GUI integration shipped: [`keithley617.py`](../air-stacker-gui/keithley617.py) m
 - **Software**: `~/Desktop/Platinum_Firmware_Software_1.4.0.6/` containing `EIP_1.1.5`, `Firmware_1.4.0.6`, `Platinum_Configurator_1.5.2.0`, `USBDriver`. Launcher on Desktop is `Temp Controller.appref-ms` (ClickOnce).
 - The earlier "Thermo Scientific Platinum" label in this doc was wrong — it's Omega.
 
+## USB topology and additions policy
+
+- **Intel xHCI root hub (motherboard ports)**: all four instruments — the three FTDI USB-serial adapters (COM3 / COM4 / COM5), the Omega heater VCP (COM7), and the FLIR Flea3.
+- **Renesas add-in USB3 card (PCIe)**: the Anker PowerConf C200 webcam only. Anything transient that must be plugged in goes here, never on the Intel hub next to the instruments.
+- **Aaron's rule: nothing else gets added to this PC** — no hardware on the USB bus, no software — without his OK. Third-party USB3 devices (bulk-streaming cameras in particular) have caused simultaneous serial timeouts on both FTDI adapters and are the main thing this rule guards against.
+- **Stanford IT endpoint agents present**: CrowdStrike Falcon sensor + Device Control (a USB device-class policy engine) and the BigFix client. Not ours to touch; if USB devices start being blocked or re-enumerated unexpectedly, Device Control policy is a suspect.
+
 ## Defunct / disabled
 
 - The USBTMC SCPI temp/humidity instrument that `~/something.py` used to poll (`SENS1:TEMP:DATA?` / `SENS2:HUM:DATA?` → `spxtr.net/demgraphs/` as `stacker.temp`/`stacker.hum`) is **no longer connected** — pyvisa enumerates no USB instruments. The script and its `something.bat` companion are still on disk but inert.
