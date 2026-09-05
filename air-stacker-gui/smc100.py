@@ -1,9 +1,10 @@
 """Newport SMC100CC ASCII driver over RS-232 (one controller per port, address 1).
 
 Mirrors :mod:`conex.py` — same Newport ASCII command shape, same TS state /
-error decoding (the bit assignments line up with the CONEX-CC documentation),
-same query/response prefix-stripping rules. Differences from the CONEX-CC
-driver:
+error decoding (the bit assignments line up with the CONEX-CC documentation).
+Both drivers sit on :class:`newport_serial.NewportLink`, which owns the port,
+framing, reply validation, and stale-reply discipline. Differences from the
+CONEX-CC driver:
 
 - Default baud is 57600 (vs. 921600 on CONEX-CC).
 - The CONEX-CC has its USB-CDC bridge built in; the SMC100 reaches the PC via
@@ -23,15 +24,19 @@ References:
 
 from __future__ import annotations
 
+import logging
 import math
-import threading
+import re
 from dataclasses import dataclass
 
-import serial
+from newport_serial import ANY, FLOAT, TERMINATOR, TEXT, TS_REPLY, NewportLink
 
 DEFAULT_BAUD = 57600
 DEFAULT_ADDRESS = 1
-TERMINATOR = b"\r\n"
+
+__all__ = ["SMC100Axis", "SMC100Error", "StageInfo", "TERMINATOR"]
+
+log = logging.getLogger("airstacker.smc100.link")
 
 # Subset of the SMC100CC state byte (low 2 hex chars of the TS response) →
 # human label. Verified against the user's manual §5.3 / TS command page.
@@ -154,25 +159,22 @@ class SMC100Axis:
         self.address = address
         self.timeout = timeout
         self._position_limits = position_limits
-        self._serial: serial.Serial | None = None
-        self._lock = threading.Lock()
+        self._link = NewportLink(
+            port,
+            baud=baud,
+            address=address,
+            timeout=timeout,
+            error_cls=SMC100Error,
+            log=log,
+        )
         # Effective software clamp computed in open() = position_limits ∩ (SL, SR).
         # None means "no clamp configured" — caller sees raw controller behavior.
         self._effective_limits: tuple[float, float] | None = None
 
     def open(self) -> None:
-        if self._serial is not None:
+        if self._link.is_open:
             return
-        ser = serial.Serial(
-            port=self.port,
-            baudrate=self.baud,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=self.timeout,
-            write_timeout=self.timeout,
-        )
-        self._serial = ser
+        self._link.open()
         # Read the controller's ESP-loaded soft limits so we can validate
         # any caller-supplied range against them, and use them as the default
         # clamp when no kwarg was passed.
@@ -197,16 +199,11 @@ class SMC100Axis:
             self._effective_limits = None
 
     def close(self) -> None:
-        with self._lock:
-            if self._serial is not None:
-                try:
-                    self._serial.close()
-                finally:
-                    self._serial = None
+        self._link.close()
 
     @property
     def is_open(self) -> bool:
-        return self._serial is not None and self._serial.is_open
+        return self._link.is_open
 
     @property
     def position_limits(self) -> tuple[float, float] | None:
@@ -222,49 +219,38 @@ class SMC100Axis:
 
     def send(self, cmd: str) -> None:
         """Fire-and-forget command (no reply expected)."""
-        if not self._serial:
-            raise SMC100Error("serial port not open")
-        line = f"{self.address}{cmd}".encode("ascii") + TERMINATOR
-        with self._lock:
-            self._serial.reset_input_buffer()
-            self._serial.write(line)
-            self._serial.flush()
+        self._link.send(cmd)
 
-    def query(self, cmd: str) -> str:
-        """Send a query (e.g. ``TP?``) and return the value portion of the reply."""
-        if not self._serial:
-            raise SMC100Error("serial port not open")
-        line = f"{self.address}{cmd}".encode("ascii") + TERMINATOR
-        with self._lock:
-            self._serial.reset_input_buffer()
-            self._serial.write(line)
-            self._serial.flush()
-            raw = self._serial.read_until(TERMINATOR)
-        text = raw.decode("ascii", errors="replace").strip()
-        prefix = f"{self.address}{cmd.rstrip('?')}"
-        if not text:
-            raise SMC100Error(f"no response to {cmd!r}")
-        if text.startswith(prefix):
-            return text[len(prefix) :]
-        return text
+    def query(self, cmd: str, pattern: re.Pattern[str] = ANY) -> str:
+        """Send a query (e.g. ``TP?``) and return the value portion of the reply.
+
+        ``pattern`` declares the reply-body shape; a reply that fails it
+        raises :class:`SMC100Error` rather than returning something a
+        caller might parse into nonsense. Stale replies from earlier
+        queries are discarded by the link, never returned.
+        """
+        return self._link.query(cmd, pattern).group(0)
+
+    def _query_float(self, cmd: str) -> float:
+        return float(self._link.query(cmd, FLOAT).group(0))
 
     # --- queries (safe) -----------------------------------------------------
 
     def identify(self) -> str:
         """``ID?`` — stage identification string (LTA-HS_PN:... on this rig)."""
-        return self.query("ID?")
+        return self.query("ID?", TEXT)
 
     def firmware(self) -> str:
         """``VE?`` — controller / firmware revision string."""
-        return self.query("VE?")
+        return self.query("VE?", TEXT)
 
     def position(self) -> float:
         """``TP?`` — current position in stage units (mm for LTA-HS)."""
-        return float(self.query("TP?"))
+        return self._query_float("TP?")
 
     def setpoint(self) -> float:
         """``TH?`` — set-point position. Useful while in MOVING state."""
-        return float(self.query("TH?"))
+        return self._query_float("TH?")
 
     def state(self) -> tuple[str, str]:
         """Returns (state_2hex, error_4hex) from the TS response.
@@ -276,23 +262,21 @@ class SMC100Axis:
         it reads it. Don't rely on multiple consecutive TS calls returning
         the same error bits; cache the first read if you need to inspect.
         """
-        raw = self.query("TS")
-        if len(raw) < 6:
-            raise SMC100Error(f"unexpected TS response: {raw!r}")
-        return raw[4:6], raw[:4]
+        m = self._link.query("TS", TS_REPLY)
+        return m.group(2).upper(), m.group(1).upper()
 
     def velocity(self) -> float:
         """``VA?`` — current velocity setting (units/s)."""
-        return float(self.query("VA?"))
+        return self._query_float("VA?")
 
     def accel(self) -> float:
         """``AC?`` — current acceleration setting (units/s²)."""
-        return float(self.query("AC?"))
+        return self._query_float("AC?")
 
     def software_limits(self) -> tuple[float, float]:
         """``(SL, SR)`` — controller's ESP-loaded negative / positive limits."""
-        sl = float(self.query("SL?"))
-        sr = float(self.query("SR?"))
+        sl = self._query_float("SL?")
+        sr = self._query_float("SR?")
         return sl, sr
 
     def encoder_unit(self) -> float:
@@ -300,7 +284,7 @@ class SMC100Axis:
         (≈ 35.4 nm/count). The controller silently rounds motion requests
         to the nearest integer multiple of this, so software requests
         that aren't whole-count multiples move less than asked."""
-        return float(self.query("SU?"))
+        return self._query_float("SU?")
 
     # --- motion (mutating, but transient — no persistent writes) ------------
 

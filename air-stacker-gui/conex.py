@@ -1,15 +1,23 @@
-"""Newport CONEX-CC ASCII driver over USB-CDC serial (one controller per port, address 1)."""
+"""Newport CONEX-CC ASCII driver over USB-CDC serial (one controller per port, address 1).
+
+Transport (port, framing, stale-reply discipline) lives in
+:class:`newport_serial.NewportLink`; this module is the command vocabulary.
+"""
 
 from __future__ import annotations
 
-import threading
+import logging
+import re
 from dataclasses import dataclass
 
-import serial
+from newport_serial import ANY, FLOAT, TERMINATOR, TEXT, TS_REPLY, NewportLink
 
 DEFAULT_BAUD = 921600
 DEFAULT_ADDRESS = 1
-TERMINATOR = b"\r\n"
+
+__all__ = ["ConexAxis", "ConexError", "StageInfo", "TERMINATOR"]
+
+log = logging.getLogger("airstacker.conex.link")
 
 # Subset of the CONEX-CC state byte (first 4 hex chars of TS response) → human label.
 STATE_LABELS: dict[str, str] = {
@@ -99,68 +107,46 @@ class ConexAxis:
         self.baud = baud
         self.address = address
         self.timeout = timeout
-        self._serial: serial.Serial | None = None
-        self._lock = threading.Lock()
-
-    def open(self) -> None:
-        if self._serial is not None:
-            return
-        self._serial = serial.Serial(
-            port=self.port,
-            baudrate=self.baud,
-            bytesize=serial.EIGHTBITS,
-            parity=serial.PARITY_NONE,
-            stopbits=serial.STOPBITS_ONE,
-            timeout=self.timeout,
-            write_timeout=self.timeout,
+        self._link = NewportLink(
+            port,
+            baud=baud,
+            address=address,
+            timeout=timeout,
+            error_cls=ConexError,
+            log=log,
         )
 
+    def open(self) -> None:
+        self._link.open()
+
     def close(self) -> None:
-        with self._lock:
-            if self._serial is not None:
-                try:
-                    self._serial.close()
-                finally:
-                    self._serial = None
+        self._link.close()
 
     @property
     def is_open(self) -> bool:
-        return self._serial is not None and self._serial.is_open
+        return self._link.is_open
 
     def send(self, cmd: str) -> None:
         """Fire-and-forget command (no reply expected)."""
-        if not self._serial:
-            raise ConexError("serial port not open")
-        line = f"{self.address}{cmd}".encode("ascii") + TERMINATOR
-        with self._lock:
-            self._serial.reset_input_buffer()
-            self._serial.write(line)
-            self._serial.flush()
+        self._link.send(cmd)
 
-    def query(self, cmd: str) -> str:
-        """Send a query (e.g. 'TP?') and return the value portion of the response."""
-        if not self._serial:
-            raise ConexError("serial port not open")
-        line = f"{self.address}{cmd}".encode("ascii") + TERMINATOR
-        with self._lock:
-            self._serial.reset_input_buffer()
-            self._serial.write(line)
-            self._serial.flush()
-            raw = self._serial.read_until(TERMINATOR)
-        text = raw.decode("ascii", errors="replace").strip()
-        prefix = f"{self.address}{cmd.rstrip('?')}"
-        if not text:
-            raise ConexError(f"no response to {cmd!r}")
-        if text.startswith(prefix):
-            return text[len(prefix):]
-        return text
+    def query(self, cmd: str, pattern: re.Pattern[str] = ANY) -> str:
+        """Send a query (e.g. 'TP?') and return the value portion of the response.
+
+        ``pattern`` declares the reply-body shape; a mismatch raises
+        :class:`ConexError`. Stale replies are discarded by the link.
+        """
+        return self._link.query(cmd, pattern).group(0)
+
+    def _query_float(self, cmd: str) -> float:
+        return float(self._link.query(cmd, FLOAT).group(0))
 
     # --- queries (safe) ---
     def identify(self) -> str:
-        return self.query("ID?")
+        return self.query("ID?", TEXT)
 
     def position(self) -> float:
-        return float(self.query("TP?"))
+        return self._query_float("TP?")
 
     def state(self) -> tuple[str, str]:
         """Returns (controller_state_2hex, error_register_4hex).
@@ -168,19 +154,17 @@ class ConexAxis:
         TS response is `1TSabcdef`: abcd is the 16-bit positioner error
         register, ef is the controller state. See CONEX-CC controller doc §TS.
         """
-        raw = self.query("TS?")
-        if len(raw) < 6:
-            raise ConexError(f"unexpected TS response: {raw!r}")
-        return raw[4:6], raw[:4]
+        m = self._link.query("TS?", TS_REPLY)
+        return m.group(2).upper(), m.group(1).upper()
 
     def negative_limit(self) -> float:
-        return float(self.query("SL?"))
+        return self._query_float("SL?")
 
     def positive_limit(self) -> float:
-        return float(self.query("SR?"))
+        return self._query_float("SR?")
 
     def velocity(self) -> float:
-        return float(self.query("VA?"))
+        return self._query_float("VA?")
 
     # --- transient setters ---
     def set_velocity(self, v: float) -> None:

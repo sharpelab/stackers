@@ -27,9 +27,9 @@ from smc100 import SMC100Axis, SMC100Error, error_label, state_label
 
 
 def _query(axis: SMC100Axis, cmd: str) -> str:
-    """Query and strip, or return a 'err: ...' marker on failure."""
+    """Query, or return a 'err: ...' marker on failure."""
     try:
-        return axis.query(cmd).strip()
+        return axis.query(cmd)
     except SMC100Error as e:
         return f"err: {e}"
 
