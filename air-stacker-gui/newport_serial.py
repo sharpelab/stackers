@@ -16,9 +16,12 @@ error register of ``1TP2``, a state of ``5.``, a position of 33000 µm.
 declared pattern as malformed (raise, don't guess).
 
 Timeouts: the constructor value bounds one whole query, stale discards
-included. pyserial's port timeout is per read, so the link narrows it to
-the remaining budget before any read that may block, and restores it
-afterwards. The port object is private to the link; nothing else touches it.
+included. The port's own read timeout is a short fixed quantum set once at
+open and never changed afterwards: reconfiguring a pyserial port timeout
+goes through ``SetCommState`` on Windows, and the FTDI driver loses or
+delays bytes that arrive during that call — which is exactly when a reply
+is in flight. The link polls in quanta against its own deadline instead.
+The port object is private to the link; nothing else touches it.
 
 Write timeouts: pyserial raises ``SerialTimeoutException`` when the OS
 accepted only part of a line. The controller then holds an unterminated
@@ -40,6 +43,10 @@ import serial
 
 DEFAULT_ADDRESS = 1
 TERMINATOR = b"\r\n"
+# Port read timeout: how long one blocking read waits for a first byte
+# before the deadline loop gets to check the clock again. Comfortably above
+# the FTDI latency timer (16 ms) so a reply arrives within one wait.
+READ_QUANTUM_S = 0.05
 
 # Reply-body patterns. Drivers pass one per command so the shape is declared
 # next to the command that produces it.
@@ -105,7 +112,7 @@ class NewportLink:
             bytesize=serial.EIGHTBITS,
             parity=serial.PARITY_NONE,
             stopbits=serial.STOPBITS_ONE,
-            timeout=self.timeout,
+            timeout=min(READ_QUANTUM_S, self.timeout),
             write_timeout=self.timeout,
         )
         self._rx.clear()
@@ -148,30 +155,26 @@ class NewportLink:
             self._write(ser, cmd)
             deadline = time.monotonic() + self.timeout
             discarded = 0
-            try:
-                while True:
-                    text = self._read_line(ser, deadline)
-                    if text is None:
-                        suffix = f" ({discarded} stale line(s) discarded)" if discarded else ""
-                        raise self._error_cls(f"no response to {cmd!r}{suffix}")
-                    if not text:
-                        continue  # blank line; the deadline still bounds us
-                    if not text.startswith(prefix):
-                        discarded += 1
-                        self._log.warning(
-                            "%s: discarded stale reply %r while awaiting %s",
-                            self.port, text, cmd,
-                        )
-                        continue
-                    # Strip: VE? and friends put a space after the mnemonic.
-                    body = text[len(prefix):].strip()
-                    m = pattern.match(body)
-                    if m is None:
-                        raise self._error_cls(f"malformed {cmd!r} reply: {body!r}")
-                    return m
-            finally:
-                if ser.timeout != self.timeout:
-                    ser.timeout = self.timeout
+            while True:
+                text = self._read_line(ser, deadline)
+                if text is None:
+                    suffix = f" ({discarded} stale line(s) discarded)" if discarded else ""
+                    raise self._error_cls(f"no response to {cmd!r}{suffix}")
+                if not text:
+                    continue  # blank line; the deadline still bounds us
+                if not text.startswith(prefix):
+                    discarded += 1
+                    self._log.warning(
+                        "%s: discarded stale reply %r while awaiting %s",
+                        self.port, text, cmd,
+                    )
+                    continue
+                # Strip: VE? and friends put a space after the mnemonic.
+                body = text[len(prefix):].strip()
+                m = pattern.match(body)
+                if m is None:
+                    raise self._error_cls(f"malformed {cmd!r} reply: {body!r}")
+                return m
 
     # --- internals -----------------------------------------------------------
 
@@ -210,10 +213,11 @@ class NewportLink:
         """One terminator-delimited line, or None if the deadline passes first.
 
         Serves from the link's receive buffer first. Otherwise reads whatever
-        the port already has without blocking; only when the port is empty
-        does it narrow the port timeout to the remaining budget and block.
-        An unterminated fragment left at the deadline stays buffered and is
-        reported by the next ``_drain_pending``.
+        the port already has without blocking, or blocks one quantum for a
+        first byte, and re-checks the deadline between reads. The port
+        timeout is never modified. An unterminated fragment left at the
+        deadline stays buffered and is reported by the next
+        ``_drain_pending``.
         """
         while True:
             idx = self._rx.find(TERMINATOR)
@@ -221,13 +225,9 @@ class NewportLink:
                 line = bytes(self._rx[:idx])
                 del self._rx[: idx + len(TERMINATOR)]
                 return line.decode("ascii", errors="replace").strip()
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if time.monotonic() >= deadline:
                 return None
             waiting = ser.in_waiting
-            if not waiting:
-                ser.timeout = remaining
             chunk = ser.read(max(1, waiting))
-            if not chunk:
-                return None
-            self._rx += chunk
+            if chunk:
+                self._rx += chunk

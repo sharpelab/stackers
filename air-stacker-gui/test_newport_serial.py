@@ -19,7 +19,7 @@ from unittest import mock
 import serial
 
 from conex import ConexAxis, ConexError
-from newport_serial import ANY, FLOAT, TEXT, TS_REPLY, NewportLink
+from newport_serial import ANY, FLOAT, READ_QUANTUM_S, TEXT, TS_REPLY, NewportLink
 from smc100 import SMC100Axis, SMC100Error
 
 # (delay_s, bytes) — the fake delivers these strictly in order; each becomes
@@ -33,7 +33,8 @@ class FakeSerial:
 
     def __init__(self, responder: Responder | None = None, **kwargs) -> None:
         self.kwargs = kwargs
-        self.timeout: float | None = kwargs.get("timeout")
+        self._timeout: float | None = kwargs.get("timeout")
+        self.timeout_sets = 0  # post-construction reconfigures; must stay 0
         self.write_timeout: float | None = kwargs.get("write_timeout")
         self.is_open = True
         self.writes: list[bytes] = []
@@ -62,6 +63,15 @@ class FakeSerial:
         return out
 
     # --- serial.Serial surface -----------------------------------------------
+
+    @property
+    def timeout(self) -> float | None:
+        return self._timeout
+
+    @timeout.setter
+    def timeout(self, value: float | None) -> None:
+        self._timeout = value
+        self.timeout_sets += 1
 
     @property
     def in_waiting(self) -> int:
@@ -143,7 +153,8 @@ def test_query_healthy():
     m = link.query("TP?", FLOAT)
     assert float(m.group(0)) == 12.5
     assert port.writes == [b"1TP?\r\n"]
-    assert port.timeout == 0.2, "port timeout must be restored after a query"
+    assert port.timeout == READ_QUANTUM_S, "port timeout is the fixed quantum, never the link budget"
+    assert port.timeout_sets == 0, "the link must never reconfigure the port timeout"
 
 
 def test_late_reply_is_discarded_by_next_query():
