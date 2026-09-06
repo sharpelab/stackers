@@ -10,8 +10,7 @@ CONEX-CC driver:
 - The CONEX-CC has its USB-CDC bridge built in; the SMC100 reaches the PC via
   RS-232 → USB-RS232 dongle, but the protocol on top is the same.
 - ``open()`` validates the optional ``position_limits=`` kwarg lies inside the
-  controller's ESP-loaded ``SL`` / ``SR`` envelope (parallel to
-  :class:`yoko.Yoko7651`'s ``voltage_limits=`` sanity check).
+  controller's ESP-loaded ``SL`` / ``SR`` envelope.
 
 Persistent / CONFIG-mode commands (``PW1`` / ``PW0`` / EEPROM saves) are
 deliberately not exposed. Anyone needing those has to reach for ``send`` /
@@ -133,8 +132,7 @@ class SMC100Axis:
     """A single SMC100CC controller on its own COM port (address 1 by default).
 
     ``position_limits=(lo, hi)`` is an optional software clamp on
-    :meth:`move_absolute` and :meth:`move_relative` targets, parallel to
-    :class:`yoko.Yoko7651`'s ``voltage_limits=`` kwarg. When set, ``open()``
+    :meth:`move_absolute` and :meth:`move_relative` targets. When set, ``open()``
     queries the controller's ESP-loaded ``SL`` / ``SR`` and verifies the
     supplied range lies inside that envelope, raising :class:`SMC100Error`
     otherwise. Targets are checked against the intersection of the kwarg and

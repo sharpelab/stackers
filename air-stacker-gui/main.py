@@ -89,7 +89,6 @@ from status_bar import StatusBar
 from webcam import WebcamConfig
 from webcam_window import WebcamWindow
 from widgets import action_button
-from yoko_panel import YokoPanel
 
 import tomlkit
 
@@ -3657,14 +3656,14 @@ class LaunchingDialog(QDialog):
     """Small 'Launching…' indicator shown during CameraWindow construction.
 
     Closes the operator-feedback gap that lets the GUI process run for
-    several seconds (PySpin / serial / VISA setup) with no visible
+    several seconds (PySpin / serial setup) with no visible
     window. The X (window close button) sets a cancel flag; CameraWindow
     checks it at construction checkpoints and raises StartupAborted.
 
     Honest caveat: X is responsive *between* construction steps, not
-    *during* a single long step (e.g. Yoko's ~8.5 s VISA timeout when
-    the 7651 is offline). Full responsiveness requires deferring device
-    connects to worker threads — separate refactor.
+    *during* a single long step (e.g. a serial open that times out).
+    Full responsiveness requires deferring device connects to worker
+    threads — separate refactor.
     """
 
     def __init__(self) -> None:
@@ -3713,7 +3712,6 @@ class CameraWindow(QMainWindow):
         self.axis_panels: list[ConexAxisPanel] = []
         self.heater_panel: HeaterPanel | None = None
         self.smc100_panel: SMC100Panel | None = None
-        self.yoko_panel: YokoPanel | None = None
         self.camera_options_panel: CameraOptionsPanel | None = None
         self.adjustments_panel: ImageAdjustmentsPanel | None = None
         # PySpin handles get assigned in _initialize. They are *not*
@@ -3754,7 +3752,6 @@ class CameraWindow(QMainWindow):
             self.camera_options_panel,
             self.heater_panel,
             self.smc100_panel,
-            self.yoko_panel,
         ):
             if p is not None:
                 try:
@@ -3882,7 +3879,6 @@ class CameraWindow(QMainWindow):
             axes_cfg=config.get("axis", []),
             heater_cfg=config.get("heater"),
             smc100_cfg=config.get("smc100"),
-            yoko_cfg=config.get("yoko"),
         )
 
         self.layer_panel = LayerPanel()
@@ -4588,7 +4584,6 @@ class CameraWindow(QMainWindow):
         axes_cfg: list[dict],
         heater_cfg: dict | None,
         smc100_cfg: dict | None = None,
-        yoko_cfg: dict | None = None,
     ) -> QWidget:
         panel = QWidget()
         panel.setFixedWidth(300)
@@ -4597,9 +4592,7 @@ class CameraWindow(QMainWindow):
 
         # Ordering principle: top-to-bottom by order-of-use during a
         # stacking run. Rotation stage(s) come first (orient the sample),
-        # then heater (bring up to temp), then coarse Z (SMC100, mm scale,
-        # rough approach), then fine Z (Yoko/NPM140 piezo, µm scale, final
-        # touch-down) at the bottom.
+        # then heater (bring up to temp), then Z (SMC100) at the bottom.
         for cfg in axes_cfg:
             self._checkpoint(f"Connecting to axis: {cfg.get('name', '?')}…")
             ap = ConexAxisPanel(cfg)
@@ -4613,15 +4606,6 @@ class CameraWindow(QMainWindow):
             self._checkpoint("Connecting to SMC100 (Z stage)…")
             self.smc100_panel = SMC100Panel(smc100_cfg)
             layout.addWidget(self.smc100_panel)
-        if yoko_cfg:
-            # NB: when the 7651 is offline this call blocks ~8.5 s on
-            # VISA timeouts. The launch dialog will sit on "Connecting
-            # to Yoko…" for that whole window and not be responsive to
-            # an X click until it returns. Deferred-connect refactor
-            # would fix that.
-            self._checkpoint("Connecting to Yoko (NPM140 piezo)…")
-            self.yoko_panel = YokoPanel(yoko_cfg)
-            layout.addWidget(self.yoko_panel)
         self._checkpoint("Finalizing UI…")
         layout.addStretch(1)
         return panel
@@ -4756,8 +4740,6 @@ class CameraWindow(QMainWindow):
             ap.shutdown()
         if self.smc100_panel is not None:
             self.smc100_panel.shutdown()
-        if self.yoko_panel is not None:
-            self.yoko_panel.shutdown()
         if self.heater_panel is not None:
             self.heater_panel.shutdown()
         # PySpin shutdown: end stream, deinit, drop the Camera reference
@@ -4817,7 +4799,7 @@ def main() -> int:
 
     # Single-instance lock. Acquired before CameraWindow construction
     # so a second launch never even starts spinning up PySpin / serial
-    # / VISA — it sees the lock, tells the operator the GUI is already
+    # — it sees the lock, tells the operator the GUI is already
     # running, and exits. QLockFile is held for the lifetime of the
     # process; assigning to a local var (not _, not transient) keeps
     # it from being GC'd before app.exec() returns.
@@ -4840,8 +4822,8 @@ def main() -> int:
     log.info("acquired single-instance lock: %s", LOCK_PATH)
 
     # Show the launching dialog before CameraWindow construction so the
-    # operator gets visible feedback during the slow Spinnaker / serial /
-    # VISA setup. processEvents() forces an initial paint; subsequent
+    # operator gets visible feedback during the slow Spinnaker / serial
+    # setup. processEvents() forces an initial paint; subsequent
     # paints happen at each _checkpoint() inside CameraWindow.__init__.
     launch = LaunchingDialog()
     launch.show()
